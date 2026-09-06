@@ -25,7 +25,7 @@ final class GatewayMenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSApp.setActivationPolicy(.accessory)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "AI Connecting"
+        item.button?.title = "AI…"
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
@@ -81,8 +81,8 @@ final class GatewayMenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuild() {
         guard let menu = item?.menu else { return }
         menu.removeAllItems()
-        item.button?.title = snapshot.map { $0.draining ? "AI Draining" : ($0.current == nil ? "AI Idle" : "AI " + $0.current!.route) } ?? "AI Offline"
-        item.button?.toolTip = "Claude Gateway · " + configuration.gatewayURL
+        item.button?.title = snapshot.map { $0.draining ? "AI Draining" : ($0.current.map { MenuFormat.statusTitle($0.route) } ?? "AI Idle") } ?? "AI Offline"
+        item.button?.toolTip = (snapshot?.current?.route).map { $0 + "\n" + configuration.gatewayURL } ?? "Claude Gateway · " + configuration.gatewayURL
         section(menu, "Claude Gateway · " + configuration.gatewayURL)
         if let problem { text(menu, problem) }
         if let value = snapshot {

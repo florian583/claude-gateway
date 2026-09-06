@@ -2,6 +2,13 @@ import XCTest
 @testable import GatewayMenuCore
 
 final class CoreTests: XCTestCase {
+    func testCompactStatusTitleKeepsAccountOutOfMenuBar() {
+        XCTAssertEqual(MenuFormat.statusTitle("Anthropic / Work account"), "AI Claude")
+        XCTAssertEqual(MenuFormat.statusTitle("BigModel"), "AI BigModel")
+        XCTAssertEqual(MenuFormat.statusTitle("OpenCode Go / DeepSeek"), "AI OpenCode Go")
+        XCTAssertLessThanOrEqual(MenuFormat.statusTitle("A very long provider name").count, 15)
+        XCTAssertEqual(MenuFormat.statusTitle(" "), "AI")
+    }
     private func data(_ json: String) -> Data { Data(json.utf8) }
     func testConfigurationDefaultsAndOverrides() throws {
         let defaults = try MenuConfiguration.parse(data("{}"))

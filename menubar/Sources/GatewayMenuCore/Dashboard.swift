@@ -64,6 +64,12 @@ public struct Dashboard: Decodable {
     }
 }
 public enum MenuFormat {
+    public static func statusTitle(_ route: String) -> String {
+        let provider = (route.components(separatedBy: " / ").first ?? route).trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = provider == "Anthropic" ? "Claude" : provider
+        guard !name.isEmpty else { return "AI" }
+        return "AI " + (name.count > 12 ? String(name.prefix(11)) + "…" : name)
+    }
     public static func date(_ raw: String?) -> Date? {
         guard let raw else { return nil }
         let f = ISO8601DateFormatter()
