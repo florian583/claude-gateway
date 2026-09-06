@@ -1,4 +1,4 @@
-.PHONY: build check test race vet examples privacy hooks
+.PHONY: build check test race vet examples privacy hooks menubar menubar-check
 SOURCE_HASH := $(shell shasum -a 256 *.go go.mod | shasum -a 256 | cut -d ' ' -f 1)
 build:
 	mkdir -p bin
@@ -17,3 +17,8 @@ privacy:
 hooks:
 	git config --local core.hooksPath .githooks
 check: privacy test race vet examples
+menubar:
+	sh menubar/build.sh
+menubar-check:
+	swift test --package-path menubar
+	plutil -lint menubar/Info.plist

@@ -1127,6 +1127,7 @@ func (s *proxyServer) handler() http.Handler {
 	mux.HandleFunc("/quota", s.quota)
 	mux.HandleFunc("/routing", s.routingStatus)
 	mux.HandleFunc("/catalog", s.catalog)
+	mux.HandleFunc("/dashboard", s.dashboard)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Definition != nil && (r.Method != http.MethodPost || (r.URL.Path != "/v1/messages" && r.URL.Path != "/v1/messages/count_tokens")) {
 			writeAPIError(w, http.StatusNotFound, "invalid_request_error", "unsupported local proxy endpoint")
@@ -6484,6 +6485,9 @@ func (s *proxyServer) tryUpstreamCountTokens(w http.ResponseWriter, r *http.Requ
 	countCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	countRequest := r.WithContext(countCtx)
+	if s.cfg.Providers[providerName].Variant == "opencode-go" {
+		countRequest = withOpenCodeSession(countRequest, payload)
+	}
 	// Counting is a capability probe, never an inference fallback cascade.
 	started := time.Now()
 	resp, err := s.doUpstreamWithHeaderBudgetLimit(countCtx, countRequest, body, selected, 5*time.Second)
@@ -7159,6 +7163,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		if s.cfg.Definition != nil && s.cfg.Providers[providerName].Billing == "metered" {
 			paidStarted = true
 		}
+		if s.cfg.Providers[providerName].Variant == "opencode-go" {
+			attemptRequest = withOpenCodeSession(attemptRequest, payload)
+		}
 		resp, err := s.doUpstreamWithHeaderBudgetLimit(context.WithValue(ctx, upstreamTimingContextKey{}, trace.Timing), attemptRequest, attemptBody, candidate, attemptMaximum)
 		if resp != nil {
 			trace.HeadersMS = time.Since(attemptStarted).Milliseconds()
@@ -7555,6 +7562,13 @@ func (s *proxyServer) doUpstream(ctx context.Context, r *http.Request, body []by
 	}
 	if err := s.applyProviderHeadersContext(ctx, providerName, upstreamReq.Header); err != nil {
 		return nil, err
+	}
+	upstreamReq.Header.Del("x-opencode-session")
+	if provider.Variant == "opencode-go" {
+		if session, ok := r.Context().Value(openCodeSessionKey{}).(string); ok {
+			upstreamReq.Header.Set("x-opencode-session", session)
+		}
+		upstreamReq.Header.Set("User-Agent", "claude-gateway/1")
 	}
 	client, ok := s.upstreamClient(providerName, r)
 	if !ok {

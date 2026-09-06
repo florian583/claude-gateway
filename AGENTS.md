@@ -10,3 +10,4 @@
 - Use a GitHub handle and GitHub no-reply email for both author and committer. Install `.githooks` with `make hooks`; never bypass a privacy-check failure. See CONTRIBUTING.md.
 - Use neutral account labels and visibly synthetic credentials in tests. Do not copy real account data into fixtures.
 - Before handoff: `make check build` (includes staged files and reachable-history privacy checks).
+- Menu integration: `make menubar-check menubar` and `python3 -B scripts/menubar_smoke.py`. Keep `/dashboard` observation-only; do not refresh credentials, probe providers, or alter routing from display polling. No private configuration or live service changes in tests.

@@ -17,3 +17,5 @@
 *.app/
 .DS_Store
 __pycache__/
+/menubar/.build/
+/menubar/.swiftpm/

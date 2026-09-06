@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "gatewayURL": "http://127.0.0.1:48104",
+  "refreshSeconds": 15,
+  "showMeteredProviders": false,
+  "accountOrder": ["work", "backup"],
+  "providerOrder": [],
+  "maxTrafficRows": 8
+}

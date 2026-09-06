@@ -6,6 +6,7 @@ A local gateway for Claude Code. Route requests through Claude accounts and API 
 - Sequential account/provider failover, quota reserves, and session affinity.
 - Streaming text and tool calls, with cancellation and interrupted-stream handling.
 - Optional usage APIs and browser snapshots. Neither is required for routing.
+- Optional [macOS menu app](docs/menubar.md) with live activity, remaining usage, and local reset times.
 
 ## Requirements
 
@@ -138,10 +139,12 @@ Set per-profile or pool thresholds to preserve quota. Proactive reserves need fr
 
 ## Operations
 
-Read-only endpoints: `/health`, `/status`, `/routes`, `/routing`, `/metrics`, and `/catalog`. `/quota` exposes Ollama-specific quota data.
+Status endpoints: `/health`, `/status`, `/routes`, `/routing`, `/metrics`, and `/catalog`. `/dashboard` is a versioned, cached-only display endpoint for the menu app. `/quota` exposes Ollama-specific quota data and may refresh its cache.
+
+For OpenCode Go, configure `variant: "opencode-go"`. The gateway adds `x-opencode-session` and identifies itself as `claude-gateway/1` for either protocol. An explicit incoming session header is preserved. Otherwise Claude session metadata is hashed into a stable, non-identifying ID before adapter rewrites. Clients without session metadata get a best-effort first-message fingerprint; send an explicit header to distinguish identical prompts or preserve identity across compaction. Generate that ID once per conversation, not per request. Direct HTTPie/curl calls bypassing this gateway still need their own header. [OpenCode Go requirements](https://github.com/anomalyco/opencode/blob/337fd144d2ba144743368f78d9579a99cce175bd/packages/web/src/content/docs/go.mdx).
 
 Keep configuration, credentials, snapshots, and runtime logs outside Git. Bind only to loopback; the listener is not an authentication boundary between local processes and must not be exposed through a tunnel. Ctrl-C or SIGTERM allows active requests to drain. Client-visible partial streams are not replayed.
 
 Use credentials in accordance with [provider terms](https://code.claude.com/docs/en/legal-and-compliance). Claude subscription credentials have restrictions on third-party integrations; use supported API credentials where required. A redistribution license has not yet been selected.
 
-See [configuration](docs/configuration.md), [architecture](docs/architecture.md), [testing](docs/testing.md), and [contributing safely](CONTRIBUTING.md). Claude Code's [gateway guide](https://code.claude.com/docs/en/llm-gateway) documents the underlying client environment variables.
+See [configuration](docs/configuration.md), [architecture](docs/architecture.md), [testing](docs/testing.md), [contributing safely](CONTRIBUTING.md), and the [local migration checklist](docs/local-migration.md). Claude Code's [gateway guide](https://code.claude.com/docs/en/llm-gateway) documents the underlying client environment variables.

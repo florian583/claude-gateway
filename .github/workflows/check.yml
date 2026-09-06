@@ -17,5 +17,7 @@ jobs:
           go-version-file: go.mod
           cache: false
       - run: make check build
+      - run: make menubar-check menubar
+      - run: python3 -B scripts/menubar_smoke.py
       - name: Reject formatting drift
         run: test -z "$(gofmt -l *.go)"
