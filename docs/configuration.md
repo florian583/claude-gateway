@@ -8,6 +8,7 @@
 | --- | --- |
 | `version` | Required integer `1` |
 | `listen` | Literal loopback and numeric port; default `127.0.0.1:48104` |
+| `alsoListen` | Optional additional literal-loopback listeners with unique nonzero ports; one process and shared pools |
 | `stateDir` | Private runtime files; default `./state` |
 | `client` | Proxy-facing Claude command, settings directory, and model aliases |
 | `profiles` | Local Claude identities and executable commands |
@@ -17,6 +18,9 @@
 | `modelPools` | Named model-ID lists and selection policy |
 | `chains` | Ordered model/pool stages and paid-fallback policy |
 | `aliases` | Nonempty client model string to chain-ID map |
+| `normalize` | Optional `unsupportedContentTypes: {"tool_reference":"text"}` compatibility mapping |
+| `adaptiveRouting` | Optional scoring settings from `adaptiveRoutingConfig`; applies within sticky-health pools, never across chain stages |
+| `providerQuarantine` | Optional provider-health/network incident settings from `providerQuarantineConfig` |
 
 All aliases must be explicit, including dated names and `[1m]` variants. No family-name wildcard imports an unregistered model. `[1m]` requires every candidate to declare at least 1,000,000 context tokens.
 
@@ -51,6 +55,11 @@ When known, quota affects eligibility and selection alongside affinity and in-fl
 Required: `protocol`, `baseURL`, `billing`, `auth`.
 
 Optional: `displayName`, `variant`, `messagesPath`, `headers`, `requestOverrides`, `responseHeaderTimeoutMS`, `streamIdleTimeoutMS`, `usage`.
+
+Adapter options: `dropResponseContentTypes` may contain `thinking` and
+`redacted_thinking` only; it cannot discard tool calls or text. Set
+`foldSystemIntoMessages` for endpoints requiring system text in messages.
+`circuitBreaker: false` disables the per-route circuit, not quota/auth checks.
 
 Protocols: `anthropic` (native Messages), `openai-chat-completions` (Messages-to-Chat translation and response translation). Not OpenAI Responses/realtime or arbitrary endpoints.
 
@@ -87,6 +96,9 @@ API-key/helper auth defaults to `Authorization: Bearer <token>`. Override `auth.
 
 Model fields: `provider`, `upstream`, optional `accountPool`, `contextWindow`, `supportsImages`, `supportsTools`, `requestOverrides`. Capabilities default to unknown/false. Options merge shallowly, model over provider. Overrides cannot replace `model`, `messages`, `stream`, `tools`, `system`, or `max_tokens`. Other options are provider-native; the operator must verify supported names/values, including reasoning effort.
 
+Optional `responseAlias` controls the model label returned to clients without
+changing the upstream model ID or its declared capabilities.
+
 Model pool fields: `models` (nonempty IDs), `selection` (`fixed-order` default, or `sticky-health`), `minimumContextWindow`, `requireTools`, `requireImages`. Requirements apply to every member. Selection cannot reorder chain stages. Use separate provider IDs to isolate gateway backend preferences; performance aggregates by provider/upstream model.
 
 Chain fields: `steps`, `allowPaidFallback` (false), `paidFallbackOn`, `minimumContextWindow`, `requireTools`, `requireImages`. Each step has exactly one `model` or `pool`. Chains cannot reference chains, so cycles are not expressible. Repeated model IDs are rejected.
@@ -121,4 +133,12 @@ Snapshot format:
 
 Use current RFC3339 timestamps, utilization fraction 0..1, and window percentages 0..100. Future timestamps are rejected. Files are bounded to 1 MiB; valid snapshots are cached for five seconds. Missing/invalid/stale non-exhausted telemetry does not block inference. Losing a collector preserves its last known exhaustion until a reported reset or 24 hours without reset evidence, plus two minutes' grace. Disabling browser mode stops consulting the source, without erasing independent inference-derived blocks.
 
-Collectors, browser/dashboard login, installation, and scheduling are outside this project. Never store cookies, tokens, raw webpages, or prompts in snapshots. A collector reports evidence; Go owns routing decisions.
+Go reads configured snapshot files at startup and every 15 seconds, including while inference is idle. This does not launch a browser or contact a provider. Collectors, browser/dashboard login, installation, and scheduling are outside this project. Never store cookies, tokens, raw webpages, or prompts in snapshots. A collector reports evidence; Go owns routing decisions.
+
+For Ollama API usage, optional `sessionThresholdPct`, `weeklyThresholdPct` and
+`reserveUpstreams` reserve remaining allowance for specific configured upstreams.
+At either configured threshold, other models are skipped; reserved models remain
+eligible until real exhaustion. Values must be in 0..100; zero disables that
+threshold. Requires API mode and at least one threshold and reserve upstream.
+These deliberate quota skips qualify as quota evidence for an explicitly enabled
+paid fallback, but authentication or network failures do not.

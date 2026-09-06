@@ -258,6 +258,42 @@ func (s *proxyServer) configuredBrowserUsage(provider string) (browserUsageProvi
 	s.providerState.browser[provider] = cachedBrowserUsage{value: p, checkedAt: now, available: true}
 	return freshValue(p, true)
 }
+
+// Explicit local snapshots are collected by Go, not by the read-only menu.
+// This never opens a browser or contacts a provider.
+func (s *proxyServer) monitorConfiguredBrowserUsage(ctx context.Context) {
+	if s.cfg.Definition == nil {
+		return
+	}
+	var ids []string
+	for id, p := range s.cfg.Providers {
+		if p.Usage.Mode == "browser" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	read := func() {
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				return
+			}
+			s.configuredBrowserUsage(id)
+		}
+	}
+	read()
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			read()
+		}
+	}
+}
 func (s *proxyServer) catalog(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)

@@ -18,17 +18,21 @@ import (
 
 // fileConfig is the JSON schema; config contains compiled routing tables.
 type fileConfig struct {
-	Version      int                              `json:"version"`
-	Listen       string                           `json:"listen"`
-	StateDir     string                           `json:"stateDir"`
-	Client       clientDefinition                 `json:"client"`
-	Profiles     map[string]profileDefinition     `json:"profiles"`
-	AccountPools map[string]accountPoolDefinition `json:"accountPools"`
-	Providers    map[string]providerDefinition    `json:"providers"`
-	Models       map[string]modelDefinition       `json:"models"`
-	ModelPools   map[string]modelPoolDefinition   `json:"modelPools"`
-	Chains       map[string]chainDefinition       `json:"chains"`
-	Aliases      map[string]string                `json:"aliases"`
+	Version            int                              `json:"version"`
+	Listen             string                           `json:"listen"`
+	AlsoListen         []string                         `json:"alsoListen,omitempty"`
+	Normalize          normalizeConfig                  `json:"normalize,omitempty"`
+	AdaptiveRouting    *adaptiveRoutingConfig           `json:"adaptiveRouting,omitempty"`
+	ProviderQuarantine *providerQuarantineConfig        `json:"providerQuarantine,omitempty"`
+	StateDir           string                           `json:"stateDir"`
+	Client             clientDefinition                 `json:"client"`
+	Profiles           map[string]profileDefinition     `json:"profiles"`
+	AccountPools       map[string]accountPoolDefinition `json:"accountPools"`
+	Providers          map[string]providerDefinition    `json:"providers"`
+	Models             map[string]modelDefinition       `json:"models"`
+	ModelPools         map[string]modelPoolDefinition   `json:"modelPools"`
+	Chains             map[string]chainDefinition       `json:"chains"`
+	Aliases            map[string]string                `json:"aliases"`
 }
 type clientDefinition struct {
 	Command     []string `json:"command"`
@@ -57,11 +61,14 @@ type accountPoolDefinition struct {
 	StickySeconds        int      `json:"stickySeconds"`
 }
 type usageDefinition struct {
-	Mode                string `json:"mode"`
-	PollIntervalSeconds int    `json:"pollIntervalSeconds"`
-	SnapshotPath        string `json:"snapshotPath"`
-	SnapshotKey         string `json:"snapshotKey"`
-	MaxAgeSeconds       int    `json:"maxAgeSeconds"`
+	Mode                string   `json:"mode"`
+	PollIntervalSeconds int      `json:"pollIntervalSeconds"`
+	SnapshotPath        string   `json:"snapshotPath"`
+	SnapshotKey         string   `json:"snapshotKey"`
+	MaxAgeSeconds       int      `json:"maxAgeSeconds"`
+	SessionThresholdPct float64  `json:"sessionThresholdPct,omitempty"`
+	WeeklyThresholdPct  float64  `json:"weeklyThresholdPct,omitempty"`
+	ReserveUpstreams    []string `json:"reserveUpstreams,omitempty"`
 }
 type authDefinition struct {
 	Type      string   `json:"type"`
@@ -73,22 +80,26 @@ type authDefinition struct {
 	Prefix    *string  `json:"prefix"`
 }
 type providerDefinition struct {
-	DisplayName             string            `json:"displayName"`
-	Protocol                string            `json:"protocol"`
-	Variant                 string            `json:"variant"`
-	BaseURL                 string            `json:"baseURL"`
-	MessagesPath            string            `json:"messagesPath"`
-	Billing                 string            `json:"billing"`
-	Auth                    authDefinition    `json:"auth"`
-	Usage                   usageDefinition   `json:"usage"`
-	Headers                 map[string]string `json:"headers"`
-	RequestOverrides        map[string]any    `json:"requestOverrides"`
-	ResponseHeaderTimeoutMS int               `json:"responseHeaderTimeoutMS"`
-	StreamIdleTimeoutMS     int               `json:"streamIdleTimeoutMS"`
+	DisplayName              string            `json:"displayName"`
+	Protocol                 string            `json:"protocol"`
+	Variant                  string            `json:"variant"`
+	BaseURL                  string            `json:"baseURL"`
+	MessagesPath             string            `json:"messagesPath"`
+	Billing                  string            `json:"billing"`
+	Auth                     authDefinition    `json:"auth"`
+	Usage                    usageDefinition   `json:"usage"`
+	Headers                  map[string]string `json:"headers"`
+	RequestOverrides         map[string]any    `json:"requestOverrides"`
+	ResponseHeaderTimeoutMS  int               `json:"responseHeaderTimeoutMS"`
+	StreamIdleTimeoutMS      int               `json:"streamIdleTimeoutMS"`
+	DropResponseContentTypes []string          `json:"dropResponseContentTypes,omitempty"`
+	FoldSystemIntoMessages   bool              `json:"foldSystemIntoMessages,omitempty"`
+	CircuitBreaker           *bool             `json:"circuitBreaker,omitempty"`
 }
 type modelDefinition struct {
 	Provider         string         `json:"provider"`
 	Upstream         string         `json:"upstream"`
+	ResponseAlias    string         `json:"responseAlias,omitempty"`
 	AccountPool      string         `json:"accountPool"`
 	ContextWindow    int            `json:"contextWindow"`
 	SupportsImages   bool           `json:"supportsImages"`
@@ -276,6 +287,15 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	if e != nil || portErr != nil || portNumber < 0 || portNumber > 65535 || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
 		return config{}, errors.New("listen must be a literal loopback IP and port")
 	}
+	seenListeners := map[string]bool{f.Listen: true}
+	for _, addr := range f.AlsoListen {
+		h, p, err := net.SplitHostPort(addr)
+		n, parseErr := strconv.Atoi(p)
+		if err != nil || parseErr != nil || n < 1 || n > 65535 || net.ParseIP(h) == nil || !net.ParseIP(h).IsLoopback() || seenListeners[addr] {
+			return config{}, errors.New("alsoListen requires unique literal loopback addresses and nonzero ports")
+		}
+		seenListeners[addr] = true
+	}
 	if f.StateDir == "" {
 		f.StateDir = "./state"
 	}
@@ -300,6 +320,16 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		}
 	}
 	cfg := config{Definition: &f, Listen: f.Listen, Providers: map[string]providerConfig{}, Models: map[string]modelConfig{}, Chains: map[string]routeChain{}}
+	cfg.AlsoListen = append([]string(nil), f.AlsoListen...)
+	cfg.Normalize = f.Normalize
+	for from, to := range f.Normalize.UnsupportedContentTypes {
+		if from != "tool_reference" || to != "text" {
+			return config{}, errors.New("normalize supports only tool_reference to text")
+		}
+	}
+	if f.ProviderQuarantine != nil {
+		cfg.Quarantine = *f.ProviderQuarantine
+	}
 	cfg.Metrics = metricsConfig{Path: filepath.Join(f.StateDir, "metrics.jsonl"), MaxSamples: 10000}
 	cfg.Logging = loggingConfig{Path: filepath.Join(f.StateDir, "proxy.log")}
 	for _, id := range sortedKeys(f.Profiles) {
@@ -412,6 +442,14 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			return config{}, e
 		}
 		q := providerConfig{BaseURL: p.BaseURL, Headers: p.Headers, RequestOverrides: p.RequestOverrides, Variant: p.Variant, Billing: p.Billing, DisplayName: p.DisplayName, Usage: p.Usage, ResponseHeaderTimeoutMS: p.ResponseHeaderTimeoutMS, StreamIdleTimeoutMS: p.StreamIdleTimeoutMS}
+		for _, contentType := range p.DropResponseContentTypes {
+			if contentType != "thinking" && contentType != "redacted_thinking" {
+				return config{}, errors.New("dropResponseContentTypes supports only thinking and redacted_thinking")
+			}
+		}
+		q.DropResponseContentTypes = p.DropResponseContentTypes
+		q.FoldSystemIntoMessages = p.FoldSystemIntoMessages
+		q.CircuitBreaker = p.CircuitBreaker
 		if p.Protocol == "openai-chat-completions" {
 			q.Format = "openai-chat"
 		}
@@ -503,6 +541,13 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			return config{}, errors.New("invalid auth header")
 		}
 		q.Usage.Mode = firstNonEmpty(p.Usage.Mode, "passive")
+		if !threshold(p.Usage.SessionThresholdPct) || !threshold(p.Usage.WeeklyThresholdPct) {
+			return config{}, errors.New("usage reserve thresholds must be in 0..100")
+		}
+		hasReserve := p.Usage.SessionThresholdPct != 0 || p.Usage.WeeklyThresholdPct != 0 || len(p.Usage.ReserveUpstreams) > 0
+		if hasReserve && (p.Variant != "ollama-cloud" || q.Usage.Mode != "api" || len(p.Usage.ReserveUpstreams) == 0 || p.Usage.SessionThresholdPct == 0 && p.Usage.WeeklyThresholdPct == 0) {
+			return config{}, errors.New("usage reserves require Ollama API usage, a threshold, and reserveUpstreams")
+		}
 		switch q.Usage.Mode {
 		case "passive":
 			if p.Usage.SnapshotPath != "" || p.Usage.SnapshotKey != "" || p.Usage.PollIntervalSeconds != 0 || p.Usage.MaxAgeSeconds != 0 {
@@ -547,6 +592,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			}
 			cfg.OllamaUsage.Provider = id
 			cfg.OllamaUsage.CacheTTLSeconds = q.Usage.PollIntervalSeconds
+			cfg.OllamaUsage.SessionThresholdPct = q.Usage.SessionThresholdPct
+			cfg.OllamaUsage.WeeklyThresholdPct = q.Usage.WeeklyThresholdPct
+			cfg.OllamaUsage.ReserveUpstreams = q.Usage.ReserveUpstreams
 		}
 		if q.Usage.Mode == "api" && p.Variant == "clinepass" {
 			if cfg.ClineUsage.Provider != "" {
@@ -554,6 +602,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			}
 			cfg.ClineUsage.Provider = id
 			cfg.ClineUsage.CacheTTLSeconds = q.Usage.PollIntervalSeconds
+		}
+		if q.Usage.Mode == "api" && p.Variant == "claude-subscription" {
+			cfg.ClaudeUsage.CacheTTLSeconds = q.Usage.PollIntervalSeconds
 		}
 		p.Usage = q.Usage
 		f.Providers[id] = p
@@ -569,6 +620,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if e := validateOverrides(m.RequestOverrides); e != nil {
 			return config{}, e
 		}
+		if m.ResponseAlias != "" && !validID(m.ResponseAlias) {
+			return config{}, fmt.Errorf("model %s has invalid responseAlias", id)
+		}
 		if m.AccountPool != "" && p.Variant != "claude-subscription" {
 			return config{}, errors.New("accountPool only applies to Claude subscription models")
 		}
@@ -579,8 +633,11 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			}
 			cfg.ClaudeUsage.EligibleUpstreams = append(cfg.ClaudeUsage.EligibleUpstreams, m.Upstream)
 		}
+		if m.Provider == cfg.OllamaUsage.Provider && !containsString(cfg.OllamaUsage.EligibleUpstreams, m.Upstream) {
+			cfg.OllamaUsage.EligibleUpstreams = append(cfg.OllamaUsage.EligibleUpstreams, m.Upstream)
+		}
 		images := m.SupportsImages
-		normalizedModels[id] = modelConfig{ModelID: id, Provider: m.Provider, Upstream: m.Upstream, AccountPool: m.AccountPool, AccountStickySeconds: f.AccountPools[m.AccountPool].StickySeconds, ContextWindow: m.ContextWindow, SupportsImages: &images, SupportsTools: m.SupportsTools, ModelOverrides: m.RequestOverrides}
+		normalizedModels[id] = modelConfig{ModelID: id, Provider: m.Provider, Upstream: m.Upstream, ResponseAlias: m.ResponseAlias, AccountPool: m.AccountPool, AccountStickySeconds: f.AccountPools[m.AccountPool].StickySeconds, ContextWindow: m.ContextWindow, SupportsImages: &images, SupportsTools: m.SupportsTools, ModelOverrides: m.RequestOverrides}
 		f.Models[id] = m
 	}
 	for _, id := range sortedKeys(f.ModelPools) {
@@ -688,6 +745,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	cfg.DefaultProvider = cfg.Models[sortedKeys(f.Aliases)[0]].Provider
 	cfg.AdaptiveRouting.Enabled = true
+	if f.AdaptiveRouting != nil {
+		cfg.AdaptiveRouting = *f.AdaptiveRouting
+	}
 	return normalizeRuntimeConfig(path, body, cfg)
 }
 

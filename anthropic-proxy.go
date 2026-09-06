@@ -1082,6 +1082,7 @@ func serve(cfg config) error {
 	go server.monitorClineUsage(ctx)
 	go server.monitorXAIUsage(ctx)
 	go server.monitorProfileCredentials(ctx)
+	go server.monitorConfiguredBrowserUsage(ctx)
 	go server.monitorClaudeUsage(ctx)
 	errCh := make(chan error, len(servers)+1)
 	go func() {
@@ -7044,6 +7045,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			paidEvidence[evidenceKey] = ""
 		}
 		if reservedOut, reason := s.ollamaCandidateReservedOut(candidate); reservedOut {
+			paidEvidence[evidenceKey] = "quota-exhausted"
 			if s.cfg.Logging.DebugRequests {
 				log.Printf("ollama reserve active, skipping provider=%s upstream=%q model=%q reason=%q", providerName, candidate.Upstream, candidate.Requested, reason)
 			}
