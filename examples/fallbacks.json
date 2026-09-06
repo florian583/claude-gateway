@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "listen": "127.0.0.1:48114",
+  "stateDir": "./state",
+  "client": {"command": ["claude"], "configDir": "./client", "model": "flash"},
+  "providers": {
+    "my-go": {
+      "displayName": "OpenCode Go", "protocol": "openai-chat-completions", "variant": "opencode-go",
+      "baseURL": "https://opencode.ai/zen/go/v1", "billing": "subscription",
+      "auth": {"type": "env", "name": "OPENCODE_GO_API_KEY"}
+    },
+    "my-ollama": {
+      "displayName": "Ollama Cloud", "protocol": "anthropic", "variant": "ollama-cloud",
+      "baseURL": "https://ollama.com", "billing": "subscription",
+      "auth": {"type": "env", "name": "OLLAMA_API_KEY"}
+    },
+    "my-merge": {
+      "displayName": "Merge Gateway", "protocol": "anthropic", "variant": "merge-gateway",
+      "baseURL": "https://api-gateway.merge.dev/v1/anthropic", "billing": "metered",
+      "auth": {"type": "env", "name": "MERGE_GATEWAY_API_KEY"}
+    },
+    "my-vercel": {
+      "displayName": "Vercel Gateway", "protocol": "anthropic", "variant": "vercel-gateway",
+      "baseURL": "https://ai-gateway.vercel.sh", "billing": "metered",
+      "auth": {"type": "env", "name": "VERCEL_AI_GATEWAY_API_KEY"}
+    }
+  },
+  "models": {
+    "flash-go": {"provider": "my-go", "upstream": "glm-5.3-flash", "contextWindow": 1000000, "supportsTools": true},
+    "flash-ollama": {"provider": "my-ollama", "upstream": "glm-5.3-flash", "contextWindow": 1000000, "supportsTools": true},
+    "flash-merge": {"provider": "my-merge", "upstream": "zai/glm-5.3-flash", "contextWindow": 1000000, "supportsTools": true},
+    "flash-vercel": {"provider": "my-vercel", "upstream": "zai/glm-5.3-flash", "contextWindow": 1000000, "supportsTools": true},
+    "kimi-ollama": {"provider": "my-ollama", "upstream": "kimi-k3", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true},
+    "kimi-merge": {"provider": "my-merge", "upstream": "moonshot/kimi-k3", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true}
+  },
+  "modelPools": {"flash-subscriptions": {"models": ["flash-go", "flash-ollama"], "selection": "sticky-health", "minimumContextWindow": 1000000, "requireTools": true}},
+  "chains": {
+    "flash": {"steps": [{"pool": "flash-subscriptions"}, {"model": "flash-merge"}, {"model": "flash-vercel"}], "allowPaidFallback": true, "paidFallbackOn": ["quota-exhausted"]},
+    "kimi": {"steps": [{"model": "kimi-ollama"}, {"model": "kimi-merge"}], "allowPaidFallback": true, "requireImages": true}
+  },
+  "aliases": {"flash": "flash", "flash[1m]": "flash", "kimi": "kimi", "kimi[1m]": "kimi"}
+}

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "listen": "127.0.0.1:48114",
+  "stateDir": "./state",
+  "client": {"command": ["claude"], "configDir": "./client", "model": "chat"},
+  "providers": {
+    "my-chat": {
+      "displayName": "My chat provider", "protocol": "openai-chat-completions", "variant": "generic",
+      "baseURL": "https://provider.example/v1", "billing": "metered",
+      "auth": {"type": "env", "name": "MY_CHAT_API_KEY"}
+    },
+    "my-messages": {
+      "displayName": "My Messages provider", "protocol": "anthropic", "variant": "generic",
+      "baseURL": "https://messages.example/v1", "billing": "metered",
+      "auth": {"type": "env", "name": "MY_MESSAGES_API_KEY", "header": "x-api-key", "prefix": ""}
+    }
+  },
+  "models": {
+    "chat": {"provider": "my-chat", "upstream": "REPLACE_WITH_CHAT_MODEL_ID", "supportsTools": true},
+    "messages": {"provider": "my-messages", "upstream": "REPLACE_WITH_MESSAGES_MODEL_ID", "supportsTools": true}
+  },
+  "chains": {"chat": {"steps": [{"model": "chat"}]}, "messages": {"steps": [{"model": "messages"}]}},
+  "aliases": {"chat": "chat", "messages": "messages"}
+}

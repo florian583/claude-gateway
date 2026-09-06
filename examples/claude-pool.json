@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "listen": "127.0.0.1:48114",
+  "stateDir": "./state",
+  "client": {"command": ["claude"], "configDir": "./client", "model": "worker"},
+  "profiles": {
+    "work": {"displayName": "Work", "command": ["claude"], "configDir": "./profiles/work"},
+    "backup": {"displayName": "Backup", "command": ["claude"], "configDir": "./profiles/backup", "sevenDayThresholdPct": 95}
+  },
+  "accountPools": {
+    "claude": {"profiles": ["work", "backup"], "fiveHourThresholdPct": 100, "sevenDayThresholdPct": 100, "stickySeconds": 1800}
+  },
+  "providers": {
+    "claude": {
+      "displayName": "Claude subscriptions", "protocol": "anthropic", "variant": "claude-subscription",
+      "baseURL": "https://api.anthropic.com", "billing": "subscription",
+      "auth": {"type": "claude-profile-pool", "pool": "claude"},
+      "usage": {"mode": "api", "pollIntervalSeconds": 60}
+    }
+  },
+  "models": {
+    "worker": {"provider": "claude", "upstream": "REPLACE_WITH_YOUR_MODEL_ID", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true}
+  },
+  "chains": {"worker": {"steps": [{"model": "worker"}], "requireTools": true}},
+  "aliases": {"worker": "worker", "worker[1m]": "worker"}
+}
