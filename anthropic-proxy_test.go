@@ -761,12 +761,16 @@ func TestConfiguredClaudeProfilesDeduplicatesSameSubscription(t *testing.T) {
 	directory := t.TempDir()
 	primaryCache := filepath.Join(directory, "primary.json")
 	duplicateCache := filepath.Join(directory, "duplicate.json")
+	differentOrganizationCache := filepath.Join(directory, "different-organization.json")
 	otherCache := filepath.Join(directory, "other.json")
 	duplicateIdentity := []byte(`{"oauthAccount":{"accountUuid":"account-a","organizationUuid":"org-a"}}`)
 	if err := os.WriteFile(primaryCache, duplicateIdentity, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(duplicateCache, duplicateIdentity, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(differentOrganizationCache, []byte(`{"oauthAccount":{"accountUuid":"account-a","organizationUuid":"org-b"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(otherCache, []byte(`{"oauthAccount":{"accountUuid":"account-b","organizationUuid":"org-b"}}`), 0o600); err != nil {
@@ -778,13 +782,14 @@ func TestConfiguredClaudeProfilesDeduplicatesSameSubscription(t *testing.T) {
 			"48104": {Name: "primary", CachePath: primaryCache, CredentialsService: "primary-service"},
 		},
 		AccountProfiles: map[string]claudeUsageProfile{
-			"duplicate": {Name: "duplicate", CachePath: duplicateCache, CredentialsService: "duplicate-service"},
-			"other":     {Name: "other", CachePath: otherCache, CredentialsService: "other-service"},
+			"different-org": {Name: "different-org", CachePath: differentOrganizationCache, CredentialsService: "different-org-service"},
+			"duplicate":     {Name: "duplicate", CachePath: duplicateCache, CredentialsService: "duplicate-service"},
+			"other":         {Name: "other", CachePath: otherCache, CredentialsService: "other-service"},
 		},
 	}}}
 	profiles := server.configuredClaudeProfiles()
-	if len(profiles) != 2 || profiles[0].Name != "primary" || profiles[1].Name != "other" {
-		t.Fatalf("profiles = %#v, want primary plus distinct other subscription", profiles)
+	if len(profiles) != 3 || profiles[0].Name != "primary" || profiles[1].Name != "different-org" || profiles[2].Name != "other" {
+		t.Fatalf("profiles = %#v, want exact duplicate excluded and distinct organizations retained", profiles)
 	}
 }
 
