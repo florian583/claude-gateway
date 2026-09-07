@@ -545,6 +545,13 @@ type claudeUsageCache struct {
 	mu         sync.Mutex
 	snapshots  map[string]claudeUsageSnapshot
 	refreshing map[string]chan struct{}
+	retryAt    map[string]time.Time
+}
+
+type claudeUsageRateLimit struct{ delay time.Duration }
+
+func (e *claudeUsageRateLimit) Error() string {
+	return "Claude usage endpoint returned status 429"
 }
 
 type claudeIdentityCacheEntry struct {
@@ -5638,6 +5645,9 @@ func (s *proxyServer) fetchClaudeUsageSnapshot(ctx context.Context, auth, profil
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return claudeUsageSnapshot{}, &claudeUsageRateLimit{delay: providerCooldown(resp.Header, nil)}
+		}
 		return claudeUsageSnapshot{}, fmt.Errorf("Claude usage endpoint returned status %d", resp.StatusCode)
 	}
 	var payload claudeUsageResponse
@@ -5726,6 +5736,19 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 		s.claudeUse.refreshing = map[string]chan struct{}{}
 	}
 	staleSnapshot, hasStaleSnapshot := s.claudeUse.snapshots[key]
+	if time.Now().Before(s.claudeUse.retryAt[key]) {
+		s.claudeUse.mu.Unlock()
+		if hasStaleSnapshot && time.Since(staleSnapshot.FetchedAt) < staleTTL {
+			if staleSnapshot.Source == "oauth-api" {
+				staleSnapshot.Source = "oauth-api-stale"
+			}
+			return staleSnapshot, nil
+		}
+		if cached, err := readClaudeCLIUsage(profile, staleTTL); err == nil {
+			return cached, nil
+		}
+		return claudeUsageSnapshot{}, errors.New("Claude usage refresh cooling down after failed fetch")
+	}
 	if hasStaleSnapshot && !force {
 		if math.Max(staleSnapshot.FiveHour.Utilization, staleSnapshot.SevenDay.Utilization) >= 90 && cacheTTL > 30*time.Second {
 			cacheTTL = 30 * time.Second
@@ -5761,6 +5784,19 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 	s.claudeUse.mu.Unlock()
 
 	snapshot, fetchErr := s.fetchClaudeUsageSnapshot(ctx, auth, profile.Name)
+	if fetchErr != nil {
+		delay := 5 * time.Second
+		var limited *claudeUsageRateLimit
+		if errors.As(fetchErr, &limited) {
+			delay = limited.delay
+		}
+		s.claudeUse.mu.Lock()
+		if s.claudeUse.retryAt == nil {
+			s.claudeUse.retryAt = map[string]time.Time{}
+		}
+		s.claudeUse.retryAt[key] = time.Now().Add(delay)
+		s.claudeUse.mu.Unlock()
+	}
 	if fetchErr != nil {
 		if force {
 			log.Printf("Claude usage background fetch failed profile=%q error=%v", profile.Name, fetchErr)
@@ -5843,21 +5879,14 @@ func (s *proxyServer) monitorClaudeUsage(ctx context.Context) {
 	if s.cfg.Definition != nil {
 		interval = time.Duration(s.cfg.Providers[s.cfg.ClaudeUsage.Provider].Usage.PollIntervalSeconds) * time.Second
 	}
-	retry := 5 * time.Second
+	// Check individual due times frequently so one delayed account cannot shift
+	// every other account's schedule. Fresh accounts do not make HTTP requests.
+	tick := min(5*time.Second, interval)
 	force := true
 	for {
-		started := time.Now()
-		delay := interval
-		if s.refreshClaudeUsageProfiles(ctx, force) {
-			retry = 5 * time.Second
-			force = true
-			delay = max(0, interval-time.Since(started))
-		} else {
-			force = false // Retry unavailable accounts; reuse other accounts' fresh snapshots.
-			delay = min(retry, interval)
-			retry = min(retry*2, interval)
-		}
-		timer := time.NewTimer(delay)
+		s.refreshClaudeUsageProfiles(ctx, force)
+		force = false
+		timer := time.NewTimer(tick)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
