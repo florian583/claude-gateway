@@ -5709,6 +5709,10 @@ func (s *proxyServer) claudeUsageSnapshot(ctx context.Context, r *http.Request) 
 }
 
 func (s *proxyServer) claudeUsageSnapshotWithAuth(ctx context.Context, auth string, profile claudeUsageProfile) (claudeUsageSnapshot, error) {
+	return s.claudeUsageSnapshotRefresh(ctx, auth, profile, false)
+}
+
+func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth string, profile claudeUsageProfile, force bool) (claudeUsageSnapshot, error) {
 	policy := s.cfg.ClaudeUsage
 	key := claudeTokenKey(auth)
 	cacheTTL := time.Duration(policy.CacheTTLSeconds) * time.Second
@@ -5722,7 +5726,7 @@ func (s *proxyServer) claudeUsageSnapshotWithAuth(ctx context.Context, auth stri
 		s.claudeUse.refreshing = map[string]chan struct{}{}
 	}
 	staleSnapshot, hasStaleSnapshot := s.claudeUse.snapshots[key]
-	if hasStaleSnapshot {
+	if hasStaleSnapshot && !force {
 		if math.Max(staleSnapshot.FiveHour.Utilization, staleSnapshot.SevenDay.Utilization) >= 90 && cacheTTL > 30*time.Second {
 			cacheTTL = 30 * time.Second
 		}
@@ -5758,6 +5762,9 @@ func (s *proxyServer) claudeUsageSnapshotWithAuth(ctx context.Context, auth stri
 
 	snapshot, fetchErr := s.fetchClaudeUsageSnapshot(ctx, auth, profile.Name)
 	if fetchErr != nil {
+		if force {
+			log.Printf("Claude usage background fetch failed profile=%q error=%v", profile.Name, fetchErr)
+		}
 		if cliSnapshot, cliErr := readClaudeCLIUsage(profile, staleTTL); cliErr == nil {
 			snapshot = cliSnapshot
 			fetchErr = nil
@@ -5786,9 +5793,10 @@ func (s *proxyServer) claudeUsageSnapshotWithAuth(ctx context.Context, auth stri
 	return snapshot, fetchErr
 }
 
-func (s *proxyServer) refreshClaudeUsageProfiles(ctx context.Context) {
+func (s *proxyServer) refreshClaudeUsageProfiles(ctx context.Context, force bool) bool {
 	profiles := s.configuredClaudeProfiles()
 	var wait sync.WaitGroup
+	var failed atomic.Bool
 	for _, profile := range profiles {
 		profile := profile
 		wait.Add(1)
@@ -5798,15 +5806,30 @@ func (s *proxyServer) refreshClaudeUsageProfiles(ctx context.Context) {
 			defer cancel()
 			token, err := resolveClaudeProfileOAuthToken(refreshCtx, profile)
 			if err != nil {
+				failed.Store(true)
+				log.Printf("Claude usage background credentials unavailable profile=%q", profile.Name)
 				if refreshCtx.Err() == nil {
 					s.triggerClaudeOAuthRefresh(profile)
 				}
 				return
 			}
-			_, _ = s.claudeUsageSnapshotWithAuth(refreshCtx, "Bearer "+token, profile)
+			auth := "Bearer " + token
+			if !force {
+				s.claudeUse.mu.Lock()
+				cached, ok := s.claudeUse.snapshots[claudeTokenKey(auth)]
+				s.claudeUse.mu.Unlock()
+				if ok && cached.Source == "oauth-api" && time.Since(cached.FetchedAt) < time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
+					return
+				}
+			}
+			snapshot, err := s.claudeUsageSnapshotRefresh(refreshCtx, auth, profile, true)
+			if err != nil || snapshot.Source != "oauth-api" || time.Since(snapshot.FetchedAt) >= time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
+				failed.Store(true)
+			}
 		}()
 	}
 	wait.Wait()
+	return !failed.Load()
 }
 
 func (s *proxyServer) monitorClaudeUsage(ctx context.Context) {
@@ -5816,19 +5839,30 @@ func (s *proxyServer) monitorClaudeUsage(ctx context.Context) {
 	if s.cfg.ClaudeUsage.Provider == "" || len(s.configuredClaudeProfiles()) == 0 {
 		return
 	}
-	s.refreshClaudeUsageProfiles(ctx)
 	interval := time.Minute
 	if s.cfg.Definition != nil {
 		interval = time.Duration(s.cfg.Providers[s.cfg.ClaudeUsage.Provider].Usage.PollIntervalSeconds) * time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	retry := 5 * time.Second
+	force := true
 	for {
+		started := time.Now()
+		delay := interval
+		if s.refreshClaudeUsageProfiles(ctx, force) {
+			retry = 5 * time.Second
+			force = true
+			delay = max(0, interval-time.Since(started))
+		} else {
+			force = false // Retry unavailable accounts; reuse other accounts' fresh snapshots.
+			delay = min(retry, interval)
+			retry = min(retry*2, interval)
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			s.refreshClaudeUsageProfiles(ctx)
+		case <-timer.C:
 		}
 	}
 }
