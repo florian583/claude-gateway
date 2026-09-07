@@ -5196,6 +5196,9 @@ func readClaudeProfileAccountKey(profile claudeUsageProfile) string {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return ""
 	}
+	if state.OAuthAccount.AccountUUID != "" && state.OAuthAccount.OrganizationUUID != "" {
+		return "account:" + state.OAuthAccount.AccountUUID + "/organization:" + state.OAuthAccount.OrganizationUUID
+	}
 	if state.OAuthAccount.AccountUUID != "" {
 		return "account:" + state.OAuthAccount.AccountUUID
 	}
