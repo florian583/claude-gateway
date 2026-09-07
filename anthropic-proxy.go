@@ -542,10 +542,11 @@ type claudeUsageSnapshot struct {
 }
 
 type claudeUsageCache struct {
-	mu         sync.Mutex
-	snapshots  map[string]claudeUsageSnapshot
-	refreshing map[string]chan struct{}
-	retryAt    map[string]time.Time
+	mu            sync.Mutex
+	workerHistory map[string][]claudeUsageSnapshot
+	snapshots     map[string]claudeUsageSnapshot
+	refreshing    map[string]chan struct{}
+	retryAt       map[string]time.Time
 }
 
 type claudeUsageRateLimit struct{ delay time.Duration }
@@ -5504,6 +5505,10 @@ func (s *proxyServer) selectClaudeProfile(ctx context.Context, r *http.Request, 
 			failures = append(failures, profile.Name+":usage_exhausted")
 			continue
 		}
+		if reason := s.claudeWorkerReserveReason(snapshot, candidate); reason != "" {
+			failures = append(failures, profile.Name+":"+reason)
+			continue
+		}
 		available = append(available, availableClaudeAccount{profile: profile, snapshot: snapshot})
 	}
 	if len(available) > 0 {
@@ -5816,6 +5821,7 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 	s.claudeUse.mu.Lock()
 	if fetchErr == nil {
 		snapshot.TokenKey = key
+		s.rememberWorkerUsageLocked(snapshot)
 		for existingKey, cached := range s.claudeUse.snapshots {
 			if existingKey != key && snapshot.Profile != "" && cached.Profile == snapshot.Profile && !cached.FetchedAt.After(snapshot.FetchedAt) {
 				delete(s.claudeUse.snapshots, existingKey)
@@ -5911,6 +5917,9 @@ func (s *proxyServer) claudeSubscriptionAllowed(ctx context.Context, r *http.Req
 	if s.cfg.Definition != nil {
 		if !s.snapshotAllowedForCandidate(snapshot, candidate) {
 			return false, "configured_quota_limit"
+		}
+		if reason := s.claudeWorkerReserveReason(snapshot, candidate); reason != "" {
+			return false, reason
 		}
 		return true, ""
 	}

@@ -10,13 +10,32 @@ A local gateway for Claude Code. Route requests through Claude accounts and API 
 
 ## Requirements
 
-- Go 1.27 or later.
+- Go 1.27 or later when building from source; not required for packaged binaries.
 - Claude Code installed and available as `claude`.
 - macOS for Claude subscription credentials, which use Keychain. API-key providers do not require Keychain.
 
 ## Quick start
 
 ### 1. Build and install
+
+Download a matching archive and `.sha256` file from [Releases](https://github.com/florian583/claude-gateway/releases).
+`darwin` means macOS; `arm64` is Apple Silicon and `amd64` is Intel/x64.
+Linux packages support API providers; Claude subscription credentials require macOS Keychain.
+Verify the archive before extracting, then install its `claude-proxy` executable
+into a directory on your `PATH`. For example, on Apple Silicon:
+
+```sh
+shasum -a 256 -c claude-proxy-darwin-arm64.tar.gz.sha256
+tar -xzf claude-proxy-darwin-arm64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 claude-proxy-darwin-arm64/claude-proxy "$HOME/.local/bin/claude-proxy"
+```
+
+Packages are not Apple-notarized. Checksums detect corruption, not publisher identity;
+download both files from this repository's release. The optional menu app is built separately.
+Until a versioned release is published, download packages from a successful
+[Package workflow](https://github.com/florian583/claude-gateway/actions/workflows/package.yml)
+run (GitHub sign-in required; artifacts expire after 14 days), or build from source:
 
 ```sh
 git clone https://github.com/florian583/claude-gateway.git
@@ -98,6 +117,40 @@ claude-routed --resume
 ```
 
 The launcher preserves the project directory and forwards Claude arguments. It sets the proxy URL and a non-secret local token, while removing inherited upstream credentials. The proxy supplies the selected provider's credentials. Do not log in to a subscription through `claude-routed`; use `profiles login` or an account alias.
+
+## Agent-assisted setup
+
+Copy this prompt into your coding agent:
+
+```text
+Set up Claude Gateway on this computer from https://github.com/florian583/claude-gateway.
+Read README.md and docs/configuration.md from the selected release/checkout first.
+
+Inspect OS, architecture, Claude Code installation, existing profiles, shell aliases,
+and occupied ports. Preserve existing settings and running sessions. Ask only for
+missing choices: accounts/providers to use, model aliases, and whether paid fallback
+is allowed. Do not assume model IDs, capabilities, subscriptions, or credentials.
+
+Prefer a matching release binary and verify its SHA-256 checksum; otherwise build
+from source with the documented Go version and run the checks. Keep configuration,
+credentials, and runtime data outside the repository. Never print tokens or commit
+personal settings. On Linux use supported API providers, not macOS Keychain profiles.
+
+Create or reuse explicitly selected account profiles. Use profiles add and profiles
+login for new accounts; let me complete interactive login. Keep direct account access
+separate from the proxy client directory. Create non-conflicting aliases for direct
+account management and daily proxy use (claude-proxy run --).
+
+Configure exact model aliases and sequential fallback chains. Keep usage collection
+passive by default, browser collection off, and metered fallback off unless I approve.
+Explain optional API usage polling and workerUtilizationLimitPct if I want quota reserves.
+
+Validate config, start only one loopback listener, and verify /health and /status.
+With my approval, send one small test through the proxy and confirm its actual route.
+Do not claim login or inference works from config validation alone. Ask before
+installing an autostart service or the optional menu app. Finish with paths, aliases,
+start/stop instructions, verification results, and any remaining login steps.
+```
 
 ## Client configuration
 

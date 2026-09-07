@@ -349,7 +349,8 @@ func (s *proxyServer) configuredClaudeUsageStatus() map[string]any {
 			}
 			candidate := modelConfig{Provider: m.Provider, Upstream: m.Upstream, AccountPool: m.AccountPool}
 			blocked, state := s.providerBlockForCandidate(m.Provider+"@"+id, candidate)
-			eligibility[name] = map[string]any{"eligible": !blocked && s.snapshotAllowedForCandidate(snapshot, candidate), "blockReason": state.Reason, "blockedUntil": state.BlockedUntil}
+			workerReason := s.claudeWorkerReserveReason(snapshot, candidate)
+			eligibility[name] = map[string]any{"eligible": !blocked && s.snapshotAllowedForCandidate(snapshot, candidate) && workerReason == "", "blockReason": state.Reason, "blockedUntil": state.BlockedUntil, "workerReserveReason": workerReason}
 		}
 		entry["models"] = eligibility
 		profiles[id] = entry

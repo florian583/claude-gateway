@@ -1,4 +1,5 @@
 /bin/
+/dist/
 /state/
 /client/
 /profiles/

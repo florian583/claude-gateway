@@ -48,6 +48,22 @@ Pool fields: `profiles` (nonempty ordered IDs), `fiveHourThresholdPct`, `sevenDa
 
 One Claude subscription provider is supported per instance, with multiple named pools. `auth.pool` supplies its default pool; a Claude model's `accountPool` can choose another. No account outside that model's pool is tried. No speculative duplicate generation is issued.
 
+Optional pool `workerUtilizationLimitPct` (0 disables; e.g. 75) reserves remaining
+capacity for Opus/Fable. Sonnet/Haiku requests, including main sessions using those
+models, skip an account once either 5-hour or weekly utilization reaches this
+limit. Other eligible accounts are tried before the configured fallback chain.
+This is a routing reserve, not a provider ban or evidence authorizing paid fallback.
+
+With API usage collection enabled, the proxy retains one actual subscription
+percentage observation per account every five minutes, for 30 minutes, in memory.
+After at least ten minutes of observations in the same quota window, it projects
+recent percentage growth to reset. Workers skip accounts projected to reach the
+limit early; as the measured pace slows, they become eligible again. No token
+budget or dollar estimate is involved. Stale/future samples and changed reset
+windows cannot establish pace. After restart the fixed cap applies while fresh
+history accumulates. Unknown usage remains unknown. This cannot guarantee an
+exact reserve with concurrent in-flight requests or delayed provider telemetry.
+
 When known, quota affects eligibility and selection alongside affinity and in-flight load. Unknown quota remains eligible without pretending to be unused. Actual auth, account, and model-specific blocks still apply. Proactive reserves require fresh telemetry; without it they cannot be guaranteed.
 
 ## Provider fields

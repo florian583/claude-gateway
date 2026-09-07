@@ -55,10 +55,11 @@ type profileDefinition struct {
 	RefreshCommand []string `json:"refreshCommand"`
 }
 type accountPoolDefinition struct {
-	Profiles             []string `json:"profiles"`
-	FiveHourThresholdPct float64  `json:"fiveHourThresholdPct"`
-	SevenDayThresholdPct float64  `json:"sevenDayThresholdPct"`
-	StickySeconds        int      `json:"stickySeconds"`
+	WorkerUtilizationLimitPct float64  `json:"workerUtilizationLimitPct,omitempty"`
+	Profiles                  []string `json:"profiles"`
+	FiveHourThresholdPct      float64  `json:"fiveHourThresholdPct"`
+	SevenDayThresholdPct      float64  `json:"sevenDayThresholdPct"`
+	StickySeconds             int      `json:"stickySeconds"`
 }
 type usageDefinition struct {
 	Mode                string   `json:"mode"`
@@ -381,6 +382,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	for _, id := range sortedKeys(f.AccountPools) {
 		p := f.AccountPools[id]
+		if p.WorkerUtilizationLimitPct < 0 || p.WorkerUtilizationLimitPct > 100 {
+			return config{}, fmt.Errorf("invalid worker utilization limit for pool %s", id)
+		}
 		if !validID(id) || len(p.Profiles) == 0 {
 			return config{}, fmt.Errorf("account pool %q is empty or invalid", id)
 		}
