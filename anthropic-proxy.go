@@ -542,11 +542,17 @@ type claudeUsageSnapshot struct {
 }
 
 type claudeUsageCache struct {
-	mu            sync.Mutex
-	workerHistory map[string][]claudeUsageSnapshot
-	snapshots     map[string]claudeUsageSnapshot
-	refreshing    map[string]chan struct{}
-	retryAt       map[string]time.Time
+	gate              chan struct{}
+	nextFetch         time.Time
+	globalRetryAt     time.Time
+	credentialRetryAt map[string]time.Time
+	pollCursor        int
+	persistMu         sync.Mutex
+	mu                sync.Mutex
+	workerHistory     map[string][]claudeUsageSnapshot
+	snapshots         map[string]claudeUsageSnapshot
+	refreshing        map[string]chan struct{}
+	retryAt           map[string]time.Time
 }
 
 type claudeUsageRateLimit struct{ delay time.Duration }
@@ -1022,6 +1028,7 @@ type proxyServer struct {
 	networkIncident          sharedNetworkIncidentState
 	clockNow                 func() time.Time
 	claudeRefreshMu          sync.Mutex
+	claudeAuthRefreshGate    chan struct{}
 	claudeRefreshInFlight    map[string]bool
 	claudeRefreshLastAttempt map[string]time.Time
 	claudeRefreshRunner      func(context.Context, claudeUsageProfile) error
@@ -1764,6 +1771,7 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 			sticky:      map[string]stickyRoute{},
 		},
 		claudeUse: claudeUsageCache{
+			gate:       make(chan struct{}, 1),
 			snapshots:  map[string]claudeUsageSnapshot{},
 			refreshing: map[string]chan struct{}{},
 		},
@@ -1780,6 +1788,7 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 	server.claudeRefreshRunner = func(ctx context.Context, profile claudeUsageProfile) error {
 		return server.refreshProfileCredentials(ctx, profile)
 	}
+	server.loadClaudeUsageCache()
 	return server, nil
 }
 
@@ -5629,6 +5638,11 @@ func claudeTokenKey(auth string) string {
 }
 
 func (s *proxyServer) fetchClaudeUsageSnapshot(ctx context.Context, auth, profile string) (claudeUsageSnapshot, error) {
+	release, err := s.admitClaudeUsageFetch(ctx)
+	if err != nil {
+		return claudeUsageSnapshot{}, err
+	}
+	defer release()
 	policy := s.cfg.ClaudeUsage
 	providerURL, ok := s.providers[policy.Provider]
 	if !ok {
@@ -5654,7 +5668,11 @@ func (s *proxyServer) fetchClaudeUsageSnapshot(ctx context.Context, auth, profil
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
 		if resp.StatusCode == http.StatusTooManyRequests {
-			return claudeUsageSnapshot{}, &claudeUsageRateLimit{delay: providerCooldown(resp.Header, nil)}
+			delay := providerCooldown(resp.Header, nil)
+			s.claudeUse.mu.Lock()
+			s.claudeUse.globalRetryAt = time.Now().Add(delay)
+			s.claudeUse.mu.Unlock()
+			return claudeUsageSnapshot{}, &claudeUsageRateLimit{delay: delay}
 		}
 		return claudeUsageSnapshot{}, fmt.Errorf("Claude usage endpoint returned status %d", resp.StatusCode)
 	}
@@ -5744,6 +5762,13 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 		s.claudeUse.refreshing = map[string]chan struct{}{}
 	}
 	staleSnapshot, hasStaleSnapshot := s.claudeUse.snapshots[key]
+	if !hasStaleSnapshot && profile.Name != "" {
+		for _, cached := range s.claudeUse.snapshots {
+			if cached.Profile == profile.Name && (!hasStaleSnapshot || cached.FetchedAt.After(staleSnapshot.FetchedAt)) {
+				staleSnapshot, hasStaleSnapshot = cached, true
+			}
+		}
+	}
 	if time.Now().Before(s.claudeUse.retryAt[key]) {
 		s.claudeUse.mu.Unlock()
 		if hasStaleSnapshot && time.Since(staleSnapshot.FetchedAt) < staleTTL {
@@ -5809,7 +5834,7 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 		if force {
 			log.Printf("Claude usage background fetch failed profile=%q error=%v", profile.Name, fetchErr)
 		}
-		if cliSnapshot, cliErr := readClaudeCLIUsage(profile, staleTTL); cliErr == nil {
+		if cliSnapshot, cliErr := readClaudeCLIUsage(profile, staleTTL); cliErr == nil && (!hasStaleSnapshot || cliSnapshot.FetchedAt.After(staleSnapshot.FetchedAt)) {
 			snapshot = cliSnapshot
 			fetchErr = nil
 		} else if hasStaleSnapshot && time.Since(staleSnapshot.FetchedAt) < staleTTL {
@@ -5835,46 +5860,91 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 	close(waiting)
 	delete(s.claudeUse.refreshing, key)
 	s.claudeUse.mu.Unlock()
+	s.persistClaudeUsageCache()
 	return snapshot, fetchErr
 }
 
 func (s *proxyServer) refreshClaudeUsageProfiles(ctx context.Context, force bool) bool {
-	profiles := s.configuredClaudeProfiles()
-	var wait sync.WaitGroup
-	var failed atomic.Bool
-	for _, profile := range profiles {
-		profile := profile
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			token, err := resolveClaudeProfileOAuthToken(refreshCtx, profile)
-			if err != nil {
-				failed.Store(true)
-				log.Printf("Claude usage background credentials unavailable profile=%q", profile.Name)
-				if refreshCtx.Err() == nil {
-					s.triggerClaudeOAuthRefresh(profile)
-				}
-				return
-			}
-			auth := "Bearer " + token
-			if !force {
-				s.claudeUse.mu.Lock()
-				cached, ok := s.claudeUse.snapshots[claudeTokenKey(auth)]
-				s.claudeUse.mu.Unlock()
-				if ok && cached.Source == "oauth-api" && time.Since(cached.FetchedAt) < time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
-					return
-				}
-			}
-			snapshot, err := s.claudeUsageSnapshotRefresh(refreshCtx, auth, profile, true)
-			if err != nil || snapshot.Source != "oauth-api" || time.Since(snapshot.FetchedAt) >= time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
-				failed.Store(true)
-			}
-		}()
+	s.claudeUse.mu.Lock()
+	coolingDown := time.Now().Before(s.claudeUse.globalRetryAt)
+	s.claudeUse.mu.Unlock()
+	if coolingDown {
+		return false
 	}
-	wait.Wait()
-	return !failed.Load()
+	profiles := s.configuredClaudeProfiles()
+	// Rotate the first account so a throttled account cannot monopolize recovery.
+	if len(profiles) > 1 {
+		s.claudeUse.mu.Lock()
+		start := s.claudeUse.pollCursor % len(profiles)
+		s.claudeUse.pollCursor++
+		s.claudeUse.mu.Unlock()
+		profiles = append(profiles[start:], profiles[:start]...)
+	}
+	failed := false
+	for _, profile := range profiles {
+		if err := ctx.Err(); err != nil {
+			return false
+		}
+		// Check profile snapshots before resolving credentials, including restored
+		// snapshots whose key is intentionally independent of the OAuth token.
+		if !force {
+			fresh := false
+			s.claudeUse.mu.Lock()
+			for _, cached := range s.claudeUse.snapshots {
+				age := time.Since(cached.FetchedAt)
+				if cached.Profile == profile.Name && cached.Source == "oauth-api" && age >= 0 && age < time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
+					fresh = true
+					break
+				}
+			}
+			s.claudeUse.mu.Unlock()
+			if fresh {
+				continue
+			}
+		}
+		s.claudeUse.mu.Lock()
+		credentialBlocked := time.Now().Before(s.claudeUse.credentialRetryAt[profile.CredentialsService])
+		s.claudeUse.mu.Unlock()
+		if credentialBlocked {
+			failed = true
+			continue
+		}
+		// Anthropic's OAuth usage endpoint rate-limits bursts across accounts.
+		// Shared admission also serializes request-time cache misses.
+		refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		token, err := resolveClaudeProfileOAuthToken(refreshCtx, profile)
+		if err != nil {
+			failed = true
+			s.claudeUse.mu.Lock()
+			if s.claudeUse.credentialRetryAt == nil {
+				s.claudeUse.credentialRetryAt = map[string]time.Time{}
+			}
+			s.claudeUse.credentialRetryAt[profile.CredentialsService] = time.Now().Add(time.Minute)
+			s.claudeUse.mu.Unlock()
+			log.Printf("Claude usage background credentials unavailable profile=%q", profile.Name)
+			if refreshCtx.Err() == nil {
+				s.triggerClaudeOAuthRefresh(profile)
+			}
+			cancel()
+			continue
+		}
+		auth := "Bearer " + token
+		if !force {
+			s.claudeUse.mu.Lock()
+			cached, ok := s.claudeUse.snapshots[claudeTokenKey(auth)]
+			s.claudeUse.mu.Unlock()
+			if ok && cached.Source == "oauth-api" && time.Since(cached.FetchedAt) < time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
+				cancel()
+				continue
+			}
+		}
+		snapshot, err := s.claudeUsageSnapshotRefresh(refreshCtx, auth, profile, true)
+		if err != nil || snapshot.Source != "oauth-api" || time.Since(snapshot.FetchedAt) >= time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second {
+			failed = true
+		}
+		cancel()
+	}
+	return !failed
 }
 
 func (s *proxyServer) monitorClaudeUsage(ctx context.Context) {
@@ -5888,13 +5958,11 @@ func (s *proxyServer) monitorClaudeUsage(ctx context.Context) {
 	if s.cfg.Definition != nil {
 		interval = time.Duration(s.cfg.Providers[s.cfg.ClaudeUsage.Provider].Usage.PollIntervalSeconds) * time.Second
 	}
-	// Check individual due times frequently so one delayed account cannot shift
-	// every other account's schedule. Fresh accounts do not make HTTP requests.
-	tick := min(5*time.Second, interval)
-	force := true
+	// Cheap due checks; fresh profiles skip both credential and HTTP work.
+	// Startup honors persisted snapshots instead of forcing a quota burst.
+	tick := min(30*time.Second, interval)
 	for {
-		s.refreshClaudeUsageProfiles(ctx, force)
-		force = false
+		s.refreshClaudeUsageProfiles(ctx, false)
 		timer := time.NewTimer(tick)
 		select {
 		case <-ctx.Done():
@@ -8847,6 +8915,9 @@ func providerSpecificRequestIncompatibility(status int, body []byte) bool {
 		return false
 	}
 	text := strings.ToLower(string(body))
+	if strings.Contains(text, "deferred custom tools are only supported") && strings.Contains(text, "implement deferral") {
+		return true
+	}
 	capability := strings.Contains(text, "image input") || strings.Contains(text, "vision") ||
 		strings.Contains(text, "tool choice") || strings.Contains(text, "structured output")
 	parameter := strings.Contains(text, "temperature") || strings.Contains(text, "parameter") ||
@@ -9353,8 +9424,17 @@ func filterSSE(source io.Reader, writer io.Writer, dropTypes map[string]bool, in
 	sawMessageStart := false
 	sawTerminal := false   // message_stop or upstream error event
 	sawStopReason := false // a message_delta with non-null stop_reason
+	sawMessageStop := false
 	flush := func() error {
 		frameBytes = 0
+		// OpenRouter appends an OpenAI sentinel after a complete Anthropic
+		// message. Ignore only that trailing marker; premature DONE remains
+		// a protocol error and cannot turn a truncated stream into success.
+		terminalFrame := strings.ReplaceAll(strings.TrimSpace(strings.Join(lines, "")), "\r\n", "\n")
+		if sawMessageStop && sawStopReason && (terminalFrame == "data: [DONE]" || terminalFrame == "event: data\ndata: [DONE]") {
+			lines = nil
+			return nil
+		}
 		validatedType, validationErr := validateAnthropicSSEEvent(lines, sawMessageStart, sawTerminal)
 		if validationErr != nil {
 			if stats != nil {
@@ -9364,15 +9444,12 @@ func filterSSE(source io.Reader, writer io.Writer, dropTypes map[string]bool, in
 			_, _ = io.WriteString(writer, formatSSEEvent("error", `{"type":"error","error":{"type":"api_error","message":`+strconv.Quote("malformed upstream Anthropic SSE: "+validationErr.Error())+`}}`))
 			return fmt.Errorf("malformed Anthropic SSE: %w", validationErr)
 		}
-		out, eventType, stopReason, inputTokens, outputTokens := filterSSEEvent(lines, state, dropTypes, inputTokenHint, responseAlias, stats)
+		out, eventType, stopReason, _, outputTokens := filterSSEEvent(lines, state, dropTypes, inputTokenHint, responseAlias, stats)
 		lines = nil
 		if eventType == "" {
 			eventType = validatedType
 		}
 		if stats != nil {
-			if inputTokens > 0 {
-				stats.InputTokens.Store(inputTokens)
-			}
 			if outputTokens > 0 {
 				stats.OutputTokens.Store(outputTokens)
 			}
@@ -9386,6 +9463,7 @@ func filterSSE(source io.Reader, writer io.Writer, dropTypes map[string]bool, in
 			}
 		case "message_stop":
 			sawTerminal = true
+			sawMessageStop = true
 			if sawMessageStart && !sawStopReason {
 				// A well-formed Anthropic stream always ends with
 				// message_delta(stop_reason) followed by message_stop. Some
@@ -9592,9 +9670,11 @@ func filterSSEEvent(lines []string, state *sseFilterState, dropTypes map[string]
 		if value, ok := usage["cache_creation_input_tokens"]; ok {
 			stats.CacheWriteTokens.Store(metricInt64(value))
 		}
-		if value, ok := usage["input_tokens"]; ok && metricInt64(value) > 0 {
+		if value, ok := usage["input_tokens"]; ok {
+			stats.InputTokens.Store(metricInt64(value))
 			stats.InputEstimated.Store(false)
 		} else if eventName == "message_start" && inputTokenHint > 0 {
+			stats.InputTokens.Store(int64(inputTokenHint))
 			stats.InputEstimated.Store(true)
 		}
 		delta, _ := payload["delta"].(map[string]any)
@@ -9674,7 +9754,9 @@ func addMessageStartUsageHint(payload map[string]any, inputTokenHint int) {
 		usage = map[string]any{}
 		message["usage"] = usage
 	}
-	if tokens, ok := usage["input_tokens"].(float64); ok && tokens > 0 {
+	// Zero is a measured value (for example, a fully cached prompt), not
+	// missing telemetry. Never replace it with a body-size estimate.
+	if _, ok := usage["input_tokens"]; ok {
 		return
 	}
 	usage["input_tokens"] = inputTokenHint

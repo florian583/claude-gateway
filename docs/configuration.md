@@ -38,6 +38,12 @@ Unknown keys, duplicate keys, trailing JSON, invalid references, unsupported pro
 
 Profile fields: `displayName`, `command` (argv, default `["claude"]`), optional `configDir`, optional `credentialsService`, optional `refreshCommand` (argv), `fiveHourThresholdPct`, `sevenDayThresholdPct`.
 
+Refresh commands must rotate a usable credential or verify authentication and emit `{"version":1,"authVerified":true}` on stdout. A successful exit alone does not prove unchanged-token recovery. The gateway serializes these helper executions.
+
+Claude quota HTTP calls share a cancellable gate and one-second spacing across background and request-time refreshes. HTTP 429 cooldown applies across accounts and token rotation, independently of inference. Last-good quota readings and cooldown persist in `stateDir/claude-usage-cache.json` (mode 0600), without tokens. Restored readings retain their original timestamps, expire after the stale TTL, and are rejected if configured profile identity changes.
+
+The Claude background monitor checks due profiles every 30 seconds (or the configured poll interval if shorter). Fresh profile snapshots skip credential lookup and HTTP calls, including at startup after restoration. `providers.anthropic.usage.pollIntervalSeconds: 300` provides a gentler five-minute polling cadence; quota-based decisions can lag by that interval. The menu reads the local cached dashboard only. Dashboard `STALE` allows an additional 60 seconds for scheduler and serialized-fetch latency; it never renews the reading timestamp.
+
 Create a new account with `profiles add NAME`. Options: `--display-name NAME`, `--command EXECUTABLE`, `--config-dir PATH`, and `--pool ID`. The directory defaults to `./profiles/NAME`. If a Claude provider exists, the profile joins its default account pool; otherwise it is saved without routing membership. Account login is a separate `profiles login NAME` command. `profiles open NAME -- ARGS...` provides direct account access without the proxy.
 
 Profile creation refuses existing names/directories and validates the entire updated configuration before saving. It uses a temporary file, an exclusive config lock, and an atomic rename. A lock owned by another process is never removed. Use a regular config file path when adding profiles; other commands can read symlinked configs. Restart the server after changing configuration.

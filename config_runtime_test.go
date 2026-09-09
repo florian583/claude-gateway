@@ -479,9 +479,10 @@ func TestConfiguredQuotaWindowResetAllowsReevaluation(t *testing.T) {
 	}
 }
 
-func TestConfiguredRefreshRequiresActualRotation(t *testing.T) {
-	for _, rotate := range []bool{false, true} {
-		t.Run(fmt.Sprint(rotate), func(t *testing.T) {
+func TestConfiguredRefreshRequiresRotationOrVerifiedRecovery(t *testing.T) {
+	for _, tc := range []struct{ rotate, verified bool }{{false, false}, {true, false}, {false, true}} {
+		t.Run(fmt.Sprint(tc), func(t *testing.T) {
+			rotate := tc.rotate
 			dir := t.TempDir()
 			state := filepath.Join(dir, "credential.json")
 			before := `{"claudeAiOauth":{"accessToken":"sk-ant-oat-test-fixture-before","expiresAt":4102444800000}}`
@@ -494,6 +495,9 @@ func TestConfiguredRefreshRequiresActualRotation(t *testing.T) {
 			}
 			security := fmt.Sprintf("#!/bin/sh\n/bin/cat %q\n", state)
 			helper := fmt.Sprintf("#!/bin/sh\nprintf '%%s' '%s' > %q\n", after, state)
+			if tc.verified {
+				helper += "printf '%s' '{\"version\":1,\"authVerified\":true}'\n"
+			}
 			for name, script := range map[string]string{"security": security, "refresh": helper} {
 				if e := os.WriteFile(filepath.Join(dir, name), []byte(script), 0700); e != nil {
 					t.Fatal(e)
@@ -509,7 +513,7 @@ func TestConfiguredRefreshRequiresActualRotation(t *testing.T) {
 			t.Cleanup(func() { claudeOAuthCredentials.Delete(profile.CredentialsService) })
 			s := testProxy(t, cfg)
 			e := s.refreshProfileCredentials(context.Background(), profile)
-			if (e == nil) != rotate {
+			if (e == nil) != (rotate || tc.verified) {
 				t.Fatalf("rotation=%t error=%v", rotate, e)
 			}
 		})

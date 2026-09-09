@@ -54,7 +54,7 @@ func TestClaudeDashboardAllowsRefreshLatencyButExpiresOldUsage(t *testing.T) {
 	for _, tc := range []struct {
 		age  time.Duration
 		want string
-	}{{65 * time.Second, "OK"}, {76 * time.Second, "STALE"}} {
+	}{{65 * time.Second, "OK"}, {100 * time.Second, "OK"}, {121 * time.Second, "STALE"}} {
 		s.claudeUse.snapshots = map[string]claudeUsageSnapshot{"test": {Profile: "first", Source: "oauth-api", FetchedAt: now.Add(-tc.age), FiveHour: claudeUsageWindow{Utilization: 20, ResetsAt: now.Add(time.Hour)}}}
 		w := httptest.NewRecorder()
 		s.handler().ServeHTTP(w, httptest.NewRequest("GET", "/dashboard", nil))
@@ -99,6 +99,7 @@ func TestClaudeUsageRateLimitCooldown(t *testing.T) {
 		t.Fatal("missing cache must not bypass cooldown")
 	}
 	s.claudeUse.retryAt[key] = time.Now().Add(-time.Second)
+	s.claudeUse.globalRetryAt = time.Now().Add(-time.Second)
 	s.claudeUsageSnapshotRefresh(context.Background(), auth, profile, true)
 	if calls.Load() != 2 {
 		t.Fatal("expired cooldown must allow recovery")
@@ -106,5 +107,69 @@ func TestClaudeUsageRateLimitCooldown(t *testing.T) {
 	// Usage endpoint throttling must never block inference providers.
 	if blocked, _ := s.providerBlocked("endpoint"); blocked {
 		t.Fatal("usage throttling blocked inference")
+	}
+}
+
+func TestClaudeUsageRefreshSkipsFreshRestoredProfileBeforeCredentials(t *testing.T) {
+	s, err := newProxyServer(config{
+		Providers: map[string]providerConfig{"endpoint": {BaseURL: "http://127.0.0.1:1"}},
+		ClaudeUsage: claudeUsageConfig{
+			Provider: "endpoint", CacheTTLSeconds: 300, StaleTTLSeconds: 1800,
+			AccountProfiles: map[string]claudeUsageProfile{"restored": {Name: "restored", CredentialsService: "nonexistent-test-credential"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.claudeUse.snapshots["restored:restored"] = claudeUsageSnapshot{Profile: "restored", Source: "oauth-api", FetchedAt: time.Now().Add(-2 * time.Minute)}
+	if !s.refreshClaudeUsageProfiles(context.Background(), false) {
+		t.Fatal("fresh restored quota must skip missing credentials and upstream")
+	}
+	if len(s.claudeUse.credentialRetryAt) != 0 || len(s.claudeUse.refreshing) != 0 {
+		t.Fatal("fresh profile caused refresh work")
+	}
+}
+
+func TestClaudeUsageRefreshProfilesSerializesRequests(t *testing.T) {
+	var active, maximum, calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		active.Add(-1)
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":20},"seven_day":{"utilization":30}}`))
+	}))
+	defer upstream.Close()
+
+	profiles := map[string]claudeUsageProfile{
+		"first":  {Name: "first", CredentialsService: "serial-first"},
+		"second": {Name: "second", CredentialsService: "serial-second"},
+	}
+	for name, token := range map[string]string{"serial-first": "serial-token-first", "serial-second": "serial-token-second"} {
+		service, token := name, token
+		claudeOAuthCredentials.Store(service, cachedClaudeOAuthCredential{token: token, fetchedAt: time.Now()})
+		t.Cleanup(func() { claudeOAuthCredentials.Delete(service) })
+	}
+	s, err := newProxyServer(config{
+		Providers: map[string]providerConfig{"endpoint": {BaseURL: upstream.URL}},
+		ClaudeUsage: claudeUsageConfig{
+			Provider: "endpoint", CacheTTLSeconds: 60, StaleTTLSeconds: 1800,
+			RequestTimeoutMS: 1000, AccountProfiles: profiles,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.refreshClaudeUsageProfiles(context.Background(), true) {
+		t.Fatal("serialized usage refresh reported failure")
+	}
+	if calls.Load() != 2 || maximum.Load() != 1 {
+		t.Fatalf("usage calls=%d maximum concurrency=%d, want 2 and 1", calls.Load(), maximum.Load())
 	}
 }

@@ -366,12 +366,26 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 	if !ok || len(p.RefreshCommand) == 0 {
 		return errors.New("refresh not configured; run profiles login for this account")
 	}
+	s.claudeRefreshMu.Lock()
+	if s.claudeAuthRefreshGate == nil {
+		s.claudeAuthRefreshGate = make(chan struct{}, 1)
+	}
+	gate := s.claudeAuthRefreshGate
+	s.claudeRefreshMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-gate }()
 	before, _ := resolveClaudeProfileOAuthToken(ctx, profile, true)
 	cmd, e := makeProfileCommand(ctx, p, p.RefreshCommand, nil)
 	if e != nil {
 		return e
 	}
-	if e = cmd.Run(); e != nil {
+	cmd.Stdout = nil
+	output, e := cmd.Output()
+	if e != nil {
 		return errors.New("configured refresh command failed")
 	}
 	clearClaudeProfileOAuthToken(profile)
@@ -380,7 +394,13 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 		return e
 	}
 	if after == before {
-		return errors.New("refresh command did not rotate credential; login may be required")
+		var receipt struct {
+			Version      int  `json:"version"`
+			AuthVerified bool `json:"authVerified"`
+		}
+		if json.Unmarshal(output, &receipt) != nil || receipt.Version != 1 || !receipt.AuthVerified {
+			return errors.New("refresh command did not rotate credential or verify authentication")
+		}
 	}
 	raw, ok := claudeOAuthCredentials.Load(profile.CredentialsService)
 	if !ok || !raw.(cachedClaudeOAuthCredential).usable(time.Now()) {

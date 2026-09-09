@@ -170,7 +170,8 @@ func (s *proxyServer) dashboardSnapshot(now time.Time) dashboardSnapshot {
 		}
 		// Collection runs every TTL and may spend up to ten seconds fetching.
 		// Expiry must include that bounded request time, not race the collector.
-		row.State = dashboardCapacity(row.Windows, snapshot.FetchedAt, now, time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second+15*time.Second)
+		// Allow one monitor tick plus serialized fetch latency before STALE.
+		row.State = dashboardCapacity(row.Windows, snapshot.FetchedAt, now, time.Duration(s.cfg.ClaudeUsage.CacheTTLSeconds)*time.Second+60*time.Second)
 		for name, m := range f.Models {
 			poolID := firstNonEmpty(m.AccountPool, f.Providers[m.Provider].Auth.Pool)
 			if f.Providers[m.Provider].Auth.Type != "claude-profile-pool" || !containsString(f.AccountPools[poolID].Profiles, id) {
