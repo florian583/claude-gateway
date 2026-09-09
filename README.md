@@ -160,11 +160,16 @@ The `client` section controls the Claude Code instance that consumes the proxy. 
 "client": {
   "command": ["claude"],
   "configDir": "./client",
-  "model": "worker"
+  "model": "sonnet",
+  "opusModel": "opus",
+  "sonnetModel": "sonnet",
+  "haikuModel": "haiku"
 }
 ```
 
 `model` is a configured alias, not an upstream model ID. `--model` overrides it for one session. Optional `opusModel`, `sonnetModel`, and `haikuModel` map Claude's model choices to different configured aliases; each defaults to the session model.
+
+The subscription example declares separate `fable`, `opus`, `sonnet`, and `haiku` routes. Keep these routes separate: mapping every Claude Code selector to one alias silently makes an Opus selection use that one model. Fable has no dedicated Claude Code selector, so select its configured alias directly with `claude-routed --model fable`. Update the explicit upstream IDs when Anthropic changes the models available to your subscription.
 
 The client gets its own settings, sessions, and plugins. Its directory cannot also be an account directory. Configure any client-specific plugins there; account credentials stay in their own profile's Keychain entry.
 
