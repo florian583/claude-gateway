@@ -117,7 +117,7 @@ func (s *proxyServer) rankConfiguredCandidates(candidates []modelConfig, stickyK
 	score := func(m modelConfig) float64 {
 		key := routeKey(m.Provider, m)
 		v := s.routeScore(m.Provider, key, perf[key])
-		blocked, _ := s.providerBlocked(m.Provider)
+		blocked, _ := s.providerBlockForCandidate(m.Provider, m)
 		if blocked || s.circuitOpen(m.Provider, m) {
 			v -= 10000
 		}

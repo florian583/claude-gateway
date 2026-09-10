@@ -25,6 +25,7 @@ type fileConfig struct {
 	AdaptiveRouting    *adaptiveRoutingConfig           `json:"adaptiveRouting,omitempty"`
 	ProviderQuarantine *providerQuarantineConfig        `json:"providerQuarantine,omitempty"`
 	StateDir           string                           `json:"stateDir"`
+	ErrorTrace         errorTraceConfig                 `json:"errorTrace,omitempty"`
 	Client             clientDefinition                 `json:"client"`
 	Profiles           map[string]profileDefinition     `json:"profiles"`
 	AccountPools       map[string]accountPoolDefinition `json:"accountPools"`
@@ -333,6 +334,10 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	cfg.Metrics = metricsConfig{Path: filepath.Join(f.StateDir, "metrics.jsonl"), MaxSamples: 10000}
 	cfg.Logging = loggingConfig{Path: filepath.Join(f.StateDir, "proxy.log")}
+	if e := validateErrorTrace(f.ErrorTrace, f.Providers); e != nil {
+		return config{}, e
+	}
+	cfg.Logging.ErrorTrace = f.ErrorTrace
 	for _, id := range sortedKeys(f.Profiles) {
 		p := f.Profiles[id]
 		if !validID(id) {

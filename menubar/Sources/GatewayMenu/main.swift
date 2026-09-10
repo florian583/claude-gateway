@@ -167,7 +167,7 @@ final class GatewayMenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func color(_ value: String) -> NSColor {
         switch value {
         case "OK": return .systemGreen
-        case "LOW", "STALE", "RESERVE", "RESTRICTED", "DEGRADED": return .systemOrange
+        case "LOW", "STALE", "RESERVE", "RESTRICTED", "FABLE LIMIT", "DEGRADED": return .systemOrange
         case "FULL", "AUTH", "BLOCKED": return .systemRed
         case "UNKNOWN", "—": return .secondaryLabelColor
         default: return .labelColor

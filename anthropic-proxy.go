@@ -147,6 +147,8 @@ type upstreamResponse struct {
 }
 
 type requestTrace struct {
+	Execution      *attemptExecution
+	LastExecution  *attemptOutcome
 	Timing         *upstreamTiming
 	Ingress        time.Time
 	HeadersMS      int64
@@ -293,10 +295,11 @@ type metricsConfig struct {
 }
 
 type loggingConfig struct {
-	Path          string `json:"path"`
-	MaxBytes      int64  `json:"maxBytes"`
-	Backups       int    `json:"backups"`
-	DebugRequests bool   `json:"debugRequests"`
+	Path          string           `json:"path"`
+	MaxBytes      int64            `json:"maxBytes"`
+	Backups       int              `json:"backups"`
+	DebugRequests bool             `json:"debugRequests"`
+	ErrorTrace    errorTraceConfig `json:"errorTrace,omitempty"`
 }
 
 // adaptiveRoutingConfig reorders a model's configured candidates from recent
@@ -597,45 +600,50 @@ type claudeCandidateAttempt struct {
 }
 
 type metricsSample struct {
-	ReportedBackend    string  `json:"reportedBackend,omitempty"`
-	PreparationMS      int64   `json:"preparationMs,omitempty"`
-	TotalMS            int64   `json:"totalMs,omitempty"`
-	ResponseHeadersMS  int64   `json:"responseHeadersMs,omitempty"`
-	FirstEventMS       int64   `json:"firstEventMs,omitempty"`
-	FirstContentMS     int64   `json:"firstContentMs,omitempty"`
-	MaximumEventGapMS  int64   `json:"maximumEventGapMs,omitempty"`
-	CacheReadTokens    int64   `json:"cacheReadInputTokens,omitempty"`
-	CacheWriteTokens   int64   `json:"cacheCreationInputTokens,omitempty"`
-	InputTokenEstimate int64   `json:"inputTokenEstimate,omitempty"`
-	ConnectionMS       int64   `json:"connectionMs,omitempty"`
-	DNSMS              int64   `json:"dnsMs,omitempty"`
-	TLSMS              int64   `json:"tlsMs,omitempty"`
-	Timestamp          string  `json:"timestamp"`
-	RequestID          string  `json:"requestId,omitempty"`
-	Path               string  `json:"path,omitempty"`
-	RecordKind         string  `json:"recordKind,omitempty"`
-	Attempt            int     `json:"attempt"`
-	CandidateCount     int     `json:"candidateCount,omitempty"`
-	ChainElapsedMS     int64   `json:"chainElapsedMs,omitempty"`
-	RequestedModel     string  `json:"model"`
-	Provider           string  `json:"provider"`
-	ClaudeProfile      string  `json:"claudeProfile,omitempty"`
-	Upstream           string  `json:"upstream,omitempty"`
-	ResponseAlias      string  `json:"responseAlias,omitempty"`
-	Status             int     `json:"status"`
-	LatencyMS          int64   `json:"headerLatencyMs"`
-	Success            bool    `json:"success"`
-	IsFallback         bool    `json:"isFallback"`
-	FallbackTrigger    bool    `json:"fallbackTrigger"`
-	FailureReason      string  `json:"failureReason,omitempty"`
-	StreamDurationMS   int64   `json:"streamDurationMs,omitempty"`
-	StreamBytes        int64   `json:"streamBytes,omitempty"`
-	StreamEvents       int64   `json:"streamEvents,omitempty"`
-	StreamError        string  `json:"streamError,omitempty"`
-	Stream             bool    `json:"stream,omitempty"`
-	InputTokens        int64   `json:"inputTokens,omitempty"`
-	OutputTokens       int64   `json:"outputTokens,omitempty"`
-	TokensPerSecond    float64 `json:"tokensPerSecond,omitempty"`
+	StreamStalled      bool              `json:"streamStalled,omitempty"`
+	MissingStop        bool              `json:"missingStop,omitempty"`
+	ProtocolError      bool              `json:"protocolError,omitempty"`
+	LastEventAgeMS     int64             `json:"lastEventAgeMs,omitempty"`
+	Execution          *attemptExecution `json:"execution,omitempty"`
+	ReportedBackend    string            `json:"reportedBackend,omitempty"`
+	PreparationMS      int64             `json:"preparationMs,omitempty"`
+	TotalMS            int64             `json:"totalMs,omitempty"`
+	ResponseHeadersMS  int64             `json:"responseHeadersMs,omitempty"`
+	FirstEventMS       int64             `json:"firstEventMs,omitempty"`
+	FirstContentMS     int64             `json:"firstContentMs,omitempty"`
+	MaximumEventGapMS  int64             `json:"maximumEventGapMs,omitempty"`
+	CacheReadTokens    int64             `json:"cacheReadInputTokens,omitempty"`
+	CacheWriteTokens   int64             `json:"cacheCreationInputTokens,omitempty"`
+	InputTokenEstimate int64             `json:"inputTokenEstimate,omitempty"`
+	ConnectionMS       int64             `json:"connectionMs,omitempty"`
+	DNSMS              int64             `json:"dnsMs,omitempty"`
+	TLSMS              int64             `json:"tlsMs,omitempty"`
+	Timestamp          string            `json:"timestamp"`
+	RequestID          string            `json:"requestId,omitempty"`
+	Path               string            `json:"path,omitempty"`
+	RecordKind         string            `json:"recordKind,omitempty"`
+	Attempt            int               `json:"attempt"`
+	CandidateCount     int               `json:"candidateCount,omitempty"`
+	ChainElapsedMS     int64             `json:"chainElapsedMs,omitempty"`
+	RequestedModel     string            `json:"model"`
+	Provider           string            `json:"provider"`
+	ClaudeProfile      string            `json:"claudeProfile,omitempty"`
+	Upstream           string            `json:"upstream,omitempty"`
+	ResponseAlias      string            `json:"responseAlias,omitempty"`
+	Status             int               `json:"status"`
+	LatencyMS          int64             `json:"headerLatencyMs"`
+	Success            bool              `json:"success"`
+	IsFallback         bool              `json:"isFallback"`
+	FallbackTrigger    bool              `json:"fallbackTrigger"`
+	FailureReason      string            `json:"failureReason,omitempty"`
+	StreamDurationMS   int64             `json:"streamDurationMs,omitempty"`
+	StreamBytes        int64             `json:"streamBytes,omitempty"`
+	StreamEvents       int64             `json:"streamEvents,omitempty"`
+	StreamError        string            `json:"streamError,omitempty"`
+	Stream             bool              `json:"stream,omitempty"`
+	InputTokens        int64             `json:"inputTokens,omitempty"`
+	OutputTokens       int64             `json:"outputTokens,omitempty"`
+	TokensPerSecond    float64           `json:"tokensPerSecond,omitempty"`
 }
 
 // Sub-second bodies are usually buffered gateway responses, cache hits, or
@@ -773,6 +781,8 @@ type adaptiveState struct {
 }
 
 type providerRuntimeState struct {
+	QuotaProbeAt       time.Time         `json:"quotaProbeAt,omitempty"`
+	QuotaProbeInFlight bool              `json:"-"`
 	LastFailure        time.Time         `json:"lastFailure,omitempty"`
 	BlockedUntil       time.Time         `json:"blockedUntil,omitempty"`
 	Reason             string            `json:"reason,omitempty"`
@@ -835,9 +845,13 @@ type proxyIngressContextKey struct{}
 type upstreamTimingContextKey struct{}
 
 type upstreamTiming struct {
-	connectionMS atomic.Int64
-	dnsMS        atomic.Int64
-	tlsMS        atomic.Int64
+	gotConnection       atomic.Bool
+	connectionReused    atomic.Bool
+	connectionIdleMS    atomic.Int64
+	firstResponseByteMS atomic.Int64
+	connectionMS        atomic.Int64
+	dnsMS               atomic.Int64
+	tlsMS               atomic.Int64
 }
 
 var proxyRequestSequence atomic.Uint64
@@ -998,6 +1012,9 @@ func (w *rotatingLogWriter) Close() error {
 }
 
 type proxyServer struct {
+	passiveConcurrency       concurrencyTelemetry
+	errorTraceMu             sync.Mutex
+	errorTraceSequence       uint64
 	providerState            routingState
 	activeRequests           atomic.Int64
 	draining                 atomic.Bool
@@ -2158,7 +2175,7 @@ func (s *proxyServer) recordAttempt(trace requestTrace, selected, candidate mode
 	if metricPolicySkip(failureReason) {
 		recordKind = "skip"
 	}
-	s.metrics.record(metricsSample{
+	sample := metricsSample{
 		Timestamp:       time.Now().UTC().Format(time.RFC3339Nano),
 		RequestID:       trace.ID,
 		Path:            trace.Path,
@@ -2177,7 +2194,13 @@ func (s *proxyServer) recordAttempt(trace requestTrace, selected, candidate mode
 		IsFallback:      attempt > 0,
 		FallbackTrigger: fallbackTrigger,
 		FailureReason:   failureReason,
-	})
+	}
+	applyExecutionTelemetry(&sample, trace)
+	if trace.Execution != nil && trace.LastExecution != nil {
+		*trace.LastExecution = attemptOutcome{Provider: providerName, Account: candidate.ClaudeProfile, Upstream: candidate.Upstream, Attempt: attempt, Status: status, Reason: failureReason, Executions: trace.Execution.Number}
+	}
+	logFailureDiagnostics(sample)
+	s.metrics.record(sample)
 }
 
 // recordCompletion records the winning attempt after its response body has been
@@ -2253,6 +2276,12 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 	}
 	if stats != nil {
 		sample.ReportedBackend, _ = stats.ReportedBackend.Load().(string)
+		sample.StreamStalled = stats.StreamStalled.Load()
+		sample.MissingStop = stats.MissingStop.Load()
+		sample.ProtocolError = stats.ProtocolError.Load()
+		if at := stats.LastEventNS.Load(); at > 0 {
+			sample.LastEventAgeMS = time.Since(time.Unix(0, at)).Milliseconds()
+		}
 		sample.Stream = stats.Events.Load() > 0
 		sample.StreamBytes = stats.Bytes.Load()
 		sample.StreamEvents = stats.Events.Load()
@@ -2274,9 +2303,8 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		sample.TotalMS = time.Since(trace.Ingress).Milliseconds()
 	}
 	sample.ResponseHeadersMS, sample.FirstEventMS = trace.HeadersMS, trace.FirstEventMS
-	if trace.Timing != nil {
-		sample.ConnectionMS, sample.DNSMS, sample.TLSMS = trace.Timing.connectionMS.Load(), trace.Timing.dnsMS.Load(), trace.Timing.tlsMS.Load()
-	}
+	applyExecutionTelemetry(&sample, trace)
+	logFailureDiagnostics(sample)
 	s.metrics.record(sample)
 }
 
@@ -2990,7 +3018,7 @@ func (s *proxyServer) rankCandidatesForRequest(selected modelConfig, candidates 
 	for index, candidate := range candidates {
 		providerName := firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider)
 		key := routeKey(providerName, candidate)
-		blocked, _ := s.providerBlocked(providerName)
+		blocked, _ := s.providerBlockForCandidate(providerName, candidate)
 		browserExhausted, _ := s.browserUsageExhausted(providerName)
 		reservedOut, _ := s.ollamaCandidateReservedOut(candidate)
 		blocked = blocked || browserExhausted || reservedOut || s.circuitOpen(providerName, candidate)
@@ -3150,9 +3178,14 @@ func (s *proxyServer) providerBlocked(providerName string) (bool, providerRuntim
 }
 
 func claudeQuotaFamily(candidate modelConfig) string {
-	value := strings.ToLower(strings.Join([]string{candidate.Requested, candidate.Upstream, candidate.ResponseAlias}, "|"))
+	// Quota belongs to the actual attempted model, not the original client
+	// alias retained across fallback legs (for example Fable -> Opus).
+	value := strings.ToLower(firstNonEmpty(candidate.Upstream, candidate.ResponseAlias, candidate.Requested))
 	if strings.Contains(value, "fable") {
 		return "fable"
+	}
+	if strings.TrimSuffix(value, "[1m]") == "claude-opus-5" {
+		return "opus-5"
 	}
 	return ""
 }
@@ -3172,8 +3205,15 @@ func (s *proxyServer) providerBlockForCandidate(runtimeProviderName string, cand
 	if blocked, state := s.providerBlocked(runtimeProviderName); blocked {
 		return true, state
 	}
+	if blocked, state := s.providerBlocked(routeHealthKey(runtimeProviderName, candidate)); blocked {
+		return true, state
+	}
 	if modelKey := s.claudeModelQuotaBlockKey(runtimeProviderName, candidate); modelKey != "" {
-		return s.providerBlocked(modelKey)
+		blocked, state := s.providerBlocked(modelKey)
+		if blocked && s.fableQuotaProbeDue(runtimeProviderName, modelKey) {
+			return false, state
+		}
+		return blocked, state
 	}
 	return false, providerRuntimeState{}
 }
@@ -3189,8 +3229,8 @@ func (s *proxyServer) quotaBlockKeyForResponse(runtimeProviderName string, candi
 		return runtimeProviderName
 	}
 	// Anthropic does not consistently return the model-specific quota header on
-	// Fable 429 responses. Keep ambiguous Fable failures model-scoped so an
-	// exhausted Fable bucket cannot disable Sonnet or Opus on the same account.
+	// Fable/Opus 5 responses. Keep ambiguous failures model-scoped so a
+	// model-specific rejection cannot disable other models on the same account.
 	return modelKey
 }
 
@@ -3469,33 +3509,13 @@ func (s *proxyServer) observeSharedNetworkIncidentLocked(providerName, signal st
 		s.networkIncident.Signals = map[string]time.Time{}
 	}
 	s.normalizeNetworkIncidentLocked(now)
-	origin := s.providerIncidentOrigin(providerName)
-	s.networkIncident.Signals[origin] = now
-	if s.networkIncident.Phase == networkPhaseOffline || s.networkIncident.Phase == networkPhaseRecovering {
-		return true
-	}
-	if len(s.networkIncident.Signals) < s.networkIncidentOriginThreshold() {
-		return false
-	}
-	origins := make([]string, 0, len(s.networkIncident.Signals))
-	for observedOrigin := range s.networkIncident.Signals {
-		origins = append(origins, observedOrigin)
-	}
-	sort.Strings(origins)
-	s.networkIncident.ActiveUntil = now.Add(s.networkIncidentSuppression())
-	s.networkIncident.NextProbeAt = now.Add(networkRecoveryDelay)
-	s.networkIncident.Phase = networkPhaseOffline
-	s.networkIncident.ProbeInFlight = false
-	s.networkIncident.Epoch++
-	s.networkIncident.LastDetected = now
-	s.networkIncident.Origins = origins
-	s.clearSharedNetworkProviderSignalsLocked(now)
-	log.Printf("shared network incident detected origins=%d suppress=%s", len(origins), s.networkIncidentSuppression())
-	return true
+	// A label such as stream_error or ttfb_timeout cannot establish a local
+	// outage. Only corroborated strong transport errors may promote state.
+	return s.networkIncident.Phase == networkPhaseOffline || s.networkIncident.Phase == networkPhaseRecovering
 }
 
 func (s *proxyServer) observeNetworkTransportFailure(providerName, signal string, err error) networkFailureDecision {
-	if !sharedTransportError(err) {
+	if !strongLocalNetworkError(err) {
 		return networkFailureDecision{}
 	}
 	now := s.accountNow()
@@ -3933,7 +3953,8 @@ func (s *proxyServer) status(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"pid": os.Getpid(), "sourceHash": buildSourceHash,
-		"configHash": s.cfg.SourceHash, "activeRequests": s.activeRequests.Load(), "draining": s.draining.Load()})
+		"configHash": s.cfg.SourceHash, "activeRequests": s.activeRequests.Load(), "draining": s.draining.Load(),
+		"upstreamConcurrency": s.passiveConcurrency.snapshot()})
 }
 
 // quota exposes only quota metadata on the loopback proxy; credentials remain
@@ -6046,7 +6067,7 @@ func (s *proxyServer) openingConversationFamily(ctx context.Context, r *http.Req
 			continue
 		}
 		providerName := firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider)
-		blocked, _ := s.providerBlocked(providerName)
+		blocked, _ := s.providerBlockForCandidate(providerName, candidate)
 		reservedOut, _ := s.ollamaCandidateReservedOut(candidate)
 		if blocked || reservedOut || s.circuitOpen(providerName, candidate) {
 			continue
@@ -6559,7 +6580,7 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	providerScopedSignal := providerSignal != "malformed_anthropic_sse" && providerSignal != "stream_event_stall"
 	if providerSignal != "" && providerScopedSignal && !upstream.unstable && !networkDecision.SuppressProviderPenalty {
-		s.observeProviderInstability(runtimeProviderName, providerSignal)
+		s.observeProviderInstability(routeHealthKey(runtimeProviderName, selectedModel), providerSignal)
 	}
 	if !clientDisconnected && (streamErr != nil || stats.MissingStop.Load() || stats.ProtocolError.Load()) && !networkDecision.SuppressProviderPenalty {
 		// The upstream leg failed mid-stream (dropped connection, idle
@@ -6575,9 +6596,9 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 		s.resetCircuitAfter(runtimeProviderName, selectedModel, upstream.started)
 		s.clearProviderBlockAfter(runtimeProviderName, upstream.started)
 		if modelKey := s.claudeModelQuotaBlockKey(runtimeProviderName, selectedModel); modelKey != "" {
-			s.clearProviderBlockAfter(modelKey, upstream.started)
+			s.clearFableQuotaAfter(modelKey, upstream.started)
 		}
-		s.observeProviderHealthyAfter(runtimeProviderName, upstream.started)
+		s.observeProviderHealthyAfter(routeHealthKey(runtimeProviderName, selectedModel), upstream.started)
 	}
 	s.recordCompletion(upstream.trace, selectedModel, upstream.attempt, upstream.started, resp.StatusCode, time.Since(streamStarted), streamErr, stats, upstream.failureReason)
 	s.logCompletion(r, selectedModel, providerName, upstream.attempt, resp.StatusCode, upstream.started, streamStarted, streamErr, stats)
@@ -6768,8 +6789,8 @@ func (s *proxyServer) deferInstabilityQuarantinedCandidates(r *http.Request, can
 	instabilityQuarantined := make([]modelConfig, 0, len(candidates))
 	for _, candidate := range candidates {
 		providerName := firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider)
-		runtimeProviderName := s.providerRuntimeKey(r, providerName)
-		blocked, state := s.providerBlocked(runtimeProviderName)
+		runtimeProviderName := s.providerRuntimeKeyForCandidate(r, providerName, candidate)
+		blocked, state := s.providerBlockForCandidate(runtimeProviderName, candidate)
 		if blocked && strings.HasPrefix(state.Reason, "instability_") {
 			instabilityQuarantined = append(instabilityQuarantined, candidate)
 			continue
@@ -6816,6 +6837,7 @@ func (s *proxyServer) circuitKey(providerName string, m modelConfig) string {
 }
 
 func (s *proxyServer) circuitEnabled(providerName string) bool {
+	providerName, _, _ = strings.Cut(providerName, "|model=")
 	cfg, ok := s.cfg.Providers[providerName]
 	if !ok {
 		// Account-scoped runtime keys retain the base provider's policy.
@@ -7111,6 +7133,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	initialReservation, _ := r.Context().Value(claudeAccountReservationContextKey{}).(claudeAccountReservation)
 	initialReservationKey := claudeProfileRegistryKey(initialReservation.profile)
 	trace := requestTrace{
+		LastExecution:  &attemptOutcome{},
 		ID:             requestID,
 		Path:           r.URL.Path,
 		CandidateCount: len(attempts),
@@ -7131,6 +7154,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	paidEvidence := paidFallbackEvidence{}
 	paidStarted := s.cfg.Definition != nil && s.cfg.Providers[selected.Provider].Billing == "metered"
 	for i, accountAttempt := range attempts {
+		// A policy skip must not inherit timing/concurrency from a prior leg.
+		trace.Execution, trace.Timing = nil, nil
+		trace.HeadersMS, trace.FirstEventMS = 0, 0
 		if ctx.Err() != nil {
 			return upstreamResponse{}, ctx.Err()
 		}
@@ -7302,9 +7328,23 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 		}
 		attemptStarted := time.Now()
+		releaseQuota, quotaAllowed := s.acquireFableQuotaProbe(runtimeProviderName, candidate, countTokens)
+		if !quotaAllowed {
+			releaseAttemptAccount()
+			releaseCircuitProbe(circuitProbe)
+			continue
+		}
 		trace.Timing = &upstreamTiming{}
 		trace.HeadersMS, trace.FirstEventMS = 0, 0
 		releaseRoute := s.reserveRoute(runtimeProviderName, candidate)
+		execution, releaseTelemetry := s.passiveConcurrency.begin(providerName, candidate.ClaudeProfile, candidate.Upstream, s.telemetryChain(selected), trace.Path)
+		trace.Execution = &execution
+		execution.Number = trace.LastExecution.Executions + 1
+		execution.BeforeAttemptMS = time.Since(trace.ChainStarted).Milliseconds()
+		if trace.LastExecution.Executions > 0 {
+			previous := *trace.LastExecution
+			execution.Previous = &previous
+		}
 		if s.cfg.Definition != nil && s.cfg.Providers[providerName].Billing == "metered" {
 			paidStarted = true
 		}
@@ -7312,11 +7352,24 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			attemptRequest = withOpenCodeSession(attemptRequest, payload)
 		}
 		resp, err := s.doUpstreamWithHeaderBudgetLimit(context.WithValue(ctx, upstreamTimingContextKey{}, trace.Timing), attemptRequest, attemptBody, candidate, attemptMaximum)
+		if resp != nil && err == nil {
+			s.traceFailedHTTPAttempt(resp, attemptBody, candidate, providerName, trace.ID, i)
+		}
 		if resp != nil {
+			execution.observeGatewayHeaders(resp.Header)
+			execution.HTTPVersion = resp.Proto
+			execution.HTTPStatus = resp.StatusCode
+			execution.UpstreamRequestID = firstNonEmpty(resp.Header.Get("Request-Id"), resp.Header.Get("X-Request-Id"))
+			if len(execution.UpstreamRequestID) > 256 {
+				execution.UpstreamRequestID = execution.UpstreamRequestID[:256]
+			}
 			trace.HeadersMS = time.Since(attemptStarted).Milliseconds()
 		}
 		if err != nil {
+			releaseTelemetry()
 			releaseAttemptAccount()
+			execution.TransportError = passiveTransportError(err)
+			releaseQuota()
 			releaseRoute()
 			releaseCircuitProbe(circuitProbe)
 			if ctx.Err() != nil {
@@ -7330,6 +7383,15 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			failureReason := "transport"
 			if authFailure {
 				failureReason = "auth_unavailable"
+				if providerName == s.cfg.ClaudeUsage.Provider {
+					// Credential resolution can fail before an upstream HTTP
+					// response (missing/invalid Keychain OAuth). Cool the exact
+					// Claude profile so every request does not retry it, while
+					// preserving the rest of the unified account pool.
+					s.markProviderBlocked(runtimeProviderName, "auth_unavailable", time.Minute)
+					clearClaudeProfileOAuthToken(accountAttempt.profile)
+					s.triggerClaudeOAuthRefresh(accountAttempt.profile)
+				}
 			}
 			if chainLimited {
 				failureReason = "chain_deadline"
@@ -7344,7 +7406,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
 				} else {
-					s.observeProviderInstability(runtimeProviderName, signal)
+					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), signal)
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
 			}
@@ -7374,12 +7436,16 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		}
 		if resp.Body != nil {
 			resp.Body = &releaseReadCloser{ReadCloser: resp.Body, release: func() {
+				releaseTelemetry()
+				releaseQuota()
 				releaseRoute()
 				releaseCircuitProbe(circuitProbe)
 				releaseAttemptAccount()
 			}}
 		} else {
+			releaseTelemetry()
 			releaseRoute()
+			releaseQuota()
 			releaseCircuitProbe(circuitProbe)
 			releaseAttemptAccount()
 		}
@@ -7433,7 +7499,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
 				} else if !quotaError && !authError {
-					s.observeProviderInstability(runtimeProviderName, "stream_start")
+					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), "stream_start")
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
 				if providerName == s.cfg.ClaudeUsage.Provider {
@@ -7476,14 +7542,13 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		if !countTokens {
 			ttfb := time.Since(attemptStarted)
 			signal := ""
-			instabilityKey := runtimeProviderName
+			instabilityKey := routeHealthKey(runtimeProviderName, candidate)
 			switch {
 			case resp.StatusCode == http.StatusTooManyRequests && !s.explicitAnthropicPrimary(selected):
 				signal = "http_rate_limit"
 			case resp.StatusCode >= http.StatusInternalServerError:
 				signal = "http_5xx"
 				if providerName == s.cfg.ClaudeUsage.Provider {
-					instabilityKey = providerName
 					anthropicServiceOutage = true
 					if anthropicFailureClass != "auth_or_client" {
 						anthropicFailureClass = "service"
@@ -7527,6 +7592,8 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		fourXXClassified := false
 		if i < len(attempts)-1 && fallbackCandidateStatus(resp.StatusCode) {
 			errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			execution.observeGatewayError(errorBody)
+			execution.ResponseReadError = readErr != nil
 			_ = resp.Body.Close()
 			if readErr == nil && thinkingSignatureMismatchBody(errorBody) {
 				// Opaque thinking signatures are bound to the provider that made
@@ -7548,6 +7615,10 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				log.Printf("provider fallback route incompatibility request=%s model=%q provider=%s upstream=%q status=%d body=%q", trace.ID, candidate.Requested, providerName, candidate.Upstream, resp.StatusCode, trimForLog(string(errorBody), 240))
 				continue
 			}
+			// Some gateways incorrectly label exhausted account credits as
+			// invalid_request_error.  Treat the provider-side billing signal as
+			// quota before the generic client-payload veto, otherwise the chain
+			// stops on a paid/empty leg and never reaches its next candidate.
 			recognizedClientError := readErr == nil && recognizedClientPayloadError(resp.StatusCode, errorBody)
 			if readErr == nil && !recognizedClientError && (resp.StatusCode >= http.StatusInternalServerError || shouldFallbackBody(errorBody) || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusPaymentRequired) {
 				fourXXClassified = resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError
@@ -7601,6 +7672,8 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		}
 		if !fourXXClassified && resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError && resp.StatusCode != http.StatusTooManyRequests {
 			errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			execution.observeGatewayError(errorBody)
+			execution.ResponseReadError = readErr != nil
 			if readErr == nil {
 				_ = resp.Body.Close()
 				originalStatus := resp.StatusCode
@@ -7609,7 +7682,10 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					log.Printf("context overflow normalized model=%q provider=%s upstream=%q status=%d->%d", candidate.Requested, providerName, candidate.Upstream, originalStatus, resp.StatusCode)
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(errorBody))
-				if providerSpecificRequestIncompatibility(resp.StatusCode, errorBody) {
+				if providerQuotaBody(errorBody) {
+					responseFailureReason = "quota_or_rate_limit"
+					s.markProviderBlocked(s.quotaBlockKeyForResponse(runtimeProviderName, candidate, resp.Header), responseFailureReason, providerCooldown(resp.Header, errorBody))
+				} else if providerSpecificRequestIncompatibility(resp.StatusCode, errorBody) {
 					responseFailureReason = "route_incompatible"
 					if !countTokens {
 						s.tripCircuit(runtimeProviderName, candidate)
@@ -7776,15 +7852,22 @@ func (s *proxyServer) doUpstreamWithHeaderBudgetLimit(ctx context.Context, r *ht
 	}
 	attemptCtx, cancel := context.WithCancel(ctx)
 	if timing, ok := ctx.Value(upstreamTimingContextKey{}).(*upstreamTiming); ok {
+		traceStarted := time.Now()
 		var connectionStart, dnsStart, tlsStart atomic.Int64
 		attemptCtx = httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
 			GetConn: func(string) { connectionStart.Store(time.Now().UnixNano()) },
-			GotConn: func(httptrace.GotConnInfo) {
+			GotConn: func(info httptrace.GotConnInfo) {
+				timing.gotConnection.Store(true)
+				timing.connectionReused.Store(info.Reused)
+				if info.WasIdle {
+					timing.connectionIdleMS.Store(info.IdleTime.Milliseconds())
+				}
 				if at := connectionStart.Load(); at > 0 {
 					timing.connectionMS.Store(time.Since(time.Unix(0, at)).Milliseconds())
 				}
 			},
-			DNSStart: func(httptrace.DNSStartInfo) { dnsStart.Store(time.Now().UnixNano()) },
+			GotFirstResponseByte: func() { timing.firstResponseByteMS.Store(time.Since(traceStarted).Milliseconds()) },
+			DNSStart:             func(httptrace.DNSStartInfo) { dnsStart.Store(time.Now().UnixNano()) },
 			DNSDone: func(httptrace.DNSDoneInfo) {
 				if at := dnsStart.Load(); at > 0 {
 					timing.dnsMS.Store(time.Since(time.Unix(0, at)).Milliseconds())
@@ -8819,6 +8902,12 @@ func clientErrorBody(body []byte) bool {
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
+	// Providers sometimes return a billing/quota failure using the generic
+	// invalid_request_error envelope.  It is still provider-side and must
+	// remain eligible for sequential fallback.
+	if providerQuotaBody(body) {
+		return false
+	}
 	if contextOverflowBody(body) {
 		return true
 	}
@@ -8904,6 +8993,10 @@ func normalizeContextOverflowResponse(resp *http.Response, body []byte) ([]byte,
 
 func recognizedClientPayloadError(status int, body []byte) bool {
 	return (status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge) && clientErrorBody(body)
+}
+
+func providerQuotaBody(body []byte) bool {
+	return classifyFallbackBody(body) == "quota_or_rate_limit"
 }
 
 // providerSpecificRequestIncompatibility identifies payload options or
@@ -9109,6 +9202,11 @@ func recordReportedBackend(stats *streamStats, payload map[string]any) {
 		return
 	}
 	name, _ := payload["provider"].(string)
+	if name == "" {
+		errPayload, _ := payload["error"].(map[string]any)
+		metadata, _ := errPayload["metadata"].(map[string]any)
+		name, _ = metadata["provider_name"].(string)
+	}
 	if len(name) == 0 || len(name) > 80 {
 		return
 	}

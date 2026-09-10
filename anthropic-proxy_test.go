@@ -1071,6 +1071,71 @@ func TestClaudeAuthFailureTriggersExactProfileAndPreservesPairedFallback(t *test
 	}
 }
 
+func TestClaudeCredentialFailureCoolsExactProfile(t *testing.T) {
+	const fallbackService = "test-credential-failure-fallback"
+	const fallbackToken = "sk-ant-oat-test-credential-failure-fallback"
+	claudeOAuthCredentials.Store(fallbackService, cachedClaudeOAuthCredential{token: fallbackToken, fetchedAt: time.Now()})
+	t.Cleanup(func() { claudeOAuthCredentials.Delete(fallbackService) })
+
+	var fallbackCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/oauth/usage" {
+			_, _ = w.Write([]byte(`{"five_hour":{"utilization":10},"seven_day":{"utilization":10}}`))
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer "+fallbackToken {
+			fallbackCalls.Add(1)
+			_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
+			return
+		}
+		http.Error(w, "unexpected credential", http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	primary := claudeUsageProfile{
+		Name:      "primary",
+		CachePath: filepath.Join(t.TempDir(), "primary", ".claude.json"),
+	}
+	fallback := testClaudeProfile(t, "fallback", fallbackService, "credential-failure-fallback")
+	server, err := newProxyServer(config{
+		Providers: map[string]providerConfig{"anthropic": {BaseURL: upstream.URL}},
+		ClaudeUsage: claudeUsageConfig{
+			Provider: "anthropic", AutoSelectAccounts: true,
+			EligibleUpstreams: []string{"claude-sonnet-5"}, FiveHourThresholdPct: 95, SevenDayThresholdPct: 95,
+			CacheTTLSeconds: 300, StaleTTLSeconds: 1800, RequestTimeoutMS: 1000,
+			AccountProfiles: map[string]claudeUsageProfile{"primary": primary, "fallback": fallback},
+			AccountPool:     []string{"primary", "fallback"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := modelConfig{Provider: "anthropic", Upstream: "claude-sonnet-5", Requested: "claude-sonnet-5"}
+	body := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hello"}]}`)
+	payload := map[string]any{"model": "claude-sonnet-5", "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:48104/v1/messages", bytes.NewReader(body))
+	response, err := server.doWithFallbacks(context.Background(), request, body, payload, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.resp.Body.Close()
+	if response.model.ClaudeProfile != "fallback" || fallbackCalls.Load() != 1 {
+		t.Fatalf("first response profile=%q fallbackCalls=%d, want fallback/1", response.model.ClaudeProfile, fallbackCalls.Load())
+	}
+	if blocked, state := server.providerBlocked("anthropic@primary"); !blocked || state.Reason != "auth_unavailable" {
+		t.Fatalf("missing credential did not cool primary profile: %#v", state)
+	}
+
+	second, err := server.doWithFallbacks(context.Background(), request, body, payload, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = second.resp.Body.Close()
+	if second.model.ClaudeProfile != "fallback" || fallbackCalls.Load() != 2 {
+		t.Fatalf("cooled primary retried: profile=%q fallbackCalls=%d", second.model.ClaudeProfile, fallbackCalls.Load())
+	}
+}
+
 func TestAnthropicAuthFailuresNeverReachPaidFallback(t *testing.T) {
 	const (
 		primaryService  = "test-paid-guard-primary"
@@ -2624,6 +2689,66 @@ func TestRouteIncompatibilityFallsBackWithoutProviderQuarantine(t *testing.T) {
 	}
 }
 
+func TestProviderCreditExhaustion400FallsBackAndBlocksProvider(t *testing.T) {
+	primaryCalls := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service.","type":"invalid_request_error","code":"BAD_REQUEST"}}`))
+	}))
+	defer primary.Close()
+	fallbackCalls := 0
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message"}`))
+	}))
+	defer fallback.Close()
+
+	server, err := newProxyServer(config{
+		DefaultProvider: "primary",
+		Providers: map[string]providerConfig{
+			"primary":  {BaseURL: primary.URL},
+			"fallback": {BaseURL: fallback.URL},
+		},
+		Quarantine: providerQuarantineConfig{
+			Enabled: true, SignalThreshold: 1, WindowSeconds: 300, BaseSeconds: 300, MaxSeconds: 1800,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := modelConfig{
+		Requested: "worker", Provider: "primary", Upstream: "worker",
+		Fallbacks: []modelConfig{{Provider: "fallback", Upstream: "worker"}},
+	}
+	body := []byte(`{"model":"worker","messages":[{"role":"user","content":"work"}]}`)
+	response, err := server.doWithFallbacks(context.Background(), httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, map[string]any{"model": "worker"}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.resp.Body.Close()
+	if response.providerName != "fallback" || response.resp.StatusCode != http.StatusOK {
+		t.Fatalf("provider=%q status=%d, want fallback HTTP 200", response.providerName, response.resp.StatusCode)
+	}
+	if primaryCalls != 1 || fallbackCalls != 1 {
+		t.Fatalf("calls primary=%d fallback=%d, want 1 and 1", primaryCalls, fallbackCalls)
+	}
+	if blocked, state := server.providerBlocked("primary"); !blocked || state.Reason != "quota_or_rate_limit" {
+		t.Fatalf("credit exhaustion did not block primary as quota: %#v", state)
+	}
+
+	second, err := server.doWithFallbacks(context.Background(), httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, map[string]any{"model": "worker"}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.resp.Body.Close()
+	if second.providerName != "fallback" || primaryCalls != 1 || fallbackCalls != 2 {
+		t.Fatalf("blocked primary was retried: provider=%q primary=%d fallback=%d", second.providerName, primaryCalls, fallbackCalls)
+	}
+}
+
 func TestRoutingStickyKeyIsConversationScopedAndStable(t *testing.T) {
 	selected := modelConfig{Requested: "sonnet"}
 	payload := func(first, second string) map[string]any {
@@ -3805,7 +3930,7 @@ func TestHTTPFailuresAndExcessiveTTFBFeedQuarantine(t *testing.T) {
 				}
 				_ = response.resp.Body.Close()
 			}
-			if blocked, state := server.providerBlocked("provider"); !blocked || !strings.HasPrefix(state.Reason, "instability_") {
+			if blocked, state := server.providerBlockForCandidate("provider", selected); !blocked || !strings.HasPrefix(state.Reason, "instability_") {
 				t.Fatalf("provider state = %#v, want instability quarantine", state)
 			}
 		})
@@ -3841,6 +3966,8 @@ func TestSharedNetworkIncidentSuppressesProviderQuarantineButNotQuotaBlocks(t *t
 		t.Fatal(err)
 	}
 
+	server.observeNetworkTransportFailure("provider-a", "transport", fmt.Errorf("network is unreachable"))
+	server.observeNetworkTransportFailure("provider-b", "transport", fmt.Errorf("network is unreachable"))
 	for _, failure := range []struct {
 		provider string
 		signal   string
@@ -3906,12 +4033,12 @@ func TestSharedNetworkIncidentDeduplicatesProviderOrigins(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, provider := range []string{"provider-a", "provider-a-alias"} {
-		server.observeProviderInstability(provider, "transport")
+		server.observeNetworkTransportFailure(provider, "transport", fmt.Errorf("network is unreachable"))
 	}
-	if status := server.networkIncidentStatus(); status["active"] == true {
+	if status := server.networkIncidentStatus(); status["phase"] != networkPhaseSuspected {
 		t.Fatalf("one deduplicated origin triggered shared incident: %#v", status)
 	}
-	server.observeProviderInstability("provider-b", "transport")
+	server.observeNetworkTransportFailure("provider-b", "transport", fmt.Errorf("network is unreachable"))
 	if status := server.networkIncidentStatus(); status["active"] != true {
 		t.Fatalf("two independent origins did not trigger shared incident: %#v", status)
 	}
@@ -3964,7 +4091,7 @@ func TestSharedNetworkRecoveryAllowsOnlyOneProbe(t *testing.T) {
 	server.clockNow = func() time.Time { return now }
 
 	server.observeNetworkTransportFailure("provider-a", "transport", fmt.Errorf("network is unreachable"))
-	decision := server.observeNetworkTransportFailure("provider-b", "transport", fmt.Errorf("i/o timeout"))
+	decision := server.observeNetworkTransportFailure("provider-b", "transport", fmt.Errorf("network is unreachable"))
 	if !decision.SuppressProviderPenalty || !decision.StopFallback {
 		t.Fatalf("confirmation decision = %#v, want suppressed stop", decision)
 	}
@@ -4018,7 +4145,7 @@ func TestSharedNetworkGateReturnsRetryAfterWithoutUpstreamCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.observeNetworkTransportFailure("provider-a", "transport", fmt.Errorf("network is unreachable"))
-	server.observeNetworkTransportFailure("provider-b", "transport", fmt.Errorf("i/o timeout"))
+	server.observeNetworkTransportFailure("provider-b", "transport", fmt.Errorf("network is unreachable"))
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"test-model","messages":[]}`))
 	response := httptest.NewRecorder()

@@ -186,11 +186,34 @@ Non-primary metered providers require explicit paid-fallback permission. Missing
 
 Usage collection defaults to `passive`. Routing still handles real quota errors without a usage API. Optional API polling and local browser snapshots are configured per provider; no browser or collector is launched automatically.
 
+Fable-specific limits do not disable other Claude models. An old Fable limit can be revalidated by one real inference per account per hour when fresh global quota headers allow requests. This handles allowance changes after an upgrade without background inference or duplicate requests. A complete successful Fable response clears the old limit; failures retain it. The menu labels partial restrictions `FABLE LIMIT`, with the model reset time in its tooltip.
+
 Claude Code manages login credentials. The proxy rereads rotated credentials and can use an explicitly configured `refreshCommand` for unattended refresh. A successful helper must actually rotate credentials; no hidden inference probe is used.
 
 Set per-profile or pool thresholds to preserve quota. Proactive reserves need fresh usage data; unknown usage is never presented as a full balance.
 
 ## Operations
+
+See [passive request telemetry](docs/passive-telemetry.md) for concurrency,
+connection timing, and correlated fallback/error records. Observation only: no
+request caps or queues.
+
+Temporary HTTP error capture is available with top-level `errorTrace`: set
+`enabled: true`, an explicit `providers` array, and an RFC3339 `expiresAt`.
+`captureBodies` defaults to false (metadata only); setting it to true stores the
+actual transformed upstream request and error response, including potentially
+sensitive conversation text, code, and tool arguments. Do not publish captures.
+Authentication/cookie headers and URL query strings are never captured; only
+protocol/correlation headers are allowlisted. Bodies are not secret-redacted.
+
+Captures live in `stateDir/error-traces` (directory 0700, files 0600), with eight
+rotating slots. Requests are capped at 2 MiB, errors at 64 KiB, and records at
+16 MiB. Truncation, incomplete reads, request hash, proxy request ID, upstream
+request ID, and attempt index are recorded. Capture expires automatically, but
+existing files remain until rotated or manually removed. Concurrent disk writes
+are skipped rather than queued. Successes, transport failures without an HTTP
+response, and HTTP-200 SSE errors are not captured. No extra upstream reads or
+requests are made. `proxy.log` contains only capture references, not trace bodies.
 
 Status endpoints: `/health`, `/status`, `/routes`, `/routing`, `/metrics`, and `/catalog`. `/dashboard` is a versioned, cached-only display endpoint for the menu app. `/quota` exposes Ollama-specific quota data and may refresh its cache.
 

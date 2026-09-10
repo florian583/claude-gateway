@@ -19,14 +19,15 @@ type dashboardWindow struct {
 	ResetsAt *time.Time `json:"resetsAt,omitempty"`
 }
 type dashboardRow struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Billing     string            `json:"billing,omitempty"`
-	Models      []string          `json:"models"`
-	Windows     []dashboardWindow `json:"windows"`
-	State       string            `json:"state"`
-	UpdatedAt   *time.Time        `json:"updatedAt,omitempty"`
-	ModelStates map[string]string `json:"modelStates,omitempty"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Billing      string            `json:"billing,omitempty"`
+	Models       []string          `json:"models"`
+	Windows      []dashboardWindow `json:"windows"`
+	State        string            `json:"state"`
+	UpdatedAt    *time.Time        `json:"updatedAt,omitempty"`
+	ModelStates  map[string]string `json:"modelStates,omitempty"`
+	FableResetAt *time.Time        `json:"fableResetAt,omitempty"`
 }
 type dashboardFlow struct {
 	At       time.Time `json:"at"`
@@ -180,6 +181,9 @@ func (s *proxyServer) dashboardSnapshot(now time.Time) dashboardSnapshot {
 			row.Models = append(row.Models, m.Upstream)
 			state := firstNonEmpty(dashboardBlock(states[m.Provider+"@"+id], now), dashboardBlock(states[m.Provider], now))
 			modelKey := s.claudeModelQuotaBlockKey(m.Provider+"@"+id, modelConfig{Upstream: m.Upstream})
+			if block := states[modelKey]; modelKey != "" && block.Reason == "fable_quota_rejected" && block.BlockedUntil.After(now) {
+				row.FableResetAt = dashboardDate(block.BlockedUntil)
+			}
 			state = firstNonEmpty(state, dashboardBlock(states[modelKey], now))
 			if state == "" {
 				state = row.State
@@ -203,6 +207,9 @@ func (s *proxyServer) dashboardSnapshot(now time.Time) dashboardSnapshot {
 		if blocked != "" {
 			if eligible {
 				row.State = "RESTRICTED"
+				if row.FableResetAt != nil {
+					row.State = "FABLE LIMIT"
+				}
 			} else {
 				row.State = blocked
 			}
