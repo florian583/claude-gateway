@@ -38,6 +38,7 @@ const cliHelp = `Usage: claude-proxy [--config PATH] COMMAND
   validate-config            Check configuration without contacting providers
   serve                      Start the proxy (default)
   run [-- CLAUDE_ARGS...]     Open Claude Code through the proxy
+  migrate-client [OPTIONS]   Preview/import an existing Claude settings directory
   profiles add NAME [OPTIONS] Create a profile and add it to an account pool
   profiles login ID          Log in a subscription account directly
   profiles open ID [-- ARGS]  Open that account directly, without the proxy
@@ -80,7 +81,7 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		if len(args) > 1 || len(args) == 1 && args[0] != "--no-browser" {
 			return errors.New("usage: xai-login [--no-browser]")
 		}
-	case "profiles", "run":
+	case "profiles", "run", "migrate-client":
 	default:
 		return fmt.Errorf("unknown command %q (use --help)", command)
 	}
@@ -102,6 +103,8 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return err
 	}
 	switch command {
+	case "migrate-client":
+		return migrateClient(cfg.Definition.Client.ConfigDir, args, out)
 	case "serve":
 		return serve(cfg)
 	case "validate-config":

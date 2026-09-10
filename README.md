@@ -118,6 +118,42 @@ claude-routed --resume
 
 The launcher preserves the project directory and forwards Claude arguments. It sets the proxy URL and a non-secret local token, while removing inherited upstream credentials. The proxy supplies the selected provider's credentials. Do not log in to a subscription through `claude-routed`; use `profiles login` or an account alias.
 
+## Bring your existing Claude preferences and memory
+
+Already use Claude Code? Import your old profile into the gateway's separate
+`client.configDir` instead of starting from scratch:
+
+```sh
+# Preview only; creates nothing.
+claude-proxy migrate-client --from "$HOME/.claude"
+# Stop Claude sessions using either directory, review the preview, then apply.
+claude-proxy migrate-client --from "$HOME/.claude" --apply
+```
+
+For another gateway config, prepend `--config /path/to/config.json`. Destination
+comes from that config's `client.configDir`, not a hardcoded `claude-hybrid` folder.
+The proxy service does not need a restart; open a new routed Claude session afterward.
+
+Imports instructions, skills, agents, commands, rules, hooks, project memory and
+sessions, plans, todos, history, MCP definitions, and selected user/project preferences.
+Reads both profile-local `.claude.json` and the legacy sibling location (prefers local).
+Existing files are retained; settings/MCP JSON merges missing keys only, recursively.
+Existing arrays and values win. Original merged JSON files get a private backup
+under the destination; source files are never changed. Reruns are safe to preview.
+
+Account credentials, old model/auth/routing settings, plugin registrations/caches,
+and unrelated runtime data are **not** imported. Reinstall plugins through Claude's
+plugin manager. Nested symlinks are reported and skipped; linked skills need a
+separate reviewed copy/install. Project paths are retained, not relocated. Review
+copied hooks, MCP commands, permissions, and absolute paths before launching; MCP
+configuration and conversation history can contain secrets. Keep migration data local.
+Repository-level `.claude/` files stay in their projects and need no copy.
+
+Large history/session files are streamed, not loaded together into memory.
+Migration is not a whole-directory transaction: a filesystem error can leave some
+files imported. Stop destination sessions, inspect the reported backup, and rerun
+the preview. Existing non-JSON file conflicts are left for manual reconciliation.
+
 ## Agent-assisted setup
 
 Copy this prompt into your coding agent:
