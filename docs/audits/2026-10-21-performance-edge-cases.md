@@ -8,6 +8,8 @@ The main priorities are bounded body reads, correct failure reporting, and remov
 
 All six findings now have fixes and regression coverage. The findings below describe the original audited revision, and its line numbers are historical. The four audit tests now assert the corrected behavior. Requests and buffered responses have byte and time limits. JSON read and parse failures reach fallback before client output. Account pins use one ordered asynchronous writer outside the selection lock, and both transient pins and metric persistence queues are bounded. See `docs/configuration.md` for defaults and durability limits.
 
+Post-fix local benchmark: two 20-operation runs at 10000 durable pins measured 0.317–0.327 ms per new-pin update. This measures map updates and enqueue latency with the writer running concurrently, not completion of durable storage. It must not be interpreted as an fsync throughput result. The original synchronous path measured 42–265 ms per update across runs.
+
 ## Observed traffic
 
 The sample starts at 12:35 UTC, after both deployments. The collector read at most 8 MiB from each of the active and most recent archived metric files. Counts are attempt/completion records, not distinct requests. Timings are milliseconds. Account-selection duration can repeat across the attempts of one request. These short, observational samples are not a controlled host comparison or a capacity test.
