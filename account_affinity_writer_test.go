@@ -186,3 +186,68 @@ func TestAccountPinShutdownReportsFailure(t *testing.T) {
 		t.Fatal("repeated close lost error")
 	}
 }
+
+func TestAccountPinCloseBeforeFirstPin(t *testing.T) {
+	s := &proxyServer{cfg: config{Definition: &fileConfig{StateDir: t.TempDir()}}}
+	if err := s.closeClaudeAccountPins(); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshClaudeAccountLease("late", claudeUsageProfile{Name: "primary"})
+	s.claudeAccountMu.Lock()
+	s.queueClaudeAccountPinsLocked()
+	writer := s.claudePinWriter
+	s.claudeAccountMu.Unlock()
+	if writer != nil || len(s.claudePersistentPins) != 0 {
+		t.Fatal("closed store accepted a late pin")
+	}
+	if err := s.flushClaudeAccountPins(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccountPinCloseRejectsConcurrentLatePins(t *testing.T) {
+	s := &proxyServer{cfg: config{Definition: &fileConfig{StateDir: t.TempDir()}}}
+	started, release := make(chan struct{}), make(chan struct{})
+	affinityTestWriter(s, func(snapshot accountPinFile) error {
+		close(started)
+		<-release
+		return s.saveClaudeAccountPins(snapshot)
+	})
+	p := claudeUsageProfile{Name: "primary"}
+	s.refreshClaudeAccountLease("first", p)
+	<-started
+	closed := make(chan error, 1)
+	go func() { closed <- s.closeClaudeAccountPins() }()
+	// stop closes only after the closed guard is set under the account lock.
+	<-s.claudePinWriter.stop
+	for i := 0; i < 100; i++ {
+		s.refreshClaudeAccountLease(fmt.Sprint(i), p)
+	}
+	flushed := make(chan error, 1)
+	go func() { flushed <- s.flushClaudeAccountPins() }()
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not finish")
+	}
+	select {
+	case err := <-flushed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flush waited for a stopped writer")
+	}
+	if len(s.claudePersistentPins) != 1 || s.claudePinWriter.generation != 1 {
+		t.Fatal("late pin changed the final snapshot")
+	}
+	restarted := &proxyServer{cfg: s.cfg}
+	restarted.loadClaudeAccountPins()
+	if len(restarted.claudePersistentPins) != 1 {
+		t.Fatal("final snapshot not persisted")
+	}
+}

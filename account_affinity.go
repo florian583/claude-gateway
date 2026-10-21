@@ -90,6 +90,9 @@ func (s *proxyServer) loadClaudeAccountPins() {
 
 // Called under claudeAccountMu. Only hashes reach disk.
 func (s *proxyServer) rememberClaudeAccountLocked(key string, profile claudeUsageProfile, ttl time.Duration) {
+	if s.claudePinsClosed {
+		return
+	}
 	if s.claudeAccounts == nil {
 		s.claudeAccounts = map[string]claudeAccountSticky{}
 	}
@@ -135,6 +138,9 @@ type accountPinWriter struct {
 }
 
 func (s *proxyServer) queueClaudeAccountPinsLocked() {
+	if s.claudePinsClosed {
+		return
+	}
 	if s.claudePinWriter == nil {
 		w := &accountPinWriter{wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), write: s.saveClaudeAccountPins}
 		s.claudePinWriter = w
@@ -214,9 +220,10 @@ func (s *proxyServer) flushClaudeAccountPins() error {
 	return err
 }
 
-// Call after request handlers have drained, so no new pin can follow the snapshot.
+// Late handlers cannot enqueue work after shutdown takes the final snapshot.
 func (s *proxyServer) closeClaudeAccountPins() error {
 	s.claudeAccountMu.Lock()
+	s.claudePinsClosed = true
 	w := s.claudePinWriter
 	s.claudeAccountMu.Unlock()
 	if w == nil {
