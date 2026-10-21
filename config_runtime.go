@@ -378,16 +378,23 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 	if e != nil {
 		return e
 	}
-	if e = cmd.Run(); e != nil {
-		return errors.New("configured refresh command failed")
-	}
+	var output limitedBuffer
+	output.limit = 4096
+	cmd.Stdout = &output
+	runErr := cmd.Run()
 	clearClaudeProfileOAuthToken(profile)
 	after, e := resolveClaudeProfileOAuthToken(ctx, profile, true)
 	if e != nil {
 		return e
 	}
 	if after == before {
-		return errors.New("refresh command did not rotate credential; login may be required")
+		var proof struct {
+			Version      int  `json:"version"`
+			AuthVerified bool `json:"authVerified"`
+		}
+		if runErr != nil || json.Unmarshal(output.Bytes(), &proof) != nil || proof.Version != 1 || !proof.AuthVerified {
+			return errors.New("refresh command did not rotate or verify credential; login may be required")
+		}
 	}
 	raw, ok := claudeOAuthCredentials.Load(profile.CredentialsService)
 	if !ok || !raw.(cachedClaudeOAuthCredential).usable(time.Now()) {
@@ -417,7 +424,7 @@ func (s *proxyServer) monitorProfileCredentials(ctx context.Context) {
 				return
 			}
 			raw, ok := claudeOAuthCredentials.Load(profile.CredentialsService)
-			if e != nil || !ok || (!raw.(cachedClaudeOAuthCredential).expiresAt.IsZero() && raw.(cachedClaudeOAuthCredential).expiresAt.Before(time.Now().Add(2*time.Minute))) {
+			if e != nil || !ok || !raw.(cachedClaudeOAuthCredential).expiresAt.After(time.Now().Add(2*time.Minute)) {
 				s.triggerClaudeOAuthRefresh(profile)
 			}
 		}
