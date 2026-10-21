@@ -1087,6 +1087,7 @@ type proxyServer struct {
 	claudeAccounts           map[string]claudeAccountSticky
 	claudePersistentPins     map[string]persistedAccountPin
 	claudePinWriter          *accountPinWriter
+	claudePinsClosed         bool
 	claudeAccountInFlight    map[string]int
 	claudeSelectionLogMu     sync.Mutex
 	claudeSelectionLogged    map[string]string
