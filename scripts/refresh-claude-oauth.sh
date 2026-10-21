@@ -93,7 +93,7 @@ read_credential_expiry() {
 		"$JQ_BIN" -ce '
 			def expiry_epoch:
 				if type == "number" then (if . > 100000000000 then . / 1000 else . end)
-				elif type == "string" then (try tonumber catch fromdateiso8601)
+				elif type == "string" then (try (tonumber | expiry_epoch) catch fromdateiso8601)
 				else error("invalid expiresAt") end;
 			select(.claudeAiOauth.accessToken | type == "string" and length > 0)
 			| (try (.claudeAiOauth.expiresAt | expiry_epoch | floor) catch 0) as $epoch
@@ -119,9 +119,13 @@ write_profile_status() {
 	local last_success="$7"
 	local error_code="$8"
 	local checked_at="$9"
-	local tmp
+	local tmp previous
+	previous=/dev/null
+	[[ ! -r "$path" ]] || previous="$path"
 	tmp="$(/usr/bin/mktemp "${path}.tmp.XXXXXX")"
-	"$JQ_BIN" -n \
+	"$JQ_BIN" -n --slurpfile previous "$previous" \
+		--arg cliExitCode "${cli_exit_code:-}" \
+		--arg attemptDurationSeconds "${attempt_duration:-}" \
 		--arg name "$name" \
 		--arg state "$state" \
 		--arg expiresAt "$expires_at" \
@@ -138,8 +142,13 @@ write_profile_status() {
 			remainingSeconds: (if $remainingSeconds == "" then null else ($remainingSeconds | tonumber) end),
 			lastAttemptAt: (if $lastAttemptAt == "" then null else $lastAttemptAt end),
 			lastSuccessAt: (if $lastSuccessAt == "" then null else $lastSuccessAt end),
-			error: (if $error == "" then null else $error end)
-		}' >"$tmp"
+			error: (if $error == "" then null else $error end),
+            cliExitCode: (if $cliExitCode == "" then ($previous[0].cliExitCode // null) else ($cliExitCode | tonumber) end),
+            attemptDurationSeconds: (if $attemptDurationSeconds == "" then ($previous[0].attemptDurationSeconds // null) else ($attemptDurationSeconds | tonumber) end)
+        }
+        | . as $current
+        | .attempts = ((($previous[0].attempts // []) +
+            (if $cliExitCode != "" then [$current | {checkedAt,lastAttemptAt,state,error,cliExitCode,attemptDurationSeconds,expiresAt}] else [] end)) | .[-16:])' >"$tmp"
 	/bin/chmod 600 "$tmp"
 	/bin/mv -f "$tmp" "$path"
 }
@@ -213,6 +222,8 @@ while IFS= read -r profile_json; do
 		continue
 	fi
 	matched=$((matched + 1))
+	cli_exit_code=""
+	attempt_duration=""
 	checked_epoch="$(now_epoch)"
 	checked_at="$(iso_at_epoch "$checked_epoch")"
 	last_attempt="$(previous_field "$profile_status" lastAttemptAt)"
@@ -274,10 +285,18 @@ while IFS= read -r profile_json; do
 	last_attempt="$checked_at"
 	previous_expires_epoch="$expires_epoch"
 	cli_succeeded=0
+	attempt_started="$(now_epoch)"
 	if run_official_cli "$config_dir"; then
+		cli_exit_code=0
 		cli_succeeded=1
 		AUTH_VERIFIED=1
+	else
+		cli_exit_code=$?
 	fi
+	completed_epoch="$(now_epoch)"
+	attempt_duration=$((completed_epoch - attempt_started))
+	checked_epoch="$completed_epoch"
+	checked_at="$(iso_at_epoch "$checked_epoch")"
 	if credential="$(read_credential_expiry "$service")"; then
 		expires_at="$($JQ_BIN -r '.expiresAt' <<<"$credential")"
 		expires_epoch="$($JQ_BIN -r '.expiresEpoch' <<<"$credential")"
@@ -331,7 +350,7 @@ if ((${#existing_status_files[@]} > 0)); then
 		{
 			checkedAt: $checkedAt,
 			generatedAt: $generatedAt,
-			profiles: (map({key: .name, value: (del(.name, .checkedAt))}) | from_entries)
+			profiles: (map({key: .name, value: (del(.name))}) | from_entries)
 		}
 	' "${existing_status_files[@]}" >"$status_tmp"
 else
