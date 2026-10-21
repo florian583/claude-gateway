@@ -701,11 +701,21 @@ type metricsStore struct {
 	routeSamples   map[string]*metricsRing
 	rollup         *rollupStore
 	pending        []metricsSample
+	dropped        uint64
+	flushing       bool
 	flushTimer     *time.Timer
 	persistedLines int
 	persistedBytes int64
 	closed         bool
-	file           *os.File
+	file           metricsFile
+}
+
+type metricsFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Stat() (os.FileInfo, error)
+	Truncate(int64) error
+	Close() error
 }
 
 type metricsRing struct {
@@ -1964,8 +1974,12 @@ func (m *metricsStore) record(sample metricsSample) {
 	if m.rollup != nil {
 		m.rollup.observe(sample)
 	}
+	if len(m.pending) >= m.pendingCapacity() {
+		m.dropped++
+		return
+	}
 	m.pending = append(m.pending, sample)
-	if m.flushTimer == nil {
+	if m.flushTimer == nil && !m.flushing {
 		m.flushTimer = time.AfterFunc(metricsFlushDelay, m.flush)
 	}
 }
@@ -1991,13 +2005,17 @@ func (m *metricsStore) openFileLocked() error {
 	return nil
 }
 
-func (m *metricsStore) requeue(batch []metricsSample) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pending = append(batch, m.pending...)
-	if !m.closed && m.flushTimer == nil {
-		m.flushTimer = time.AfterFunc(time.Second, m.flush)
+func (m *metricsStore) pendingCapacity() int {
+	return min(m.maxSamples, 10000)
+}
+
+func (m *metricsStore) persistenceDropped() uint64 {
+	if m == nil {
+		return 0
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.dropped
 }
 
 func (m *metricsStore) rotateLocked() {
@@ -2014,16 +2032,43 @@ func (m *metricsStore) rotateLocked() {
 }
 
 func (m *metricsStore) flush() {
-	if m == nil || m.path == "" {
+	if m == nil || m.path == "" || !m.ioMu.TryLock() {
 		return
 	}
 	m.mu.Lock()
-	batch := append([]metricsSample(nil), m.pending...)
-	m.pending = nil
-	m.flushTimer = nil
-	m.mu.Unlock()
-	if len(batch) == 0 {
+	if m.closed {
+		m.ioMu.Unlock()
+		m.mu.Unlock()
 		return
+	}
+	if m.flushTimer != nil {
+		m.flushTimer.Stop()
+		m.flushTimer = nil
+	}
+	m.flushing = true
+	m.mu.Unlock()
+	ok := m.flushBatchLocked()
+	m.mu.Lock()
+	m.flushing = false
+	if !m.closed && len(m.pending) > 0 {
+		delay := metricsFlushDelay
+		if !ok {
+			delay = time.Second
+		}
+		m.flushTimer = time.AfterFunc(delay, m.flush)
+	}
+	m.ioMu.Unlock()
+	m.mu.Unlock()
+}
+
+// The I/O mutex owns the writer; pending retains the in-flight prefix so the
+// queue cap includes records being written and retries keep their EventIDs.
+func (m *metricsStore) flushBatchLocked() bool {
+	m.mu.RLock()
+	batch := append([]metricsSample(nil), m.pending[:min(len(m.pending), 256)]...)
+	m.mu.RUnlock()
+	if len(batch) == 0 {
+		return true
 	}
 
 	var buffer bytes.Buffer
@@ -2037,22 +2082,17 @@ func (m *metricsStore) flush() {
 		buffer.WriteByte('\n')
 		written++
 	}
-	if written == 0 {
-		return
-	}
 
-	m.ioMu.Lock()
-	defer m.ioMu.Unlock()
 	if err := m.openFileLocked(); err != nil {
 		log.Printf("metrics open failed path=%q error=%v", m.path, err)
-		m.requeue(batch)
-		return
+		return false
 	}
 	before, err := m.file.Stat()
 	if err != nil {
-		m.requeue(batch)
 		log.Printf("metrics stat failed: %v", err)
-		return
+		_ = m.file.Close()
+		m.file = nil
+		return false
 	}
 	n, err := m.file.Write(buffer.Bytes())
 	if err == nil && n != buffer.Len() {
@@ -2068,14 +2108,20 @@ func (m *metricsStore) flush() {
 		}
 		_ = m.file.Close()
 		m.file = nil
-		m.requeue(batch)
-		return
+		return false
 	}
+	m.mu.Lock()
+	copy(m.pending, m.pending[len(batch):])
+	clear(m.pending[len(m.pending)-len(batch):])
+	m.pending = m.pending[:len(m.pending)-len(batch)]
+	m.dropped += uint64(len(batch) - written)
+	m.mu.Unlock()
 	m.persistedLines += written
 	m.persistedBytes += int64(buffer.Len())
 	if m.persistedLines >= m.maxSamples || m.persistedBytes >= metricsSegmentBytes {
 		m.rotateLocked()
 	}
+	return true
 }
 
 func (m *metricsStore) close() {
@@ -2089,8 +2135,22 @@ func (m *metricsStore) close() {
 		m.flushTimer = nil
 	}
 	m.mu.Unlock()
-	m.flush()
 	m.ioMu.Lock()
+	for {
+		m.mu.RLock()
+		remaining := len(m.pending)
+		m.mu.RUnlock()
+		if remaining == 0 {
+			break
+		}
+		if !m.flushBatchLocked() {
+			m.mu.Lock()
+			m.dropped += uint64(len(m.pending))
+			m.pending = nil
+			m.mu.Unlock()
+			break
+		}
+	}
 	if m.file != nil {
 		_ = m.file.Close()
 		m.file = nil
@@ -4080,7 +4140,7 @@ func (s *proxyServer) status(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"pid": os.Getpid(), "sourceHash": buildSourceHash,
 		"configHash": s.cfg.SourceHash, "activeRequests": s.activeRequests.Load(), "draining": s.draining.Load(),
-		"upstreamConcurrency": s.passiveConcurrency.snapshot()})
+		"upstreamConcurrency": s.passiveConcurrency.snapshot(), "metricsPersistenceDropped": s.metrics.persistenceDropped()})
 }
 
 // quota exposes only quota metadata on the loopback proxy; credentials remain
