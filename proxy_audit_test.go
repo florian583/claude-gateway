@@ -106,14 +106,14 @@ func TestAuditTruncatedJSONRecordedAsSuccess(t *testing.T) {
 
 }
 
-func TestAuditExpiredAccountPinsAccumulate(t *testing.T) {
+func TestAuditExpiredAccountPinsBounded(t *testing.T) {
 	s := &proxyServer{}
 	p := claudeUsageProfile{Name: "synthetic", CredentialsService: "synthetic"}
 	for i := 0; i < maxAccountPins+100; i++ {
 		s.rememberClaudeAccountLocked(fmt.Sprint(i), p, -time.Hour)
 	}
-	if len(s.claudeAccounts) != maxAccountPins+100 {
-		t.Fatal("expired pins were pruned")
+	if len(s.claudeAccounts) > maxAccountPins {
+		t.Fatal("transient pin cap exceeded")
 	}
 	t.Logf("retained %d expired in-memory account pins", len(s.claudeAccounts))
 }
@@ -183,6 +183,7 @@ func BenchmarkAuditPersistNewAccountPin(b *testing.B) {
 				s.claudePersistentPins[affinityHash(fmt.Sprint(i))] = persistedAccountPin{ProfileHash: affinityHash("synthetic"), LastUsed: time.Now()}
 			}
 			p := claudeUsageProfile{Name: "synthetic", CredentialsService: "synthetic"}
+			b.Cleanup(func() { _ = s.closeClaudeAccountPins() })
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -197,7 +198,11 @@ func BenchmarkAuditPersistNewAccountPin(b *testing.B) {
 func BenchmarkAuditPersistExistingAccountPin(b *testing.B) {
 	s := &proxyServer{cfg: config{Definition: &fileConfig{StateDir: b.TempDir()}}}
 	p := claudeUsageProfile{Name: "synthetic", CredentialsService: "synthetic"}
-	s.rememberClaudeAccountLocked("same", p, time.Hour)
+	s.refreshClaudeAccountLease("same", p)
+	if err := s.flushClaudeAccountPins(); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = s.closeClaudeAccountPins() })
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
