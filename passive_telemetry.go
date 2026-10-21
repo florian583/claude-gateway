@@ -52,6 +52,15 @@ type attemptOutcome struct {
 }
 
 type attemptExecution struct {
+	PrimedFrames        int               `json:"primedFrames,omitempty"`
+	PrimeLastFrame      string            `json:"primeLastFrame,omitempty"`
+	PreludeMS           int64             `json:"preludeMs,omitempty"`
+	AccountSelectionMS  *int64            `json:"accountSelectionMs,omitempty"`
+	TransformMS         int64             `json:"transformMs"`
+	HeaderBudgetMS      int64             `json:"headerBudgetMs,omitempty"`
+	ChainRemainingMS    int64             `json:"chainRemainingMs,omitempty"`
+	ChainLimited        bool              `json:"chainLimited,omitempty"`
+	RequestWrittenMS    *int64            `json:"requestWrittenMs,omitempty"`
 	ResponseMetadata    map[string]string `json:"responseMetadata,omitempty"`
 	Chain               string            `json:"chain,omitempty"`
 	Number              int               `json:"number"`
@@ -161,12 +170,14 @@ func (c *concurrencyTelemetry) snapshot() concurrencySnapshot {
 }
 
 func applyExecutionTelemetry(sample *metricsSample, trace requestTrace) {
+	sample.usageAttribution = trace.Attribution
 	if trace.Execution == nil {
 		return
 	}
 	// Copy before recording: metrics may serialize asynchronously, while the
 	// request proceeds through its remaining fallback candidates.
 	e := *trace.Execution
+	e.AccountSelectionMS = trace.AccountSelectionMS
 	if e.ResponseMetadata != nil {
 		e.ResponseMetadata = make(map[string]string, len(trace.Execution.ResponseMetadata))
 		for key, value := range trace.Execution.ResponseMetadata {
@@ -181,6 +192,13 @@ func applyExecutionTelemetry(sample *metricsSample, trace requestTrace) {
 	sample.ResponseHeadersMS, sample.FirstEventMS = trace.HeadersMS, trace.FirstEventMS
 	if trace.Timing != nil {
 		t := trace.Timing
+		e.HeaderBudgetMS = t.headerBudgetMS.Load()
+		e.ChainRemainingMS = t.chainRemainingMS.Load()
+		e.ChainLimited = t.chainLimited.Load()
+		if t.requestWritten.Load() {
+			written := t.requestWrittenMS.Load()
+			e.RequestWrittenMS = &written
+		}
 		sample.ConnectionMS, sample.DNSMS, sample.TLSMS = t.connectionMS.Load(), t.dnsMS.Load(), t.tlsMS.Load()
 		e.FirstResponseByteMS = t.firstResponseByteMS.Load()
 		if t.gotConnection.Load() {

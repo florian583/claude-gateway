@@ -165,6 +165,12 @@ func TestConfiguredPaidFallbackRequiresEveryLegEvidence(t *testing.T) {
 		{"quota-then-auth", []int{429, 401}, 0}, {"quota-then-outage", []int{429, 503}, 0}, {"all-quota", []int{429, 402}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// This test reuses fixture provider/model names. Clear process-global
+			// circuit state left by earlier tests before exercising paid policy.
+			for _, key := range []string{"endpoint|test-model", "other|test-model", "renamed-gateway|test-model"} {
+				circuitBreakers.Delete(key)
+				t.Cleanup(func() { circuitBreakers.Delete(key) })
+			}
 			var paid atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -223,6 +229,15 @@ func TestConfiguredPaidFallbackRequiresEveryLegEvidence(t *testing.T) {
 
 func TestConfiguredPaidPolicyStateAndOutageProof(t *testing.T) {
 	m := modelConfig{AllowPaidFallback: true, PaidFallbackOn: []string{"quota-exhausted", "confirmed-provider-outage"}}
+	timeoutEvidence := paidFallbackEvidence{"subscription": "response-header-timeout"}
+	if timeoutEvidence.allowed(m) {
+		t.Fatal("timeout spending must require explicit opt-in")
+	}
+	optedIn := m
+	optedIn.PaidFallbackOn = []string{"response-header-timeout"}
+	if !timeoutEvidence.allowed(optedIn) || (paidFallbackEvidence{"subscription": ""}).allowed(optedIn) {
+		t.Fatal("timeout opt-in must allow only observed timeout evidence")
+	}
 	if (paidFallbackEvidence{}).allowed(m) || (paidFallbackEvidence{"quota": "quota-exhausted", "wifi": ""}).allowed(m) {
 		t.Fatal("unknown triggered paid fallback")
 	}

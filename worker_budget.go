@@ -34,12 +34,17 @@ func (s *proxyServer) claudeWorkerReserveReason(snapshot claudeUsageSnapshot, m 
 		return ""
 	}
 	upstream := strings.ToLower(m.Upstream)
+	if strings.Contains(upstream, "fable") {
+		return s.claudeFableReserveReason(snapshot, m)
+	}
 	if !strings.Contains(upstream, "sonnet") && !strings.Contains(upstream, "haiku") {
 		return ""
 	}
 	pool := firstNonEmpty(m.AccountPool, s.cfg.Definition.Providers[s.cfg.ClaudeUsage.Provider].Auth.Pool)
-	limit := s.cfg.Definition.AccountPools[pool].WorkerUtilizationLimitPct
-	if limit <= 0 || snapshot.Source == "unknown" {
+	poolDef := s.cfg.Definition.AccountPools[pool]
+	genericLimit := poolDef.WorkerUtilizationLimitPct
+	weeklyLimit := poolDef.WorkerWeeklyUtilizationLimitPct
+	if (genericLimit <= 0 && weeklyLimit <= 0) || snapshot.Source == "unknown" {
 		return ""
 	}
 	now := s.accountNow()
@@ -48,6 +53,13 @@ func (s *proxyServer) claudeWorkerReserveReason(snapshot claudeUsageSnapshot, m 
 	s.claudeUse.mu.Unlock()
 	windows := []claudeUsageWindow{snapshot.FiveHour, snapshot.SevenDay}
 	for i, window := range windows {
+		limit := genericLimit
+		if i == 1 && weeklyLimit > 0 {
+			limit = weeklyLimit
+		}
+		if limit <= 0 {
+			continue
+		}
 		if !window.ResetsAt.IsZero() && !now.Before(window.ResetsAt) {
 			continue // Previous window is not evidence about the new one.
 		}

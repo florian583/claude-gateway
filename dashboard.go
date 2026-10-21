@@ -58,6 +58,7 @@ type dashboardSnapshot struct {
 	Traffic        []dashboardTraffic `json:"traffic"`
 	TrafficMinutes int                `json:"trafficMinutes"`
 	TrafficLimited bool               `json:"trafficLimited"`
+	Events         []proxyEvent       `json:"events,omitempty"`
 }
 
 func dashboardDate(t time.Time) *time.Time {
@@ -73,6 +74,9 @@ func dashboardBlock(state providerRuntimeState, now time.Time) string {
 	if state.BlockedUntil.After(now) {
 		if strings.Contains(state.Reason, "auth") {
 			return "AUTH"
+		}
+		if state.Reason == temporaryRateLimitReason {
+			return "THROTTLED"
 		}
 		if isQuotaReason(state.Reason) {
 			return "FULL"
@@ -196,7 +200,7 @@ func (s *proxyServer) dashboardSnapshot(now time.Time) dashboardSnapshot {
 		blocked, eligible := "", false
 		for _, state := range row.ModelStates {
 			switch state {
-			case "AUTH", "BLOCKED", "FULL", "RESERVE", "DEGRADED":
+			case "AUTH", "BLOCKED", "FULL", "THROTTLED", "RESERVE", "DEGRADED":
 				if blocked == "" || state < blocked {
 					blocked = state
 				}
@@ -250,6 +254,9 @@ func (s *proxyServer) dashboardSnapshot(now time.Time) dashboardSnapshot {
 	sort.Slice(out.Accounts, func(i, j int) bool { return out.Accounts[i].ID < out.Accounts[j].ID })
 	sort.Slice(out.Providers, func(i, j int) bool { return out.Providers[i].ID < out.Providers[j].ID })
 	s.dashboardTraffic(&out, now)
+	if s.events != nil {
+		out.Events = tailEvents(s.events.path, 15)
+	}
 	return out
 }
 
@@ -288,13 +295,6 @@ func (s *proxyServer) dashboardProviderWindows(id string, row *dashboardRow) tim
 			add(s.clineUse.snapshot.Windows)
 		}
 		s.clineUse.mu.Unlock()
-	case s.xaiUsageProviderName():
-		s.xaiUse.mu.Lock()
-		if s.xaiUse.hasValue {
-			at = s.xaiUse.snapshot.FetchedAt
-			add(s.xaiUse.snapshot.Windows)
-		}
-		s.xaiUse.mu.Unlock()
 	}
 	if len(row.Windows) == 0 && s.cfg.Providers[id].Usage.Mode == "browser" {
 		s.providerState.mu.Lock()

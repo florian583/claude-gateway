@@ -23,12 +23,10 @@ func validConversationID(value string) bool {
 	return true
 }
 
-// Capture identity before adapter rewrites. Explicit IDs survive compaction,
-// model switches and retries. Raw user/account metadata never leaves the proxy.
-func withOpenCodeSession(r *http.Request, payload map[string]any) *http.Request {
-	if id := r.Header.Get("x-opencode-session"); validConversationID(id) {
-		return r.WithContext(context.WithValue(r.Context(), openCodeSessionKey{}, id))
-	}
+// payloadSessionID extracts a stable conversation/session identifier from
+// request metadata (metadata.session_id, a JSON user_id, or a "_session_"
+// suffix). Raw user/account metadata never leaves the proxy.
+func payloadSessionID(payload map[string]any) string {
 	metadata, _ := payload["metadata"].(map[string]any)
 	id, _ := metadata["session_id"].(string)
 	user, _ := metadata["user_id"].(string)
@@ -45,6 +43,18 @@ func withOpenCodeSession(r *http.Request, payload map[string]any) *http.Request 
 			id = session
 		}
 	}
+	return id
+}
+
+// Capture identity before adapter rewrites. Explicit IDs survive compaction,
+// model switches and retries. Raw user/account metadata never leaves the proxy.
+func withOpenCodeSession(r *http.Request, payload map[string]any) *http.Request {
+	if id := r.Header.Get("x-opencode-session"); validConversationID(id) {
+		return r.WithContext(context.WithValue(r.Context(), openCodeSessionKey{}, id))
+	}
+	metadata, _ := payload["metadata"].(map[string]any)
+	user, _ := metadata["user_id"].(string)
+	id := payloadSessionID(payload)
 	seed := map[string]any{"session": id}
 	if id == "" {
 		// Best effort for clients without session metadata. Callers must send an

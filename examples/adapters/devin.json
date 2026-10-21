@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "listen": "127.0.0.1:48115",
+  "stateDir": "./devin-adapter-state",
+  "client": {"command": ["claude"], "configDir": "./devin-adapter-client", "model": "swe-2"},
+  "providers": {
+    "devin-adapter": {
+      "displayName": "Devin SWE adapter",
+      "protocol": "openai-chat-completions",
+      "variant": "generic",
+      "baseURL": "http://127.0.0.1:48105",
+      "billing": "local",
+      "auth": {"type": "env", "name": "DEVIN_ADAPTER_API_KEY"},
+      "responseHeaderTimeoutMS": 600000,
+      "streamIdleTimeoutMS": 600000
+    }
+  },
+  "models": {
+    "swe-2": {"provider": "devin-adapter", "upstream": "swe-2-high", "contextWindow": 262144, "supportsTools": true, "supportsImages": false}
+  },
+  "chains": {"swe-2": {"steps": [{"model": "swe-2"}]}},
+  "aliases": {"swe-2": "swe-2"}
+}

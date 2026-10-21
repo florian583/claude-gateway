@@ -167,6 +167,43 @@ func TestWorkerBudget(t *testing.T) {
 	}
 }
 
+func TestWorkerWeeklyLimitGatesSevenDayOnly(t *testing.T) {
+	now := time.Now().UTC()
+	f := testClaudeConfig(t)
+	model := f.Models["model"]
+	model.Upstream = "claude-sonnet-5"
+	f.Models["model"] = model
+	p := f.AccountPools["shared"]
+	p.WorkerUtilizationLimitPct = 0
+	p.WorkerWeeklyUtilizationLimitPct = 50
+	f.AccountPools["shared"] = p
+	s := testProxy(t, compileFixture(t, f))
+	s.clockNow = func() time.Time { return now }
+	m := s.cfg.Models["test"]
+	m.Upstream = "claude-sonnet-5"
+	base := claudeUsageSnapshot{Profile: "first", Source: "oauth-api", FetchedAt: now,
+		FiveHour: claudeUsageWindow{Utilization: 30, ResetsAt: now.Add(time.Hour)},
+		SevenDay: claudeUsageWindow{Utilization: 30, ResetsAt: now.Add(24 * time.Hour)}}
+	for _, tc := range []struct {
+		name   string
+		modify func(*claudeUsageSnapshot)
+		want   string
+	}{
+		{"below weekly limit", func(*claudeUsageSnapshot) {}, ""},
+		{"five hour ignored", func(v *claudeUsageSnapshot) { v.FiveHour.Utilization = 95 }, ""},
+		{"weekly cap", func(v *claudeUsageSnapshot) { v.SevenDay.Utilization = 50 }, "worker_reserve"},
+		{"weekly over cap", func(v *claudeUsageSnapshot) { v.SevenDay.Utilization = 72 }, "worker_reserve"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := base
+			tc.modify(&v)
+			if got := s.claudeWorkerReserveReason(v, m); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWorkerHistoryBoundedAndIndependent(t *testing.T) {
 	s := &proxyServer{}
 	now := time.Now()

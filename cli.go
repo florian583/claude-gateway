@@ -44,8 +44,8 @@ const cliHelp = `Usage: claude-proxy [--config PATH] COMMAND
   profiles open ID [-- ARGS]  Open that account directly, without the proxy
   profiles status [ID]       Check account login status
   profiles doctor [ID]       Check profile setup and credential storage
-  xai-login [--no-browser]    Authorize an xAI subscription
-  xai-status                 Check xAI authorization
+  stats [--since 24h] [--state-dir PATH] [--json]  Traffic/cost/quota summary from persisted rollups
+  rebuild-usage --source FILE --out NEW_DIR  Offline rebuild from canonical metrics (repeat --source)
   --version                  Print build information
 `
 
@@ -67,21 +67,19 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		command, args = args[0], args[1:]
 	}
 	switch command {
+	case "rebuild-usage":
+		return rebuildUsageCLI(args, out)
 	case "help", "--help", "-h":
 		_, err := io.WriteString(out, cliHelp)
 		return err
 	case "version", "--version":
 		_, err := fmt.Fprintf(out, "claude-proxy config-v1 source=%s\n", buildSourceHash)
 		return err
-	case "init", "validate-config", "serve", "xai-status":
+	case "init", "validate-config", "serve":
 		if len(args) != 0 {
 			return fmt.Errorf("%s does not accept arguments", command)
 		}
-	case "xai-login":
-		if len(args) > 1 || len(args) == 1 && args[0] != "--no-browser" {
-			return errors.New("usage: xai-login [--no-browser]")
-		}
-	case "profiles", "run", "migrate-client":
+	case "profiles", "run", "migrate-client", "stats":
 	default:
 		return fmt.Errorf("unknown command %q (use --help)", command)
 	}
@@ -115,10 +113,8 @@ func runCLI(ctx context.Context, args []string, in io.Reader, out, errOut io.Wri
 		return runProfilesCommand(ctx, cfg, args, in, out, errOut)
 	case "run":
 		return runClient(ctx, cfg, args, in, out, errOut)
-	case "xai-login":
-		return runXAIOAuthLogin(ctx, cfg, out, len(args) == 0)
-	case "xai-status":
-		return printXAIOAuthStatus(cfg, out)
+	case "stats":
+		return runStats(cfg, args, out)
 	}
 	return nil
 }

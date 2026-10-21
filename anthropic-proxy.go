@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +47,7 @@ type config struct {
 	ClineUsage      clineUsageConfig          `json:"clineUsage"`
 	ClaudeUsage     claudeUsageConfig         `json:"claudeUsage"`
 	AdaptiveRouting adaptiveRoutingConfig     `json:"adaptiveRouting"`
+	Classifier      *classifierConfig         `json:"-"`
 	Quarantine      providerQuarantineConfig  `json:"providerQuarantine"`
 }
 
@@ -80,6 +80,7 @@ type routeChain struct {
 type providerConfig struct {
 	Variant                  string            `json:"-"`
 	Billing                  string            `json:"-"`
+	Pricing                  pricingDefinition `json:"-"`
 	DisplayName              string            `json:"-"`
 	Usage                    usageDefinition   `json:"-"`
 	MessagesPath             string            `json:"-"`
@@ -101,9 +102,8 @@ type providerConfig struct {
 	AuthTokenCommand        []string `json:"authTokenCommand"`
 	AuthHeader              string   `json:"authHeader"`
 	AuthPrefix              string   `json:"authPrefix"`
-	// AuthMode enables provider-managed rotating credentials. "xai-oauth"
-	// uses the user's SuperGrok/X Premium+ device-code grant instead of an
-	// xAI pay-as-you-go API key. AuthStatePath is resolved relative to this
+	// AuthMode enables provider-managed rotating credentials. "kimi-code-oauth"
+	// uses the native Kimi Code subscription grant. AuthStatePath is relative to this
 	// config file and must remain private (0600).
 	AuthMode      string `json:"authMode"`
 	AuthStatePath string `json:"authStatePath"`
@@ -114,6 +114,7 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
+	SoftConcurrency      int            `json:"-"`
 	ModelID              string         `json:"-"`
 	AccountStickySeconds int            `json:"-"`
 	AccountPool          string         `json:"-"`
@@ -128,11 +129,20 @@ type modelConfig struct {
 	ContextWindow        int            `json:"contextWindow"`
 	Tier                 *int           `json:"tier,omitempty"`
 	SupportsImages       *bool          `json:"supportsImages,omitempty"`
-	Fallbacks            []modelConfig  `json:"fallbacks"`
-	Alias                string         `json:"alias"`
-	Chain                string         `json:"chain"`
-	Requested            string         `json:"-"`
-	ClaudeProfile        string         `json:"-"`
+	SupportsDocuments    *bool          `json:"supportsDocuments,omitempty"`
+	// UnsupportedContentTypes lists message content-block `type` values this
+	// route cannot serve (e.g. non-Anthropic providers reject `document`,
+	// `tool_reference`, server-side tool blocks). Requests containing one are
+	// routed around the candidate instead of failing on it.
+	UnsupportedContentTypes []string `json:"unsupportedContentTypes,omitempty"`
+	// TaskClass marks the work tier this route serves when the classifier
+	// stage is enabled ("fast"|"balanced"|"deep"); empty means unclassified.
+	TaskClass     string        `json:"taskClass,omitempty"`
+	Fallbacks     []modelConfig `json:"fallbacks"`
+	Alias         string        `json:"alias"`
+	Chain         string        `json:"chain"`
+	Requested     string        `json:"-"`
+	ClaudeProfile string        `json:"-"`
 }
 
 type upstreamResponse struct {
@@ -147,17 +157,24 @@ type upstreamResponse struct {
 }
 
 type requestTrace struct {
-	Execution      *attemptExecution
-	LastExecution  *attemptOutcome
-	Timing         *upstreamTiming
-	Ingress        time.Time
-	HeadersMS      int64
-	FirstEventMS   int64
-	ID             string
-	Path           string
-	CandidateCount int
-	ChainStarted   time.Time
-	ChainBudget    time.Duration
+	Attribution        usageAttribution
+	AccountSelectionMS *int64
+	Execution          *attemptExecution
+	LastExecution      *attemptOutcome
+	Timing             *upstreamTiming
+	Ingress            time.Time
+	HeadersMS          int64
+	FirstEventMS       int64
+	ID                 string
+	Path               string
+	Client             string
+	SessionID          string
+	TaskTier           string
+	TaskShadow         bool
+	TaskSample         string
+	CandidateCount     int
+	ChainStarted       time.Time
+	ChainBudget        time.Duration
 }
 
 type releaseReadCloser struct {
@@ -200,7 +217,7 @@ func readBoundedSSELine(reader *bufio.Reader, limit int) (string, error) {
 	}
 }
 
-type initialSSEError struct{ kind string }
+type initialSSEError struct{ kind, message string }
 
 func (e *initialSSEError) Error() string { return "initial SSE provider error: " + e.kind }
 
@@ -215,7 +232,8 @@ func validateInitialSSE(event, data string) error {
 	payload = unwrapOpenAIEnvelope(payload)
 	if errBody, ok := payload["error"].(map[string]any); ok {
 		kind, _ := errBody["type"].(string)
-		return &initialSSEError{kind: firstNonEmpty(kind, "api_error")}
+		message, _ := errBody["message"].(string)
+		return &initialSSEError{kind: firstNonEmpty(kind, "api_error"), message: message}
 	}
 	if event == "error" || payload["type"] == "error" || payload["error"] != nil {
 		return &initialSSEError{kind: "api_error"}
@@ -228,6 +246,23 @@ func validateInitialSSE(event, data string) error {
 // safely use the next route; later failures cannot be replayed without risking
 // duplicate output or tool calls.
 func primeSSEBody(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, error) {
+	return primeSSEBodyWithPrelude(body, timeout, 0)
+}
+
+// Positive preludeIdle buffers metadata-only frames until a semantic frame.
+// The initial event deadline remains short; subsequent thinking waits use the
+// provider's stream-idle allowance rather than introducing a new short cap.
+func primeSSEBodyWithPrelude(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent ...func()) (io.ReadCloser, error) {
+	var first func()
+	if len(firstEvent) > 0 {
+		first = firstEvent[0]
+	}
+	return primeSSEBodyObserved(body, timeout, preludeIdle, first, nil)
+}
+
+func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string)) (io.ReadCloser, error) {
+	observed := false
+	sawStopReason := false
 	reader := bufio.NewReader(body)
 	var prefix bytes.Buffer
 	hasData := false
@@ -266,8 +301,40 @@ func primeSSEBody(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, err
 				if timedOut.Load() {
 					return nil, fmt.Errorf("initial SSE event timed out after %s", timeout)
 				}
-				if err := validateInitialSSE(event, strings.Join(dataLines, "\n")); err != nil {
+				data := strings.Join(dataLines, "\n")
+				if onFrame != nil {
+					onFrame(primeFrameKind(data))
+				}
+				if err := validateInitialSSE(event, data); err != nil {
 					return nil, err
+				}
+				if !observed {
+					observed = true
+					if firstEvent != nil {
+						firstEvent()
+					}
+				}
+				metadata := false
+				if preludeIdle > 0 {
+					var preludeErr error
+					metadata, preludeErr = classifyPrelude(data, &sawStopReason)
+					if preludeErr != nil {
+						return nil, preludeErr
+					}
+				}
+				if metadata {
+					stopTimer()
+					if timedOut.Load() {
+						return nil, errors.New("initial SSE prelude timed out")
+					}
+					timerDone = make(chan struct{})
+					timer = time.AfterFunc(preludeIdle, func() {
+						timedOut.Store(true)
+						_ = body.Close()
+						close(timerDone)
+					})
+					hasData, event, dataLines = false, "", nil
+					continue
 				}
 				return &readerReadCloser{
 					Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader),
@@ -412,47 +479,6 @@ type clineUsageCache struct {
 	snapshot   clineUsageSnapshot
 	hasValue   bool
 	refreshing bool
-}
-
-type xaiUsageSnapshot struct {
-	FetchedAt   time.Time                   `json:"fetchedAt"`
-	Windows     map[string]clineUsageWindow `json:"windows"`
-	Products    map[string]float64          `json:"products,omitempty"`
-	BillingKind string                      `json:"billingKind"`
-	Source      string                      `json:"source"`
-}
-
-type xaiUsageCache struct {
-	mu         sync.Mutex
-	snapshot   xaiUsageSnapshot
-	hasValue   bool
-	refreshing bool
-}
-
-type xaiBillingAmount struct {
-	Val float64 `json:"val"`
-}
-
-type xaiBillingConfig struct {
-	CreditUsagePercent *float64 `json:"creditUsagePercent"`
-	CurrentPeriod      struct {
-		Start string `json:"start"`
-		End   string `json:"end"`
-		Type  string `json:"type"`
-	} `json:"currentPeriod"`
-	ProductUsage []struct {
-		Product      string  `json:"product"`
-		UsagePercent float64 `json:"usagePercent"`
-	} `json:"productUsage"`
-	IsUnifiedBillingUser bool             `json:"isUnifiedBillingUser"`
-	MonthlyLimit         xaiBillingAmount `json:"monthlyLimit"`
-	Used                 xaiBillingAmount `json:"used"`
-	BillingPeriodStart   string           `json:"billingPeriodStart"`
-	BillingPeriodEnd     string           `json:"billingPeriodEnd"`
-}
-
-type xaiBillingEnvelope struct {
-	Config xaiBillingConfig `json:"config"`
 }
 
 // browserUsageSnapshot is sanitized telemetry produced by the user-level Ego
@@ -600,12 +626,16 @@ type claudeCandidateAttempt struct {
 }
 
 type metricsSample struct {
+	usageAttribution
+	EventID            string            `json:"eventId,omitempty"`
+	Usage              *tokenUsage       `json:"usage,omitempty"`
 	StreamStalled      bool              `json:"streamStalled,omitempty"`
 	MissingStop        bool              `json:"missingStop,omitempty"`
 	ProtocolError      bool              `json:"protocolError,omitempty"`
 	LastEventAgeMS     int64             `json:"lastEventAgeMs,omitempty"`
 	Execution          *attemptExecution `json:"execution,omitempty"`
 	ReportedBackend    string            `json:"reportedBackend,omitempty"`
+	ReportedModel      string            `json:"reportedModel,omitempty"`
 	PreparationMS      int64             `json:"preparationMs,omitempty"`
 	TotalMS            int64             `json:"totalMs,omitempty"`
 	ResponseHeadersMS  int64             `json:"responseHeadersMs,omitempty"`
@@ -621,6 +651,8 @@ type metricsSample struct {
 	Timestamp          string            `json:"timestamp"`
 	RequestID          string            `json:"requestId,omitempty"`
 	Path               string            `json:"path,omitempty"`
+	Client             string            `json:"client,omitempty"`
+	CostUsdEstimate    float64           `json:"costUsdEstimate,omitempty"`
 	RecordKind         string            `json:"recordKind,omitempty"`
 	Attempt            int               `json:"attempt"`
 	CandidateCount     int               `json:"candidateCount,omitempty"`
@@ -666,9 +698,11 @@ type metricsStore struct {
 	maxSamples     int
 	samples        metricsRing
 	routeSamples   map[string]*metricsRing
+	rollup         *rollupStore
 	pending        []metricsSample
 	flushTimer     *time.Timer
 	persistedLines int
+	persistedBytes int64
 	closed         bool
 	file           *os.File
 }
@@ -746,14 +780,15 @@ type metricsAggregate struct {
 }
 
 type routePerformance struct {
-	Samples      int       `json:"samples"`
-	SuccessRate  float64   `json:"successRate"`
-	P50HeaderMS  float64   `json:"p50HeaderMs"`
-	P95HeaderMS  float64   `json:"p95HeaderMs"`
-	P50TPS       float64   `json:"p50TokensPerSecond"`
-	InputTokens  int64     `json:"inputTokens"`
-	OutputTokens int64     `json:"outputTokens"`
-	LastSeen     time.Time `json:"lastSeen"`
+	HeaderSamples int       `json:"headerSamples"`
+	Samples       int       `json:"samples"`
+	SuccessRate   float64   `json:"successRate"`
+	P50HeaderMS   float64   `json:"p50HeaderMs"`
+	P95HeaderMS   float64   `json:"p95HeaderMs"`
+	P50TPS        float64   `json:"p50TokensPerSecond"`
+	InputTokens   int64     `json:"inputTokens"`
+	OutputTokens  int64     `json:"outputTokens"`
+	LastSeen      time.Time `json:"lastSeen"`
 }
 
 type stickyRoute struct {
@@ -845,6 +880,11 @@ type proxyIngressContextKey struct{}
 type upstreamTimingContextKey struct{}
 
 type upstreamTiming struct {
+	headerBudgetMS      atomic.Int64
+	chainRemainingMS    atomic.Int64
+	chainLimited        atomic.Bool
+	requestWrittenMS    atomic.Int64
+	requestWritten      atomic.Bool
 	gotConnection       atomic.Bool
 	connectionReused    atomic.Bool
 	connectionIdleMS    atomic.Int64
@@ -1026,7 +1066,6 @@ type proxyServer struct {
 	metrics                  *metricsStore
 	ollamaUse                ollamaUsageCache
 	clineUse                 clineUsageCache
-	xaiUse                   xaiUsageCache
 	browserUse               browserUsageCache
 	browserUsagePath         string
 	claudeUse                claudeUsageCache
@@ -1034,12 +1073,17 @@ type proxyServer struct {
 	claudeIdentities         map[string]claudeIdentityCacheEntry
 	claudeAccountMu          sync.Mutex
 	claudeAccounts           map[string]claudeAccountSticky
+	claudePersistentPins     map[string]persistedAccountPin
 	claudeAccountInFlight    map[string]int
 	claudeSelectionLogMu     sync.Mutex
 	claudeSelectionLogged    map[string]string
 	routeLoadMu              sync.Mutex
 	routeInFlight            map[string]int
 	adaptive                 adaptiveState
+	classifier               classifierState
+	classifierHTTP           *http.Client
+	lastRoutesMu             sync.Mutex
+	lastRoutes               map[string]lastRouteInfo
 	providerStateMu          sync.Mutex
 	providerStates           map[string]providerRuntimeState
 	networkIncident          sharedNetworkIncidentState
@@ -1048,13 +1092,17 @@ type proxyServer struct {
 	claudeAuthRefreshGate    chan struct{}
 	claudeRefreshInFlight    map[string]bool
 	claudeRefreshLastAttempt map[string]time.Time
+	claudeRefreshFailures    map[string]int
+	claudeUsageAuthVerified  map[string]time.Time // protected by claudeRefreshMu
 	claudeRefreshRunner      func(context.Context, claudeUsageProfile) error
 	claudeScheduledRunner    func(context.Context) error
 	claudeRefreshStatus      string
 	claudeRefreshSummary     string
+	events                   *eventLog
+	usageHistory             *usageHistoryLog
 	claudePaidFallbackMu     sync.Mutex
 	claudePaidFallback       claudePaidFallbackState
-	xaiOAuth                 map[string]*xaiOAuthManager
+	kimiOAuth                map[string]*kimiOAuthManager
 }
 
 func main() {
@@ -1081,6 +1129,8 @@ func serve(cfg config) error {
 		return err
 	}
 	defer server.metrics.close()
+	defer server.events.close()
+	defer server.usageHistory.close()
 
 	handler := server.handler()
 
@@ -1112,7 +1162,6 @@ func serve(cfg config) error {
 	defer stop()
 	go server.monitorOllamaUsage(ctx)
 	go server.monitorClineUsage(ctx)
-	go server.monitorXAIUsage(ctx)
 	go server.monitorProfileCredentials(ctx)
 	go server.monitorConfiguredBrowserUsage(ctx)
 	go server.monitorClaudeUsage(ctx)
@@ -1159,7 +1208,9 @@ func (s *proxyServer) handler() http.Handler {
 	mux.HandleFunc("/metrics", s.metricsHandler)
 	mux.HandleFunc("/quota", s.quota)
 	mux.HandleFunc("/routing", s.routingStatus)
+	mux.HandleFunc("/last-route", s.lastRoute)
 	mux.HandleFunc("/catalog", s.catalog)
+	mux.HandleFunc("/v1/models", s.menuModels)
 	mux.HandleFunc("/dashboard", s.dashboard)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Definition != nil && (r.Method != http.MethodPost || (r.URL.Path != "/v1/messages" && r.URL.Path != "/v1/messages/count_tokens")) {
@@ -1168,7 +1219,7 @@ func (s *proxyServer) handler() http.Handler {
 		}
 		if s.draining.Load() {
 			_, requestID := ensureProxyRequestID(r)
-			s.recordRequestTerminal(requestID, r.URL.Path, modelConfig{}, http.StatusServiceUnavailable, "proxy_draining", time.Now())
+			s.recordRequestTerminal(requestID, r, modelConfig{}, http.StatusServiceUnavailable, "proxy_draining", time.Now())
 			w.Header().Set("Retry-After", "2")
 			writeAPIError(w, http.StatusServiceUnavailable, "api_error", "proxy draining; retry shortly")
 			return
@@ -1200,25 +1251,17 @@ func normalizeRuntimeConfig(path string, body []byte, cfg config) (config, error
 		if provider.AuthMode == "" {
 			continue
 		}
-		if provider.AuthMode != "xai-oauth" {
-			return config{}, fmt.Errorf("provider %q has unsupported authMode %q", name, provider.AuthMode)
+		if provider.AuthMode == "kimi-code-oauth" {
+			if provider.AuthTokenEnv != "" || len(provider.AuthTokenCommand) != 0 || provider.Format != "" || provider.Billing != "subscription" || provider.AuthHeader != "Authorization" || provider.AuthPrefix != "Bearer " {
+				return config{}, errors.New("Kimi OAuth requires isolated native subscription auth")
+			}
+			if err := validateKimiCredentialSlot(provider.AuthStatePath, provider.BaseURL); err != nil {
+				return config{}, err
+			}
+			cfg.Providers[name] = provider
+			continue
 		}
-		if provider.AuthTokenEnv != "" || len(provider.AuthTokenCommand) > 0 {
-			return config{}, fmt.Errorf("provider %q xai-oauth cannot also configure a static auth token", name)
-		}
-		if provider.Format != "openai-chat" {
-			return config{}, fmt.Errorf("provider %q xai-oauth requires format openai-chat", name)
-		}
-		if err := validateXAISubscriptionOrigin(provider.BaseURL, "inference baseURL"); err != nil {
-			return config{}, fmt.Errorf("provider %q: %w", name, err)
-		}
-		if strings.TrimSpace(provider.AuthStatePath) == "" {
-			provider.AuthStatePath = filepath.Join(filepath.Dir(path), "xai-oauth.json")
-		} else if !filepath.IsAbs(provider.AuthStatePath) {
-			provider.AuthStatePath = filepath.Join(filepath.Dir(path), provider.AuthStatePath)
-		}
-		provider.AuthStatePath = filepath.Clean(provider.AuthStatePath)
-		cfg.Providers[name] = provider
+		return config{}, fmt.Errorf("provider %q has unsupported authMode %q", name, provider.AuthMode)
 	}
 	if cfg.Normalize.UnsupportedContentTypes == nil {
 		cfg.Normalize.UnsupportedContentTypes = map[string]string{}
@@ -1429,10 +1472,10 @@ func normalizeRuntimeConfig(path string, body []byte, cfg config) (config, error
 			cfg.Quarantine.WindowSeconds = 300
 		}
 		if cfg.Quarantine.BaseSeconds <= 0 {
-			cfg.Quarantine.BaseSeconds = 300
+			cfg.Quarantine.BaseSeconds = 30
 		}
 		if cfg.Quarantine.MaxSeconds <= 0 {
-			cfg.Quarantine.MaxSeconds = 1800
+			cfg.Quarantine.MaxSeconds = 120
 		}
 		if cfg.Quarantine.MaxSeconds < cfg.Quarantine.BaseSeconds {
 			return config{}, errors.New("providerQuarantine.maxSeconds must be at least baseSeconds")
@@ -1444,7 +1487,7 @@ func normalizeRuntimeConfig(path string, body []byte, cfg config) (config, error
 			cfg.Quarantine.ExcessiveTTFBMS = 45000
 		}
 		if cfg.Quarantine.StreamEventStallMS <= 0 {
-			cfg.Quarantine.StreamEventStallMS = 120000
+			cfg.Quarantine.StreamEventStallMS = 300000
 		}
 		if cfg.Quarantine.NetworkIncidentOrigins <= 0 {
 			cfg.Quarantine.NetworkIncidentOrigins = 2
@@ -1699,8 +1742,8 @@ const defaultResponseHeaderTimeout = 120 * time.Second
 func newProxyServer(cfg config) (*proxyServer, error) {
 	providers := make(map[string]*url.URL, len(cfg.Providers))
 	clients := make(map[string]*http.Client, len(cfg.Providers))
-	xaiOAuth := map[string]*xaiOAuthManager{}
-	xaiOAuthByPath := map[string]*xaiOAuthManager{}
+	kimiOAuth := map[string]*kimiOAuthManager{}
+	kimiOAuthByPath := map[string]*kimiOAuthManager{}
 	// Providers pointing at the same origin with the same header timeout share
 	// one transport, so fallback legs that differ only in requestOverrides
 	// (the vercel-* family) reuse warm connections instead of keeping six
@@ -1715,6 +1758,21 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 			return nil, fmt.Errorf("provider %q baseURL: %w", name, err)
 		}
 		providers[name] = parsed
+		if provider.AuthMode == "kimi-code-oauth" {
+			issuer, e := kimiOAuthIssuer(provider.BaseURL)
+			if e != nil {
+				return nil, e
+			}
+			if e = validateKimiCredentialSlot(provider.AuthStatePath, provider.BaseURL); e != nil {
+				return nil, e
+			}
+			manager := kimiOAuthByPath[provider.AuthStatePath]
+			if manager == nil {
+				manager = newKimiOAuthManager(provider.AuthStatePath, issuer, nil)
+				kimiOAuthByPath[provider.AuthStatePath] = manager
+			}
+			kimiOAuth[name] = manager
+		}
 
 		headerTimeout := defaultResponseHeaderTimeout
 		switch {
@@ -1748,14 +1806,6 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 			transports[transportKey] = transport
 		}
 		clients[name] = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		if provider.AuthMode == "xai-oauth" {
-			manager := xaiOAuthByPath[provider.AuthStatePath]
-			if manager == nil {
-				manager = newXAIOAuthManager(provider.AuthStatePath, &http.Client{Timeout: 30 * time.Second})
-				xaiOAuthByPath[provider.AuthStatePath] = manager
-			}
-			xaiOAuth[name] = manager
-		}
 	}
 
 	refreshDir := filepath.Dir(cfg.Metrics.Path)
@@ -1800,12 +1850,18 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 		networkIncident:       sharedNetworkIncidentState{Signals: map[string]time.Time{}},
 		claudeRefreshInFlight: map[string]bool{},
 		claudeRefreshStatus:   filepath.Join(refreshDir, "claude-oauth-refresh-status.json"),
-		xaiOAuth:              xaiOAuth,
+		events:                newEventLog(filepath.Join(refreshDir, "events.jsonl")),
+		usageHistory:          newUsageHistoryLog(filepath.Join(refreshDir, "usage-history.jsonl")),
+		kimiOAuth:             kimiOAuth,
+	}
+	if server.metrics != nil {
+		server.metrics.rollup = newRollupStore(filepath.Join(refreshDir, "rollups"))
 	}
 	server.claudeRefreshRunner = func(ctx context.Context, profile claudeUsageProfile) error {
 		return server.refreshProfileCredentials(ctx, profile)
 	}
 	server.loadClaudeUsageCache()
+	server.loadClaudeAccountPins()
 	return server, nil
 }
 
@@ -1856,9 +1912,16 @@ func decodeMetricLines(raw []byte) []metricsSample {
 	}
 	lines := bytes.Split(raw, []byte{'\n'})
 	samples := make([]metricsSample, 0, len(lines))
+	seen := map[string]bool{}
 	for _, line := range lines {
 		var sample metricsSample
 		if json.Unmarshal(line, &sample) == nil {
+			if sample.EventID != "" {
+				if seen[sample.EventID] {
+					continue
+				}
+				seen[sample.EventID] = true
+			}
 			samples = append(samples, sample)
 		}
 	}
@@ -1893,7 +1956,13 @@ func (m *metricsStore) record(sample metricsSample) {
 	if m.closed {
 		return
 	}
+	if sample.EventID == "" {
+		sample.EventID = fmt.Sprintf("event-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), proxyRequestSequence.Add(1))
+	}
 	m.addMemoryLocked(sample)
+	if m.rollup != nil {
+		m.rollup.observe(sample)
+	}
 	m.pending = append(m.pending, sample)
 	if m.flushTimer == nil {
 		m.flushTimer = time.AfterFunc(metricsFlushDelay, m.flush)
@@ -1911,6 +1980,12 @@ func (m *metricsStore) openFileLocked() error {
 	if err != nil {
 		return err
 	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	m.persistedBytes = info.Size()
 	m.file = file
 	return nil
 }
@@ -1918,11 +1993,8 @@ func (m *metricsStore) openFileLocked() error {
 func (m *metricsStore) requeue(batch []metricsSample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed {
-		return
-	}
 	m.pending = append(batch, m.pending...)
-	if m.flushTimer == nil {
+	if !m.closed && m.flushTimer == nil {
 		m.flushTimer = time.AfterFunc(time.Second, m.flush)
 	}
 }
@@ -1932,13 +2004,12 @@ func (m *metricsStore) rotateLocked() {
 		_ = m.file.Close()
 		m.file = nil
 	}
-	archive := m.path + ".1"
-	_ = os.Remove(archive)
-	if err := os.Rename(m.path, archive); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := rotateMetricsArchives(m.path, time.Now()); err != nil {
 		log.Printf("metrics rotation failed path=%q error=%v", m.path, err)
 		return
 	}
 	m.persistedLines = 0
+	m.persistedBytes = 0
 }
 
 func (m *metricsStore) flush() {
@@ -1976,15 +2047,32 @@ func (m *metricsStore) flush() {
 		m.requeue(batch)
 		return
 	}
-	if _, err := m.file.Write(buffer.Bytes()); err != nil {
+	before, err := m.file.Stat()
+	if err != nil {
+		m.requeue(batch)
+		log.Printf("metrics stat failed: %v", err)
+		return
+	}
+	n, err := m.file.Write(buffer.Bytes())
+	if err == nil && n != buffer.Len() {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		err = m.file.Sync()
+	}
+	if err != nil {
 		log.Printf("metrics write failed path=%q error=%v", m.path, err)
+		if rollbackErr := m.file.Truncate(before.Size()); rollbackErr != nil {
+			log.Printf("metrics rollback failed; identified duplicates may remain: %v", rollbackErr)
+		}
 		_ = m.file.Close()
 		m.file = nil
 		m.requeue(batch)
 		return
 	}
 	m.persistedLines += written
-	if m.persistedLines >= m.maxSamples {
+	m.persistedBytes += int64(buffer.Len())
+	if m.persistedLines >= m.maxSamples || m.persistedBytes >= metricsSegmentBytes {
 		m.rotateLocked()
 	}
 }
@@ -2007,6 +2095,9 @@ func (m *metricsStore) close() {
 		m.file = nil
 	}
 	m.ioMu.Unlock()
+	if m.rollup != nil {
+		m.rollup.close()
+	}
 }
 
 func (m *metricsStore) read(limit int) []metricsSample {
@@ -2179,6 +2270,7 @@ func (s *proxyServer) recordAttempt(trace requestTrace, selected, candidate mode
 		Timestamp:       time.Now().UTC().Format(time.RFC3339Nano),
 		RequestID:       trace.ID,
 		Path:            trace.Path,
+		Client:          trace.Client,
 		RecordKind:      recordKind,
 		Attempt:         attempt,
 		CandidateCount:  trace.CandidateCount,
@@ -2256,6 +2348,7 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
 		RequestID:      trace.ID,
 		Path:           trace.Path,
+		Client:         trace.Client,
 		RecordKind:     recordKind,
 		Attempt:        attempt,
 		CandidateCount: trace.CandidateCount,
@@ -2276,6 +2369,7 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 	}
 	if stats != nil {
 		sample.ReportedBackend, _ = stats.ReportedBackend.Load().(string)
+		sample.ReportedModel, _ = stats.ReportedModel.Load().(string)
 		sample.StreamStalled = stats.StreamStalled.Load()
 		sample.MissingStop = stats.MissingStop.Load()
 		sample.ProtocolError = stats.ProtocolError.Load()
@@ -2296,7 +2390,21 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		if at := stats.FirstContentNS.Load(); at > 0 {
 			sample.FirstContentMS = time.Unix(0, at).Sub(started).Milliseconds()
 		}
+		applyTokenUsage(&sample, stats)
 		sample.TokensPerSecond = observedTokensPerSecond(sample.OutputTokens, streamDuration)
+	}
+	if pricing := s.cfg.Providers[sample.Provider].Pricing; pricing != (pricingDefinition{}) {
+		sample.CostUsdEstimate = float64(sample.InputTokens+sample.InputTokenEstimate)*pricing.InputPerMillionTokens/1e6 +
+			float64(sample.OutputTokens)*pricing.OutputPerMillionTokens/1e6 +
+			float64(sample.CacheReadTokens)*pricing.CacheReadPerMillionTokens/1e6
+	}
+	if trace.SessionID != "" {
+		s.noteLastRoute(lastRouteInfo{
+			SessionID: trace.SessionID, Requested: candidate.Requested, Provider: sample.Provider,
+			Upstream: candidate.Upstream, Status: status, Success: sample.Success, Reason: failureReason,
+			LatencyMS: headerLatency.Milliseconds(), TokensPS: sample.TokensPerSecond,
+			TaskTier: trace.TaskTier, TaskShadow: trace.TaskShadow, TaskSample: trace.TaskSample, At: time.Now().UTC(),
+		})
 	}
 	if !trace.Ingress.IsZero() {
 		sample.PreparationMS = trace.ChainStarted.Sub(trace.Ingress).Milliseconds()
@@ -2308,29 +2416,48 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 	s.metrics.record(sample)
 }
 
-func (s *proxyServer) recordRequestTerminal(requestID, path string, selected modelConfig, status int, reason string, started time.Time) {
-	s.recordRequestTerminalOutcome(requestID, path, selected, status, reason, started, false)
+func (s *proxyServer) recordRequestTerminal(requestID string, r *http.Request, selected modelConfig, status int, reason string, started time.Time) {
+	s.recordRequestTerminalOutcome(requestID, r, selected, status, reason, started, false)
 }
 
-func (s *proxyServer) recordRequestTerminalOutcome(requestID, path string, selected modelConfig, status int, reason string, started time.Time, success bool) {
+func (s *proxyServer) recordRequestTerminalOutcome(requestID string, r *http.Request, selected modelConfig, status int, reason string, started time.Time, success bool) {
 	if s.metrics == nil {
 		return
 	}
 	providerName := firstNonEmpty(selected.Provider, s.cfg.DefaultProvider)
+	path, client := "", ""
+	if r != nil {
+		path = r.URL.Path
+		client = requestClientLabel(r.UserAgent(), requestListenerPort(r))
+	}
 	s.metrics.record(metricsSample{
-		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
-		RequestID:      requestID,
-		Path:           path,
-		RecordKind:     "terminal",
-		RequestedModel: selected.Requested,
-		Provider:       providerName,
-		Upstream:       selected.Upstream,
-		ResponseAlias:  firstNonEmpty(selected.ResponseAlias, selected.Requested),
-		Status:         status,
-		LatencyMS:      time.Since(started).Milliseconds(),
-		Success:        success,
-		FailureReason:  reason,
+		usageAttribution: requestUsageAttribution(r),
+		Timestamp:        time.Now().UTC().Format(time.RFC3339Nano),
+		RequestID:        requestID,
+		Path:             path,
+		Client:           client,
+		RecordKind:       "terminal",
+		RequestedModel:   selected.Requested,
+		Provider:         providerName,
+		Upstream:         selected.Upstream,
+		ResponseAlias:    firstNonEmpty(selected.ResponseAlias, selected.Requested),
+		Status:           status,
+		LatencyMS:        time.Since(started).Milliseconds(),
+		Success:          success,
+		FailureReason:    reason,
 	})
+	if r != nil {
+		if session := sessionIDFromContext(r.Context()); session != "" {
+			s.noteLastRoute(lastRouteInfo{
+				SessionID: session, Requested: selected.Requested, Provider: providerName,
+				Upstream: selected.Upstream, Status: status, Success: success, Reason: reason,
+				LatencyMS: time.Since(started).Milliseconds(), At: time.Now().UTC(),
+			})
+		}
+	}
+	if reason == "fallback_exhausted" {
+		s.recordEvent("fallback_exhausted", providerName, reason, "model="+selected.Requested)
+	}
 }
 
 func routeKey(providerName string, candidate modelConfig) string {
@@ -2363,8 +2490,10 @@ func buildRoutePerformance(samples []metricsSample) map[string]routePerformance 
 		if sample.Success {
 			acc.successes++
 		}
-		if sample.LatencyMS > 0 {
-			acc.latencies = append(acc.latencies, float64(sample.LatencyMS))
+		// Completion latency includes generation; never learn header budgets
+		// from it. Timed-out header waits are censored lower bounds.
+		if headerMS := observedHeaderMS(sample); headerMS > 0 {
+			acc.latencies = append(acc.latencies, float64(headerMS))
 		}
 		if sample.TokensPerSecond > 0 {
 			acc.tps = append(acc.tps, sample.TokensPerSecond)
@@ -2378,10 +2507,11 @@ func buildRoutePerformance(samples []metricsSample) map[string]routePerformance 
 	performance := make(map[string]routePerformance, len(accumulators))
 	for key, acc := range accumulators {
 		perf := routePerformance{
-			Samples:      acc.attempts,
-			InputTokens:  acc.inputTokens,
-			OutputTokens: acc.outputTokens,
-			LastSeen:     acc.lastSeen,
+			HeaderSamples: len(acc.latencies),
+			Samples:       acc.attempts,
+			InputTokens:   acc.inputTokens,
+			OutputTokens:  acc.outputTokens,
+			LastSeen:      acc.lastSeen,
 		}
 		if acc.attempts > 0 {
 			perf.SuccessRate = float64(acc.successes) / float64(acc.attempts)
@@ -2417,7 +2547,7 @@ func excludeFromRoutePerformance(sample metricsSample) bool {
 	}
 	switch sample.FailureReason {
 	case "circuit_open", "provider_limited", "client_cancel", "client_cancel_after_stall", "quota_or_rate_limit", "ollama_reserved_for_deepseek",
-		"thinking_signature_mismatch", "thinking_history_incompatible", "client_invalid", "route_incompatible", "local_network", "chain_deadline":
+		"rate_limited", "thinking_signature_mismatch", "thinking_history_incompatible", "client_invalid", "route_incompatible", "local_network", "chain_deadline":
 		return true
 	}
 	if sample.Status == http.StatusUnauthorized || sample.Status == http.StatusForbidden {
@@ -2541,9 +2671,6 @@ const (
 func canonicalBrowserUsageProvider(providerName string) string {
 	if strings.HasPrefix(providerName, "opencode-go") {
 		return "opencode-go"
-	}
-	if providerName == "commandcode" {
-		return providerName
 	}
 	return ""
 }
@@ -2712,18 +2839,6 @@ func (s *proxyServer) providerUsageUtilization(providerName string) (float64, bo
 		}
 		s.clineUse.mu.Unlock()
 	}
-	if providerName == s.xaiUsageProviderName() {
-		s.xaiUse.mu.Lock()
-		if s.xaiUse.hasValue && time.Since(s.xaiUse.snapshot.FetchedAt) <= 15*time.Minute {
-			utilization := 0.0
-			for _, window := range s.xaiUse.snapshot.Windows {
-				utilization = math.Max(utilization, window.PercentUsed/100)
-			}
-			s.xaiUse.mu.Unlock()
-			return math.Min(utilization, 1), true
-		}
-		s.xaiUse.mu.Unlock()
-	}
 	if provider, _, fresh := s.browserUsageForProvider(providerName); fresh && provider.Utilization != nil {
 		return math.Min(math.Max(*provider.Utilization, 0), 1), true
 	}
@@ -2793,8 +2908,6 @@ func (s *proxyServer) candidateRoutePhase(selected, candidate modelConfig, provi
 		switch {
 		case candidateFamily == requestedFamily && !paid:
 			return 0
-		case providerName == "xai-oauth":
-			return 10
 		case candidateFamily == requestedFamily:
 			return 20
 		default:
@@ -2811,8 +2924,6 @@ func (s *proxyServer) candidateRoutePhase(selected, candidate modelConfig, provi
 		switch {
 		case candidateFamily == "kimi" && !paid:
 			return 10
-		case providerName == "xai-oauth":
-			return 20
 		case candidateFamily == "kimi":
 			return 30
 		default:
@@ -2822,8 +2933,6 @@ func (s *proxyServer) candidateRoutePhase(selected, candidate modelConfig, provi
 		switch {
 		case candidateFamily == "glm" && !paid:
 			return 10
-		case providerName == "xai-oauth":
-			return 20
 		case candidateFamily == "glm":
 			return 30
 		default:
@@ -2835,8 +2944,6 @@ func (s *proxyServer) candidateRoutePhase(selected, candidate modelConfig, provi
 			return 10
 		case candidateFamily == "deepseek" && !paid:
 			return 20
-		case providerName == "xai-oauth":
-			return 30
 		case candidateFamily == "glm":
 			return 40
 		default:
@@ -2871,6 +2978,9 @@ func (s *proxyServer) explicitAnthropicPrimary(selected modelConfig) bool {
 // routingStickyKey fingerprints only stable conversation seed data. No prompt
 // text leaves process memory or appears in logs/metrics.
 func routingStickyKey(selected modelConfig, payload map[string]any) string {
+	if key := stableClaudeConversationKey(selected, payload); key != "" {
+		return key
+	}
 	if selected.Requested == "" || payload == nil {
 		return selected.Requested
 	}
@@ -2985,16 +3095,19 @@ func stripHistoricalThinking(payload map[string]any) {
 }
 
 func (s *proxyServer) rankCandidates(selected modelConfig, candidates []modelConfig) []modelConfig {
-	return s.rankCandidatesForRequest(selected, candidates, selected.Requested, true, thinkingHistoryNone)
+	return s.rankCandidatesForRequest(selected, candidates, selected.Requested, true, thinkingHistoryNone, taskRouteHint{})
 }
 
 // rankCandidatesForRequest keeps one conversation on one model family. A GLM
 // thread therefore fails over to another GLM route (including Vercel) before
 // trying DeepSeek or Claude. Exploration is limited to history-free requests;
 // switching a signed tool conversation mid-turn invalidates thinking blocks.
-func (s *proxyServer) rankCandidatesForRequest(selected modelConfig, candidates []modelConfig, stickyKey string, allowExplore bool, history thinkingHistoryKind) []modelConfig {
+func (s *proxyServer) rankCandidatesForRequest(selected modelConfig, candidates []modelConfig, stickyKey string, allowExplore bool, history thinkingHistoryKind, hint taskRouteHint) []modelConfig {
 	if s.cfg.Definition != nil {
-		return s.rankConfiguredCandidates(candidates, stickyKey)
+		if s.preserveSonnetSubscriptionOrder(selected) {
+			hint = taskRouteHint{}
+		}
+		return s.rankConfiguredCandidates(candidates, stickyKey, hint)
 	}
 	if !s.cfg.AdaptiveRouting.Enabled || len(candidates) < 2 {
 		return candidates
@@ -3234,6 +3347,13 @@ func (s *proxyServer) quotaBlockKeyForResponse(runtimeProviderName string, candi
 	return modelKey
 }
 
+func (s *proxyServer) providerFailureBlockKey(providerName, runtimeProviderName string, candidate modelConfig, header http.Header, reason string) string {
+	if reason == temporaryRateLimitReason && !unifiedQuotaRejected(header) {
+		return routeHealthKey(runtimeProviderName, candidate)
+	}
+	return s.quotaBlockKeyForResponse(runtimeProviderName, candidate, header)
+}
+
 func (s *proxyServer) excessiveTTFB(elapsed time.Duration) bool {
 	return s.cfg.Quarantine.Enabled && elapsed >= time.Duration(s.cfg.Quarantine.ExcessiveTTFBMS)*time.Millisecond
 }
@@ -3273,8 +3393,6 @@ func (s *proxyServer) candidateResponseHeaderBudget(providerName string, candida
 	case variant == "bigmodel" && strings.Contains(upstream, "glm-5.3") && !strings.Contains(upstream, "flash"):
 		base = minDuration(base, 25*time.Second)
 		floor = 10 * time.Second
-	case variant == "xai-oauth" || variant == "xai-subscription":
-		base = minDuration(base, 15*time.Second)
 	case variant == "vercel-kimi" || variant == "vercel-gateway" && strings.Contains(upstream, "kimi"):
 		base = minDuration(base, 20*time.Second)
 	case variant == "opencode-go" && strings.Contains(upstream, "glm"):
@@ -3286,9 +3404,11 @@ func (s *proxyServer) candidateResponseHeaderBudget(providerName string, candida
 	}
 	if performance := s.adaptivePerformance(); performance != nil {
 		perf := performance[routeKey(providerName, candidate)]
-		if perf.Samples >= s.cfg.AdaptiveRouting.MinSamples && perf.P95HeaderMS > 0 {
+		if perf.HeaderSamples >= max(20, s.cfg.AdaptiveRouting.MinSamples) && perf.P95HeaderMS > 0 {
 			learned := time.Duration(perf.P95HeaderMS*2)*time.Millisecond + 2*time.Second
-			base = minDuration(base, maxDuration(floor, learned))
+			// Fast survivors must not shrink the model baseline. Slow/header
+			// timeout observations may expand it, within the provider ceiling.
+			base = maxDuration(base, maxDuration(floor, learned))
 		}
 	}
 	estimatedInput := estimateInputTokens(body)
@@ -3305,7 +3425,7 @@ func (s *proxyServer) candidateResponseHeaderBudget(providerName string, candida
 
 const (
 	defaultFallbackChainHeaderBudget = 60 * time.Second
-	fallbackRouteReserve             = 10 * time.Second
+	fallbackRouteReserve             = 25 * time.Second
 )
 
 func fallbackChainHeaderBudget(body []byte) time.Duration {
@@ -3322,17 +3442,30 @@ func fallbackChainHeaderBudget(body []byte) time.Duration {
 }
 
 func (s *proxyServer) hasLaterUnmeteredProvider(attempts []claudeCandidateAttempt, index int, providerName string) bool {
+	return s.laterUnmeteredProviders(attempts, index, providerName) > 0
+}
+
+func (s *proxyServer) laterUnmeteredProviders(attempts []claudeCandidateAttempt, index int, providerName string) int {
+	seen := map[string]bool{providerName: true}
+	count := 0
 	for next := index + 1; next < len(attempts); next++ {
 		candidate := attempts[next].model
 		nextProvider := firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider)
-		if nextProvider == providerName {
+		if seen[nextProvider] {
 			continue
 		}
-		if s.candidateTier(candidate, nextProvider) < 95 {
-			return true
+		billing := s.cfg.Providers[nextProvider].Billing
+		unmetered := billing == "subscription" || billing == "local"
+		if s.cfg.Definition == nil && billing == "" {
+			unmetered = s.candidateTier(candidate, nextProvider) < 95
+		}
+		// Opted-in chains must also leave header time for paid backups.
+		if unmetered || (candidate.AllowPaidFallback && containsString(candidate.PaidFallbackOn, "response-header-timeout")) {
+			seen[nextProvider] = true
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 func (s *proxyServer) remainingAttemptHeaderBudget(trace requestTrace, attempts []claudeCandidateAttempt, index int, providerName string) (time.Duration, bool) {
@@ -3340,13 +3473,13 @@ func (s *proxyServer) remainingAttemptHeaderBudget(trace requestTrace, attempts 
 	if !trace.ChainStarted.IsZero() {
 		remaining = trace.ChainStarted.Add(trace.ChainBudget).Sub(time.Now())
 	}
-	reserve := time.Duration(0)
-	if s.hasLaterUnmeteredProvider(attempts, index, providerName) {
-		reserve = fallbackRouteReserve
+	if remaining <= 0 {
+		return 0, false
 	}
-	if remaining <= reserve {
-		return 0, reserve > 0
-	}
+	later := time.Duration(s.laterUnmeteredProviders(attempts, index, providerName))
+	// Preserve a useful backup window without starving the current route when
+	// the total budget is small: then divide the remainder evenly.
+	reserve := minDuration(later*fallbackRouteReserve, remaining/(later+1)*later)
 	return remaining - reserve, false
 }
 
@@ -3409,13 +3542,13 @@ func strongLocalNetworkError(err error) bool {
 	if errors.As(err, &dnsErr) && (dnsErr.IsTimeout || dnsErr.IsTemporary || dnsErr.Err == "no such host") {
 		return true
 	}
-	for _, target := range []error{syscall.ENETDOWN, syscall.ENETUNREACH, syscall.EHOSTUNREACH} {
+	for _, target := range []error{syscall.ENETDOWN, syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.EADDRNOTAVAIL} {
 		if errors.Is(err, target) {
 			return true
 		}
 	}
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "no route to host") || strings.Contains(text, "network is unreachable") ||
+	return strings.Contains(text, "can't assign requested address") || strings.Contains(text, "cannot assign requested address") || strings.Contains(text, "no route to host") || strings.Contains(text, "network is unreachable") ||
 		strings.Contains(text, "network is down") || strings.Contains(text, "temporary failure in name resolution") ||
 		strings.Contains(text, "server misbehaving") && strings.Contains(text, "lookup")
 }
@@ -3682,6 +3815,7 @@ func (s *proxyServer) observeProviderInstability(providerName, signal string) bo
 		state.SignalWindowStart = now
 		state.Recovering = false
 		log.Printf("provider quarantined provider=%s signal=%s level=%d cooldown=%s", providerName, signal, state.QuarantineLevel, duration)
+		s.recordEvent("provider_quarantined", providerName, signal, fmt.Sprintf("level=%d until=%s", state.QuarantineLevel, until.UTC().Format(time.RFC3339)))
 	}
 	s.providerStates[providerName] = state
 	return quarantined
@@ -3714,6 +3848,9 @@ func (s *proxyServer) observeProviderHealthyAfter(providerName string, started t
 	state.RecoverySuccesses++
 	state.LastUpdated = now
 	if state.RecoverySuccesses >= s.cfg.Quarantine.RecoverySuccesses {
+		if !state.QuarantinedUntil.IsZero() || state.QuarantineLevel > 0 {
+			s.recordEvent("provider_recovered", providerName, state.QuarantineReason, "")
+		}
 		state.QuarantinedUntil = time.Time{}
 		state.QuarantineReason = ""
 		state.InstabilitySignals = 0
@@ -3735,6 +3872,9 @@ func (s *proxyServer) markProviderBlocked(providerName, reason string, duration 
 	}
 	s.providerStateMu.Lock()
 	defer s.providerStateMu.Unlock()
+	if s.providerStates == nil {
+		s.providerStates = map[string]providerRuntimeState{}
+	}
 	state := s.providerStates[providerName]
 	changed := state.BlockedUntil.IsZero() || state.Reason != reason || time.Now().After(state.BlockedUntil)
 	until := time.Now().Add(duration)
@@ -3745,6 +3885,9 @@ func (s *proxyServer) markProviderBlocked(providerName, reason string, duration 
 	state.LastUpdated = time.Now()
 	state.LastFailure = state.LastUpdated
 	s.providerStates[providerName] = state
+	if changed {
+		s.recordEvent("provider_blocked", providerName, reason, formatEventDetail(state.BlockedUntil))
+	}
 	return changed
 }
 
@@ -3760,8 +3903,11 @@ func (s *proxyServer) clearProviderBlockAfter(providerName string, started time.
 		strings.Contains(state.Reason, "quota") || state.Reason == "quota_or_rate_limit") {
 		return
 	}
-	if strings.HasPrefix(state.Reason, "ollama_usage_") || strings.HasPrefix(state.Reason, "cline_usage_") || strings.HasPrefix(state.Reason, "xai_usage_") {
+	if strings.HasPrefix(state.Reason, "ollama_usage_") || strings.HasPrefix(state.Reason, "cline_usage_") {
 		return
+	}
+	if state.Reason != "" {
+		s.recordEvent("provider_unblocked", providerName, state.Reason, "")
 	}
 	state.BlockedUntil = time.Time{}
 	state.Reason = ""
@@ -3805,19 +3951,6 @@ func (s *proxyServer) clearClineUsageBlock(providerName string) {
 	defer s.providerStateMu.Unlock()
 	state := s.providerStates[providerName]
 	if !strings.HasPrefix(state.Reason, "cline_usage_") {
-		return
-	}
-	state.BlockedUntil = time.Time{}
-	state.Reason = ""
-	state.LastUpdated = time.Now()
-	s.providerStates[providerName] = state
-}
-
-func (s *proxyServer) clearXAIUsageBlock(providerName string) {
-	s.providerStateMu.Lock()
-	defer s.providerStateMu.Unlock()
-	state := s.providerStates[providerName]
-	if !strings.HasPrefix(state.Reason, "xai_usage_") {
 		return
 	}
 	state.BlockedUntil = time.Time{}
@@ -3908,17 +4041,6 @@ func (s *proxyServer) routingStatus(w http.ResponseWriter, r *http.Request) {
 				entry["fetchedAt"] = s.clineUse.snapshot.FetchedAt.UTC().Format(time.RFC3339)
 			}
 			s.clineUse.mu.Unlock()
-		}
-		if providerName == s.xaiUsageProviderName() {
-			s.xaiUse.mu.Lock()
-			if s.xaiUse.hasValue {
-				entry["windows"] = s.xaiUse.snapshot.Windows
-				entry["products"] = s.xaiUse.snapshot.Products
-				entry["billingKind"] = s.xaiUse.snapshot.BillingKind
-				entry["source"] = s.xaiUse.snapshot.Source
-				entry["fetchedAt"] = s.xaiUse.snapshot.FetchedAt.UTC().Format(time.RFC3339)
-			}
-			s.xaiUse.mu.Unlock()
 		}
 		providerUsage[providerName] = entry
 	}
@@ -4091,6 +4213,10 @@ func (s *proxyServer) ollamaUsageSnapshot(ctx context.Context) (ollamaUsageSnaps
 		s.ollamaUse.hasValue = true
 	}
 	s.ollamaUse.mu.Unlock()
+	if err == nil {
+		s.usageHistory.note(policy.Provider, "session", snapshot.Session.Usage*100, time.Time{})
+		s.usageHistory.note(policy.Provider, "weekly", snapshot.Weekly.Usage*100, time.Time{})
+	}
 	return snapshot, err
 }
 
@@ -4146,6 +4272,8 @@ func (s *proxyServer) refreshOllamaUsageInBackground() {
 		log.Printf("ollama usage background refresh failed: %v", err)
 		return
 	}
+	s.usageHistory.note(s.cfg.OllamaUsage.Provider, "session", snapshot.Session.Usage*100, time.Time{})
+	s.usageHistory.note(s.cfg.OllamaUsage.Provider, "weekly", snapshot.Weekly.Usage*100, time.Time{})
 	s.updateOllamaUsageState(snapshot)
 }
 
@@ -4247,6 +4375,9 @@ func (s *proxyServer) refreshClineUsageInBackground() {
 		log.Printf("ClinePass usage background refresh failed: %v", err)
 		return
 	}
+	for _, window := range snapshot.Windows {
+		s.usageHistory.note("clinepass", window.Type, window.PercentUsed, window.ResetsAt)
+	}
 	s.updateClineUsageState(snapshot)
 }
 
@@ -4272,254 +4403,6 @@ func (s *proxyServer) monitorClineUsage(ctx context.Context) {
 				go s.refreshClineUsageInBackground()
 			}
 			s.clineUse.mu.Unlock()
-		}
-	}
-}
-
-const xaiUsageRefreshInterval = 5 * time.Minute
-
-func (s *proxyServer) xaiUsageProviderName() string {
-	for name, provider := range s.cfg.Providers {
-		if s.cfg.Definition != nil && provider.Usage.Mode != "api" {
-			continue
-		}
-		if provider.AuthMode == "xai-oauth" {
-			return name
-		}
-	}
-	return ""
-}
-
-func parseXAIPeriod(startRaw, endRaw string) (time.Time, time.Time, error) {
-	start, err := time.Parse(time.RFC3339, startRaw)
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid xAI billing period start: %w", err)
-	}
-	end, err := time.Parse(time.RFC3339, endRaw)
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid xAI billing period end: %w", err)
-	}
-	if !end.After(start) {
-		return time.Time{}, time.Time{}, errors.New("xAI billing period end is not after start")
-	}
-	return start, end, nil
-}
-
-func parseXAIWeeklyUsage(raw xaiBillingConfig, now time.Time) (xaiUsageSnapshot, bool, error) {
-	if !strings.Contains(strings.ToUpper(raw.CurrentPeriod.Type), "WEEK") {
-		return xaiUsageSnapshot{}, false, errors.New("xAI credits response is not weekly")
-	}
-	_, end, err := parseXAIPeriod(raw.CurrentPeriod.Start, raw.CurrentPeriod.End)
-	if err != nil {
-		return xaiUsageSnapshot{}, false, err
-	}
-	inferred := raw.CreditUsagePercent == nil
-	percent := 0.0
-	if inferred {
-		if !end.After(now) {
-			return xaiUsageSnapshot{}, false, errors.New("xAI weekly usage omitted for an expired period")
-		}
-	} else {
-		percent = *raw.CreditUsagePercent
-		if percent < 0 || percent > 100 {
-			return xaiUsageSnapshot{}, false, errors.New("xAI weekly usage is outside 0..100")
-		}
-	}
-	products := map[string]float64{}
-	for _, product := range raw.ProductUsage {
-		name := strings.TrimSpace(product.Product)
-		if name == "" || product.UsagePercent < 0 || product.UsagePercent > 100 {
-			continue
-		}
-		products[name] = product.UsagePercent
-	}
-	return xaiUsageSnapshot{
-		FetchedAt: now,
-		Windows: map[string]clineUsageWindow{
-			"weekly": {Type: "weekly", PercentUsed: percent, ResetsAt: end},
-		},
-		Products:    products,
-		BillingKind: "weekly",
-		Source:      "cli-chat-proxy.grok.com/v1/billing",
-	}, inferred, nil
-}
-
-func parseXAIMonthlyUsage(raw xaiBillingConfig, now time.Time) (xaiUsageSnapshot, error) {
-	_, end, err := parseXAIPeriod(raw.BillingPeriodStart, raw.BillingPeriodEnd)
-	if err != nil {
-		return xaiUsageSnapshot{}, err
-	}
-	if raw.MonthlyLimit.Val <= 0 || raw.Used.Val < 0 {
-		return xaiUsageSnapshot{}, errors.New("xAI monthly usage has no positive included quota")
-	}
-	percent := math.Min(raw.Used.Val/raw.MonthlyLimit.Val*100, 100)
-	return xaiUsageSnapshot{
-		FetchedAt: now,
-		Windows: map[string]clineUsageWindow{
-			"monthly": {Type: "monthly", PercentUsed: percent, ResetsAt: end},
-		},
-		BillingKind: "monthly",
-		Source:      "cli-chat-proxy.grok.com/v1/billing",
-	}, nil
-}
-
-func (s *proxyServer) fetchXAIBillingConfig(ctx context.Context, providerName, format string) (xaiBillingConfig, error) {
-	providerURL := s.providers[providerName]
-	if providerURL == nil {
-		return xaiBillingConfig{}, fmt.Errorf("xAI usage provider %q is unavailable", providerName)
-	}
-	billingURL := *providerURL
-	billingURL.Path = joinURLPath(providerURL.Path, "/v1/billing")
-	query := billingURL.Query()
-	if format != "" {
-		query.Set("format", format)
-	}
-	billingURL.RawQuery = query.Encode()
-	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	buildRequest := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, billingURL.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.applyProviderHeadersContext(requestCtx, providerName, req.Header); err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-		return req, nil
-	}
-	req, err := buildRequest()
-	if err != nil {
-		return xaiBillingConfig{}, err
-	}
-	client := s.clients[providerName]
-	if client == nil {
-		return xaiBillingConfig{}, fmt.Errorf("xAI usage provider %q has no HTTP client", providerName)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return xaiBillingConfig{}, err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		failedToken := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
-		_ = resp.Body.Close()
-		manager := s.xaiOAuth[providerName]
-		if manager == nil {
-			return xaiBillingConfig{}, errors.New("xAI OAuth manager is unavailable")
-		}
-		if _, err := manager.refreshAfterUnauthorized(requestCtx, failedToken); err != nil {
-			return xaiBillingConfig{}, fmt.Errorf("refresh xAI OAuth after billing 401: %w", err)
-		}
-		req, err = buildRequest()
-		if err != nil {
-			return xaiBillingConfig{}, err
-		}
-		resp, err = client.Do(req)
-		if err != nil {
-			return xaiBillingConfig{}, err
-		}
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
-		return xaiBillingConfig{}, fmt.Errorf("xAI billing endpoint returned status %d", resp.StatusCode)
-	}
-	var payload xaiBillingEnvelope
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		return xaiBillingConfig{}, fmt.Errorf("decode xAI billing response: %w", err)
-	}
-	return payload.Config, nil
-}
-
-func (s *proxyServer) fetchXAIUsageSnapshot(ctx context.Context) (xaiUsageSnapshot, error) {
-	providerName := s.xaiUsageProviderName()
-	if providerName == "" {
-		return xaiUsageSnapshot{}, errors.New("xAI OAuth provider is not configured")
-	}
-	now := time.Now()
-	credits, creditsErr := s.fetchXAIBillingConfig(ctx, providerName, "credits")
-	weekly, inferred, weeklyErr := parseXAIWeeklyUsage(credits, now)
-	if creditsErr != nil {
-		weeklyErr = creditsErr
-	}
-	if creditsErr != nil || weeklyErr != nil || credits.IsUnifiedBillingUser {
-		monthlyRaw, monthlyFetchErr := s.fetchXAIBillingConfig(ctx, providerName, "")
-		if monthlyFetchErr == nil {
-			if monthly, monthlyErr := parseXAIMonthlyUsage(monthlyRaw, now); monthlyErr == nil {
-				return monthly, nil
-			}
-			if weeklyErr == nil && (!inferred || monthlyRaw.MonthlyLimit.Val == 0) {
-				return weekly, nil
-			}
-		}
-		if weeklyErr != nil {
-			return xaiUsageSnapshot{}, fmt.Errorf("xAI billing has no valid weekly or monthly quota: %w", weeklyErr)
-		}
-		if inferred && credits.IsUnifiedBillingUser {
-			return xaiUsageSnapshot{}, errors.New("xAI unified billing could not confirm an inferred weekly quota")
-		}
-	}
-	if weeklyErr != nil {
-		return xaiUsageSnapshot{}, weeklyErr
-	}
-	return weekly, nil
-}
-
-func (s *proxyServer) updateXAIUsageState(snapshot xaiUsageSnapshot) {
-	providerName := s.xaiUsageProviderName()
-	for name, window := range snapshot.Windows {
-		if window.PercentUsed >= 100 {
-			if s.markProviderBlocked(providerName, "xai_usage_"+name+"_exhausted", xaiUsageRefreshInterval+time.Second) {
-				log.Printf("SuperGrok usage exhausted window=%s usage=%.1f%%; blocking provider", name, window.PercentUsed)
-			}
-			return
-		}
-	}
-	s.clearXAIUsageBlock(providerName)
-}
-
-func (s *proxyServer) refreshXAIUsageInBackground() {
-	snapshot, err := s.fetchXAIUsageSnapshot(context.Background())
-	s.xaiUse.mu.Lock()
-	s.xaiUse.refreshing = false
-	if err == nil {
-		s.xaiUse.snapshot = snapshot
-		s.xaiUse.hasValue = true
-	}
-	s.xaiUse.mu.Unlock()
-	if err != nil {
-		log.Printf("SuperGrok usage background refresh failed: %v", err)
-		return
-	}
-	s.updateXAIUsageState(snapshot)
-}
-
-func (s *proxyServer) monitorXAIUsage(ctx context.Context) {
-	if s.xaiUsageProviderName() == "" {
-		return
-	}
-	s.xaiUse.mu.Lock()
-	s.xaiUse.refreshing = true
-	s.xaiUse.mu.Unlock()
-	go s.refreshXAIUsageInBackground()
-	interval := xaiUsageRefreshInterval
-	if s.cfg.Definition != nil {
-		interval = time.Duration(s.cfg.Providers[s.xaiUsageProviderName()].Usage.PollIntervalSeconds) * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.xaiUse.mu.Lock()
-			if !s.xaiUse.refreshing {
-				s.xaiUse.refreshing = true
-				go s.refreshXAIUsageInBackground()
-			}
-			s.xaiUse.mu.Unlock()
 		}
 	}
 }
@@ -4727,6 +4610,9 @@ func (s *proxyServer) monitorClaudeOAuthRefresh(ctx context.Context) {
 			return
 		}
 		healthy, failed, statusErr := s.validateClaudeScheduledRefreshOutcome(started)
+		if statusErr == nil {
+			s.reconcileClaudeCredentialQuarantine(started)
+		}
 		switch {
 		case statusErr != nil:
 			s.logClaudeRefreshState("unverified error=" + strconv.Quote(statusErr.Error()))
@@ -4785,6 +4671,7 @@ func (s *proxyServer) triggerClaudeOAuthRefresh(profile claudeUsageProfile) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if err := s.claudeRefreshRunner(ctx, profile); err != nil {
+			s.noteClaudeCredentialRefreshResult(profile, false, started)
 			clearClaudeProfileOAuthToken(profile)
 			log.Printf("Claude OAuth refresh helper profile=%q failed", profile.Name)
 			return
@@ -4792,15 +4679,97 @@ func (s *proxyServer) triggerClaudeOAuthRefresh(profile claudeUsageProfile) {
 		clearClaudeProfileOAuthToken(profile)
 		if s.cfg.Definition == nil {
 			if err := s.validateClaudeProfileRefreshOutcome(profile, started); err != nil {
+				if claudeRefreshStateIsCredentialDead(s.claudeCredentialRefreshState(profile)) {
+					s.noteClaudeCredentialRefreshResult(profile, false, started)
+				}
 				log.Printf("Claude OAuth refresh helper profile=%q unverified error=%q", profile.Name, err.Error())
 				return
 			}
 		}
-		if s.clearClaudeProfileAuthBlock(profile, started) {
-			log.Printf("Claude OAuth refresh helper profile=%q cleared account auth block", profile.Name)
-		}
+		s.noteClaudeCredentialRefreshResult(profile, true, started)
 		log.Printf("Claude OAuth refresh helper profile=%q completed", profile.Name)
 	}()
+}
+
+const (
+	claudeCredentialQuarantineThreshold = 3
+	claudeCredentialQuarantineTTL       = time.Hour
+)
+
+func claudeRefreshStateIsCredentialDead(state string) bool {
+	switch state {
+	case "refresh_failed", "credential_unavailable", "invalid_expiry":
+		return true
+	}
+	return false
+}
+
+func (s *proxyServer) claudeCredentialRefreshState(profile claudeUsageProfile) string {
+	entry, ok := s.claudeCredentialRefreshHealth().Profiles[profile.Name]
+	if !ok {
+		return ""
+	}
+	return entry.State
+}
+
+// noteClaudeCredentialRefreshResult counts consecutive credential-refresh
+// failures per account. A refresh token that keeps failing is quarantined from
+// account selection instead of absorbing an auth_unavailable retry every
+// minute; the first successful refresh clears the block and the counter.
+func (s *proxyServer) noteClaudeCredentialRefreshResult(profile claudeUsageProfile, success bool, started ...time.Time) {
+	if profile.Name == "" {
+		return
+	}
+	if success {
+		s.claudeRefreshMu.Lock()
+		delete(s.claudeRefreshFailures, profile.Name)
+		s.claudeRefreshMu.Unlock()
+		if s.clearClaudeProfileAuthBlock(profile, started...) {
+			log.Printf("Claude OAuth refresh helper profile=%q cleared account auth block", profile.Name)
+		}
+		return
+	}
+	s.claudeRefreshMu.Lock()
+	defer s.claudeRefreshMu.Unlock()
+	// A manual login may have been authenticated by the usage monitor while an
+	// older refresh helper was still running. Its late failure is obsolete.
+	if len(started) > 0 && s.claudeUsageAuthVerified[profile.Name].After(started[0]) {
+		return
+	}
+	if s.claudeRefreshFailures == nil {
+		s.claudeRefreshFailures = map[string]int{}
+	}
+	s.claudeRefreshFailures[profile.Name]++
+	failures := s.claudeRefreshFailures[profile.Name]
+	if failures < claudeCredentialQuarantineThreshold {
+		return
+	}
+	providerName := s.cfg.ClaudeUsage.Provider + "@" + profile.Name
+	if s.markProviderBlocked(providerName, "auth_quarantined", claudeCredentialQuarantineTTL) {
+		log.Printf("Claude credential quarantine profile=%q failures=%d: refresh keeps failing; account excluded until a refresh succeeds", profile.Name, failures)
+	}
+}
+
+// reconcileClaudeCredentialQuarantine applies consecutive-refresh-failure
+// quarantine from the scheduled refresh outcome. Missing, stale, or locked
+// entries are inconclusive: they neither strike nor reset.
+func (s *proxyServer) reconcileClaudeCredentialQuarantine(started time.Time) {
+	health, err := s.freshClaudeRefreshHealth(started)
+	if err != nil {
+		return
+	}
+	for _, profile := range configuredClaudeCredentialProfiles(s.cfg.ClaudeUsage) {
+		entry, ok := health.Profiles[profile.Name]
+		if !ok {
+			continue
+		}
+		switch {
+		case claudeRefreshEntryUsable(entry):
+			s.noteClaudeCredentialRefreshResult(profile, true, started)
+		case claudeRefreshStateIsCredentialDead(entry.State):
+			s.noteClaudeCredentialRefreshResult(profile, false, started)
+		}
+	}
 }
 
 type claudeCredentialRefreshProfileHealth struct {
@@ -5307,7 +5276,7 @@ func (s *proxyServer) refreshClaudeAccountLease(stickyKey string, profile claude
 	if len(seconds) > 0 && seconds[0] > 0 {
 		ttl = time.Duration(seconds[0]) * time.Second
 	}
-	s.claudeAccounts[stickyKey] = claudeAccountSticky{Profile: profile, Until: s.accountNow().Add(ttl)}
+	s.rememberClaudeAccountLocked(stickyKey, profile, ttl)
 	s.claudeAccountMu.Unlock()
 }
 
@@ -5352,7 +5321,7 @@ func (s *proxyServer) reserveClaudeAccount(profile claudeUsageProfile) func() {
 	}
 }
 
-func (s *proxyServer) orderClaudeFallbackProfiles(profiles []claudeUsageProfile, selected claudeUsageProfile) []claudeUsageProfile {
+func (s *proxyServer) orderClaudeFallbackProfiles(profiles []claudeUsageProfile, selected claudeUsageProfile, headroomFirst ...bool) []claudeUsageProfile {
 	selectedKey := claudeProfileRegistryKey(selected)
 	if selectedKey == "" {
 		return profiles
@@ -5390,6 +5359,14 @@ func (s *proxyServer) orderClaudeFallbackProfiles(profiles []claudeUsageProfile,
 		if remaining[i].blocked != remaining[j].blocked {
 			return !remaining[i].blocked
 		}
+		if len(headroomFirst) > 0 && headroomFirst[0] {
+			if remaining[i].hasUsage != remaining[j].hasUsage {
+				return remaining[i].hasUsage
+			}
+			if remaining[i].snapshot.FiveHour.Utilization != remaining[j].snapshot.FiveHour.Utilization {
+				return remaining[i].snapshot.FiveHour.Utilization < remaining[j].snapshot.FiveHour.Utilization
+			}
+		}
 		if remaining[i].inFlight != remaining[j].inFlight {
 			return remaining[i].inFlight < remaining[j].inFlight
 		}
@@ -5407,13 +5384,15 @@ func (s *proxyServer) orderClaudeFallbackProfiles(profiles []claudeUsageProfile,
 	return ordered
 }
 
-const claudeAccountHeadroomSwitchMargin = 20.0
-
-func claudeUsagePressure(snapshot claudeUsageSnapshot) float64 {
-	return math.Max(snapshot.FiveHour.Utilization, snapshot.SevenDay.Utilization)
+// Pin-until-broken: a conversation's account never changes while it can
+// serve. Cache is per-account, so any hop rewrites the entire context; quota
+// balancing happens only when a pin actually breaks (blocked or exhausted)
+// or when a fresh conversation picks its first account.
+func (s *proxyServer) chooseClaudeAccount(available []availableClaudeAccount, stickyKey string, stickyProfile claudeUsageProfile, reserve bool, seconds ...int) (availableClaudeAccount, func(), bool) {
+	return s.chooseClaudeAccountWithPolicy(available, stickyKey, stickyProfile, reserve, false, seconds...)
 }
 
-func (s *proxyServer) chooseClaudeAccount(available []availableClaudeAccount, stickyKey string, stickyProfile claudeUsageProfile, reserve bool, seconds ...int) (availableClaudeAccount, func(), bool) {
+func (s *proxyServer) chooseClaudeAccountWithPolicy(available []availableClaudeAccount, stickyKey string, stickyProfile claudeUsageProfile, reserve, headroomFirst bool, seconds ...int) (availableClaudeAccount, func(), bool) {
 	s.claudeAccountMu.Lock()
 	defer s.claudeAccountMu.Unlock()
 	if s.claudeAccountInFlight == nil {
@@ -5422,65 +5401,58 @@ func (s *proxyServer) chooseClaudeAccount(available []availableClaudeAccount, st
 
 	stickyRegistryKey := claudeProfileRegistryKey(stickyProfile)
 	stickyAvailable := false
-	var stickySnapshot claudeUsageSnapshot
-	for _, candidate := range available {
-		if claudeProfileRegistryKey(candidate.profile) == stickyRegistryKey {
-			stickyAvailable = true
-			stickySnapshot = candidate.snapshot
-			break
+	var chosen availableClaudeAccount
+	if stickyRegistryKey != "" {
+		for _, candidate := range available {
+			if claudeProfileRegistryKey(candidate.profile) == stickyRegistryKey {
+				chosen = candidate
+				stickyAvailable = true
+				break
+			}
 		}
 	}
-	sort.SliceStable(available, func(i, j int) bool {
-		iKey := claudeProfileRegistryKey(available[i].profile)
-		jKey := claudeProfileRegistryKey(available[j].profile)
-		if reserve {
-			iInFlight := s.claudeAccountInFlight[iKey]
-			jInFlight := s.claudeAccountInFlight[jKey]
-			if iInFlight != jInFlight {
-				return iInFlight < jInFlight
-			}
-		}
-		if stickyRegistryKey != "" {
-			// Unknown is not 100% remaining: never compare fabricated zero
-			// utilization against measured quota to break an affinity lease.
-			if s.cfg.Definition != nil && (available[i].snapshot.Source == "unknown" || available[j].snapshot.Source == "unknown") {
-				if iKey == stickyRegistryKey || jKey == stickyRegistryKey {
-					return iKey == stickyRegistryKey
+	if !stickyAvailable {
+		// Fresh conversation or broken pin: spread new pins across accounts by
+		// in-flight load first, then lowest measured usage.
+		sort.SliceStable(available, func(i, j int) bool {
+			iKey := claudeProfileRegistryKey(available[i].profile)
+			jKey := claudeProfileRegistryKey(available[j].profile)
+			if headroomFirst {
+				if (available[i].snapshot.Source == "unknown") != (available[j].snapshot.Source == "unknown") {
+					return available[i].snapshot.Source != "unknown"
+				}
+				if available[i].snapshot.FiveHour.Utilization != available[j].snapshot.FiveHour.Utilization {
+					return available[i].snapshot.FiveHour.Utilization < available[j].snapshot.FiveHour.Utilization
 				}
 			}
-			iSticky := iKey == stickyRegistryKey
-			jSticky := jKey == stickyRegistryKey
-			if iSticky != jSticky {
-				if iSticky {
-					return claudeUsagePressure(available[i].snapshot) <= claudeUsagePressure(available[j].snapshot)+claudeAccountHeadroomSwitchMargin
+			if reserve {
+				iInFlight := s.claudeAccountInFlight[iKey]
+				jInFlight := s.claudeAccountInFlight[jKey]
+				if iInFlight != jInFlight {
+					return iInFlight < jInFlight
 				}
-				return claudeUsagePressure(available[j].snapshot) > claudeUsagePressure(available[i].snapshot)+claudeAccountHeadroomSwitchMargin
 			}
-		}
-		if s.cfg.Definition != nil && (available[i].snapshot.Source == "unknown") != (available[j].snapshot.Source == "unknown") {
-			return available[i].snapshot.Source != "unknown"
-		}
-		if available[i].snapshot.FiveHour.Utilization != available[j].snapshot.FiveHour.Utilization {
-			return available[i].snapshot.FiveHour.Utilization < available[j].snapshot.FiveHour.Utilization
-		}
-		return available[i].snapshot.SevenDay.Utilization < available[j].snapshot.SevenDay.Utilization
-	})
-
-	chosen := available[0]
+			if s.cfg.Definition != nil && (available[i].snapshot.Source == "unknown") != (available[j].snapshot.Source == "unknown") {
+				return available[i].snapshot.Source != "unknown"
+			}
+			if available[i].snapshot.FiveHour.Utilization != available[j].snapshot.FiveHour.Utilization {
+				return available[i].snapshot.FiveHour.Utilization < available[j].snapshot.FiveHour.Utilization
+			}
+			return available[i].snapshot.SevenDay.Utilization < available[j].snapshot.SevenDay.Utilization
+		})
+		chosen = available[0]
+	}
 	chosenKey := claudeProfileRegistryKey(chosen.profile)
-	stickyMateriallyWorse := stickyAvailable && claudeUsagePressure(stickySnapshot) > claudeUsagePressure(chosen.snapshot)+claudeAccountHeadroomSwitchMargin
-	stickyChanged := stickyRegistryKey != "" && chosenKey != stickyRegistryKey && stickyMateriallyWorse
-	if stickyRegistryKey == "" || chosenKey == stickyRegistryKey || !stickyAvailable || stickyMateriallyWorse {
+	stickyChanged := stickyRegistryKey != "" && chosenKey != stickyRegistryKey
+	if stickyKey != "" {
 		if s.claudeAccounts == nil {
 			s.claudeAccounts = map[string]claudeAccountSticky{}
 		}
-		if stickyKey != "" {
-			ttl := s.claudeAccountLeaseTTL()
-			if len(seconds) > 0 && seconds[0] > 0 {
-				ttl = time.Duration(seconds[0]) * time.Second
-			}
-			s.claudeAccounts[stickyKey] = claudeAccountSticky{Profile: chosen.profile, Until: s.accountNow().Add(ttl)}
+		ttl := s.claudeAccountLeaseTTL()
+		if len(seconds) > 0 && seconds[0] > 0 {
+			ttl = time.Duration(seconds[0]) * time.Second
 		}
+		s.rememberClaudeAccountLocked(stickyKey, chosen.profile, ttl)
 	}
 	if !reserve {
 		return chosen, nil, stickyChanged
@@ -5508,7 +5480,10 @@ func (s *proxyServer) selectClaudeProfile(ctx context.Context, r *http.Request, 
 	if stickyKey != "" {
 		s.claudeAccountMu.Lock()
 		sticky, ok := s.claudeAccounts[stickyKey]
-		if ok && !now.Before(sticky.Until) {
+		if !ok {
+			sticky, ok = s.restoreClaudeAccountPinLocked(stickyKey, profiles)
+		}
+		if ok && s.claudeAccountPinExpired(candidate, sticky.Until, now) {
 			delete(s.claudeAccounts, stickyKey)
 			ok = false
 		}
@@ -5545,14 +5520,23 @@ func (s *proxyServer) selectClaudeProfile(ctx context.Context, r *http.Request, 
 		available = append(available, availableClaudeAccount{profile: profile, snapshot: snapshot})
 	}
 	if len(available) > 0 {
-		chosen, release, stickyChanged := s.chooseClaudeAccount(available, stickyKey, stickyProfile, reserve, candidate.AccountStickySeconds)
-		s.logClaudeAccountSelection(requestListenerPort(r), chosen, reserve, stickyChanged)
+		chosen, release, stickyChanged := s.chooseClaudeAccountWithPolicy(available, stickyKey, stickyProfile, reserve, s.preserveSonnetSubscriptionOrder(candidate), candidate.AccountStickySeconds)
+		reason := ""
+		if stickyChanged {
+			for _, failure := range failures {
+				if strings.HasPrefix(failure, stickyProfile.Name+":") {
+					reason = strings.TrimPrefix(failure, stickyProfile.Name+":")
+					break
+				}
+			}
+		}
+		s.logClaudeAccountSelection(requestListenerPort(r), chosen, reserve, stickyChanged, reason)
 		return chosen.profile, chosen.snapshot, release, nil
 	}
 	return claudeUsageProfile{}, claudeUsageSnapshot{}, nil, fmt.Errorf("unified Claude account pool exhausted or blocked: %s", strings.Join(failures, ", "))
 }
 
-func (s *proxyServer) logClaudeAccountSelection(listener string, chosen availableClaudeAccount, reserve, stickyChanged bool) {
+func (s *proxyServer) logClaudeAccountSelection(listener string, chosen availableClaudeAccount, reserve, stickyChanged bool, reason string) {
 	if listener == "" {
 		listener = "default"
 	}
@@ -5571,7 +5555,7 @@ func (s *proxyServer) logClaudeAccountSelection(listener string, chosen availabl
 	if !shouldLog {
 		return
 	}
-	log.Printf("Claude account selection changed pool=unified listener=%q from=%q to=%q fiveHour=%.1f%% sevenDay=%.1f%% reserved=%t stickyChanged=%t", listener, previous, chosen.profile.Name, chosen.snapshot.FiveHour.Utilization, chosen.snapshot.SevenDay.Utilization, reserve, stickyChanged)
+	log.Printf("Claude account selection changed pool=unified listener=%q from=%q to=%q fiveHour=%.1f%% sevenDay=%.1f%% reserved=%t stickyChanged=%t reason=%q", listener, previous, chosen.profile.Name, chosen.snapshot.FiveHour.Utilization, chosen.snapshot.SevenDay.Utilization, reserve, stickyChanged, reason)
 }
 
 func (s *proxyServer) logClaudeAccountSelectionError(listener string, err error) {
@@ -5613,7 +5597,10 @@ func (s *proxyServer) bindClaudeAccount(ctx context.Context, r *http.Request, se
 	}
 	stickyKey := routingStickyKey(selected, payload)
 	reserve = reserve && firstNonEmpty(selected.Provider, s.cfg.DefaultProvider) == s.cfg.ClaudeUsage.Provider
+	selectionStarted := time.Now()
 	profile, _, release, err := s.selectClaudeProfile(ctx, r, stickyKey, reserve, selected)
+	selectionMS := time.Since(selectionStarted).Milliseconds()
+	r = r.WithContext(context.WithValue(r.Context(), accountSelectionTimingKey{}, selectionMS))
 	if err != nil {
 		s.logClaudeAccountSelectionError(s.listenerClaudeProfile(r).Name, err)
 		return r, nil
@@ -5837,7 +5824,13 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 	s.claudeUse.refreshing[key] = waiting
 	s.claudeUse.mu.Unlock()
 
+	fetchStarted := time.Now()
 	snapshot, fetchErr := s.fetchClaudeUsageSnapshot(ctx, auth, profile.Name)
+	if fetchErr == nil {
+		// Only a live authenticated fetch is recovery evidence. Cache/CLI/stale
+		// fallbacks below must never clear an account's auth quarantine.
+		s.recoverClaudeUsageAuth(profile, fetchStarted)
+	}
 	if fetchErr != nil {
 		delay := 5 * time.Second
 		var limited *claudeUsageRateLimit
@@ -5881,6 +5874,11 @@ func (s *proxyServer) claudeUsageSnapshotRefresh(ctx context.Context, auth strin
 	close(waiting)
 	delete(s.claudeUse.refreshing, key)
 	s.claudeUse.mu.Unlock()
+	if fetchErr == nil && snapshot.Source != "oauth-api-stale" {
+		scope := "claude:" + firstNonEmpty(snapshot.Profile, profile.Name)
+		s.usageHistory.note(scope, "5h", snapshot.FiveHour.Utilization, snapshot.FiveHour.ResetsAt)
+		s.usageHistory.note(scope, "7d", snapshot.SevenDay.Utilization, snapshot.SevenDay.ResetsAt)
+	}
 	s.persistClaudeUsageCache()
 	return snapshot, fetchErr
 }
@@ -6364,34 +6362,88 @@ func structuredOutputCompatibleCandidates(candidates []modelConfig) ([]modelConf
 	return compatible, true
 }
 
-func requestContainsImage(payload map[string]any) bool {
+// requestContentTypes collects every content-block `type` value present in
+// the request's messages tree in one traversal. Capability gates (images,
+// documents, provider-unsupported block types) all read this set, so a
+// multi-megabyte history is scanned once per request rather than per gate.
+func requestContentTypes(payload map[string]any) map[string]bool {
+	types := map[string]bool{}
 	if payload == nil {
-		return false
+		return types
 	}
-	return containsImageContent(payload["messages"])
+	var walk func(value any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			if contentType, ok := typed["type"].(string); ok {
+				types[strings.ToLower(strings.TrimSpace(contentType))] = true
+			}
+			for _, item := range typed {
+				walk(item)
+			}
+		}
+	}
+	walk(payload["messages"])
+	return types
 }
 
-func containsImageContent(value any) bool {
-	switch typed := value.(type) {
-	case []any:
-		for _, item := range typed {
-			if containsImageContent(item) {
-				return true
+func formatContentTypes(types map[string]bool) string {
+	if len(types) == 0 {
+		return "-"
+	}
+	list := make([]string, 0, len(types))
+	for contentType := range types {
+		list = append(list, contentType)
+	}
+	sort.Strings(list)
+	return strings.Join(list, ",")
+}
+
+// extendCacheControlTTL sets ttl:"1h" on ephemeral cache_control breakpoints so
+// turns landing beyond the default 5-minute cache window still hit the prompt
+// cache instead of paying a full cache write. Explicit client ttl values are
+// preserved. Returns nil when the body has nothing to change.
+func extendCacheControlTTL(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"cache_control"`)) {
+		return nil
+	}
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return nil
+	}
+	changed := false
+	var walk func(v any)
+	walk = func(v any) {
+		switch typed := v.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
 			}
-		}
-	case map[string]any:
-		contentType, _ := typed["type"].(string)
-		switch strings.ToLower(strings.TrimSpace(contentType)) {
-		case "image", "image_url", "input_image":
-			return true
-		}
-		for _, item := range typed {
-			if containsImageContent(item) {
-				return true
+		case map[string]any:
+			if cc, ok := typed["cache_control"].(map[string]any); ok {
+				if cc["type"] == "ephemeral" && cc["ttl"] == nil {
+					cc["ttl"] = "1h"
+					changed = true
+				}
+			}
+			for _, item := range typed {
+				walk(item)
 			}
 		}
 	}
-	return false
+	walk(payload)
+	if !changed {
+		return nil
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 func imageCompatibleCandidates(candidates []modelConfig) ([]modelConfig, bool) {
@@ -6401,6 +6453,43 @@ func imageCompatibleCandidates(candidates []modelConfig) ([]modelConfig, bool) {
 			continue
 		}
 		compatible = append(compatible, candidate)
+	}
+	if len(compatible) == len(candidates) {
+		return candidates, false
+	}
+	return compatible, true
+}
+
+func documentCompatibleCandidates(candidates []modelConfig) ([]modelConfig, bool) {
+	compatible := make([]modelConfig, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.SupportsDocuments != nil && !*candidate.SupportsDocuments {
+			continue
+		}
+		compatible = append(compatible, candidate)
+	}
+	if len(compatible) == len(candidates) {
+		return candidates, false
+	}
+	return compatible, true
+}
+
+// contentCompatibleCandidates drops legs whose unsupportedContentTypes
+// intersect the request's content-block types — the request is rerouted to a
+// leg that can serve it instead of dying on a provider-side rejection.
+func contentCompatibleCandidates(candidates []modelConfig, requestTypes map[string]bool) ([]modelConfig, bool) {
+	compatible := make([]modelConfig, 0, len(candidates))
+	for _, candidate := range candidates {
+		blocked := false
+		for _, t := range candidate.UnsupportedContentTypes {
+			if requestTypes[strings.ToLower(strings.TrimSpace(t))] {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			compatible = append(compatible, candidate)
+		}
 	}
 	if len(compatible) == len(candidates) {
 		return candidates, false
@@ -6454,18 +6543,21 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Proxy-Request-ID", requestID)
 	body, payload, selectedModel, err := s.normalizeRequest(r)
 	if r.Context().Err() != nil {
-		s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, 499, "client_cancel", requestStarted)
+		s.recordRequestTerminal(requestID, r, selectedModel, 499, "client_cancel", requestStarted)
 		return
 	}
 	if err != nil {
 		if errors.Is(err, errUnknownModel) {
-			s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, http.StatusBadRequest, "client_invalid", requestStarted)
+			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusBadRequest, "client_invalid", requestStarted)
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-		s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, http.StatusInternalServerError, "normalize_error", requestStarted)
+		s.recordRequestTerminal(requestID, r, selectedModel, http.StatusInternalServerError, "normalize_error", requestStarted)
 		writeAPIError(w, http.StatusInternalServerError, "api_error", err.Error())
 		return
+	}
+	if session := payloadSessionID(payload); session != "" {
+		r = r.WithContext(context.WithValue(r.Context(), sessionRouteContextKey{}, session))
 	}
 	selectedModel = s.applyOllamaUsageRoute(r.Context(), selectedModel)
 	countTokens := strings.HasSuffix(r.URL.Path, "/count_tokens")
@@ -6490,23 +6582,30 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	upstream, err := s.doWithFallbacks(ctx, r, body, payload, selectedModel)
 	if err != nil {
 		if r.Context().Err() != nil {
-			s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, 499, "client_cancel", requestStarted)
+			s.recordRequestTerminal(requestID, r, selectedModel, 499, "client_cancel", requestStarted)
 			return
 		}
 		var compatibilityErr *requestCompatibilityError
 		if errors.As(err, &compatibilityErr) {
-			s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, http.StatusBadRequest, "route_incompatible", requestStarted)
+			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusBadRequest, "route_incompatible", requestStarted)
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", compatibilityErr.Error())
 			return
 		}
 		var networkErr *retryableNetworkError
 		if errors.As(err, &networkErr) {
-			s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, http.StatusServiceUnavailable, "local_network", requestStarted)
+			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusServiceUnavailable, "local_network", requestStarted)
 			w.Header().Set("Retry-After", "2")
 			writeAPIError(w, http.StatusServiceUnavailable, "api_error", networkErr.Error())
 			return
 		}
-		s.recordRequestTerminal(requestID, r.URL.Path, selectedModel, http.StatusBadGateway, "fallback_exhausted", requestStarted)
+		var limitErr *upstreamRateLimitError
+		if errors.As(err, &limitErr) {
+			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusTooManyRequests, limitErr.reason, requestStarted)
+			w.Header().Set("Retry-After", limitErr.retryAfter())
+			writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", limitErr.Error())
+			return
+		}
+		s.recordRequestTerminal(requestID, r, selectedModel, http.StatusBadGateway, "fallback_exhausted", requestStarted)
 		writeAPIError(w, http.StatusBadGateway, "api_error", err.Error())
 		return
 	}
@@ -6550,7 +6649,7 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 		if openAIChat {
 			source = newOpenAIJSONReadCloserWithStats(source, responseAlias, stats)
 		}
-		responseBody = newJSONFilterReadCloser(source, dropTypes, responseAlias)
+		responseBody = newJSONFilterReadCloser(source, dropTypes, responseAlias, stats)
 	default:
 		responseBody = resp.Body
 	}
@@ -6635,7 +6734,7 @@ func (s *proxyServer) handleCountTokens(w http.ResponseWriter, r *http.Request, 
 	_ = json.NewEncoder(w).Encode(map[string]int{
 		"input_tokens": estimateInputTokens(body),
 	})
-	s.recordRequestTerminalOutcome(proxyRequestID(r), r.URL.Path, selected, http.StatusOK, "", requestStarted, true)
+	s.recordRequestTerminalOutcome(proxyRequestID(r), r, selected, http.StatusOK, "", requestStarted, true)
 }
 
 // tryUpstreamCountTokens reports whether the response was handled upstream.
@@ -6661,7 +6760,7 @@ func (s *proxyServer) tryUpstreamCountTokens(w http.ResponseWriter, r *http.Requ
 		return false
 	}
 	upstream := upstreamResponse{resp: resp, providerName: providerName, model: selected, started: started,
-		trace: requestTrace{ID: proxyRequestID(r), Path: r.URL.Path, ChainStarted: started, CandidateCount: 1}}
+		trace: requestTrace{Attribution: requestUsageAttribution(r), Client: requestClientLabel(r.UserAgent(), requestListenerPort(r)), ID: proxyRequestID(r), Path: r.URL.Path, ChainStarted: started, CandidateCount: 1}}
 	defer upstream.resp.Body.Close()
 	status := upstream.resp.StatusCode
 	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented {
@@ -6972,7 +7071,7 @@ func (s *proxyServer) isClaudePaidFallbackProvider(providerName string) bool {
 		return s.cfg.Providers[providerName].Billing == "metered"
 	}
 	// Metered gateway legs inherit the guard independently of their model.
-	if strings.HasPrefix(providerName, "vercel-") || strings.HasPrefix(providerName, "merge-gateway") {
+	if strings.HasPrefix(providerName, "vercel-") {
 		return true
 	}
 	providers := s.cfg.ClaudeUsage.PaidFallbackProviders
@@ -7059,7 +7158,7 @@ func (s *proxyServer) expandClaudeAccountAttempts(r *http.Request, candidates []
 
 	profiles := s.eligibleClaudePoolProfiles(requestListenerPort(r))
 	if selectedProfile, ok := selectedClaudeProfile(r); ok && profileInClaudePool(selectedProfile, profiles) {
-		profiles = s.orderClaudeFallbackProfiles(profiles, selectedProfile)
+		profiles = s.orderClaudeFallbackProfiles(profiles, selectedProfile, s.preserveSonnetSubscriptionOrder(selected))
 	}
 	fromProfile := ""
 	if len(profiles) > 0 {
@@ -7093,13 +7192,23 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	// otherwise ban the leg for real generation requests).
 	countTokens := strings.HasSuffix(r.URL.Path, "/count_tokens")
 	candidates := s.collectCandidates(selected)
+	if !countTokens {
+		candidates = s.advisorCompatibleCandidates(candidates, payload)
+		if len(candidates) == 0 {
+			return upstreamResponse{}, &requestCompatibilityError{message: "native advisor tool requires a compatible Anthropic route"}
+		}
+	}
 	if s.cfg.Definition != nil && !countTokens {
 		candidates = configuredCompatibleCandidates(candidates, payload)
 		if len(candidates) == 0 {
 			return upstreamResponse{}, &requestCompatibilityError{message: "no configured route supports this request's tools/images"}
 		}
 	}
-	if !countTokens && requestContainsImage(payload) {
+	var requestTypes map[string]bool
+	if !countTokens {
+		requestTypes = requestContentTypes(payload)
+	}
+	if !countTokens && (requestTypes["image"] || requestTypes["image_url"] || requestTypes["input_image"]) {
 		if compatible, changed := imageCompatibleCandidates(candidates); changed {
 			candidates = compatible
 			if len(candidates) == 0 {
@@ -7107,6 +7216,28 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 			if s.cfg.Logging.DebugRequests {
 				log.Printf("image compatibility route model=%q candidates=%d; skipping non-vision models", selected.Requested, len(candidates))
+			}
+		}
+	}
+	if !countTokens && (requestTypes["document"] || requestTypes["input_document"]) {
+		if compatible, changed := documentCompatibleCandidates(candidates); changed {
+			candidates = compatible
+			if len(candidates) == 0 {
+				return upstreamResponse{}, &requestCompatibilityError{message: fmt.Sprintf("model %q has no document-capable route", selected.Requested)}
+			}
+			if s.cfg.Logging.DebugRequests {
+				log.Printf("document compatibility route model=%q candidates=%d; skipping non-document models", selected.Requested, len(candidates))
+			}
+		}
+	}
+	if !countTokens {
+		if compatible, changed := contentCompatibleCandidates(candidates, requestTypes); changed {
+			candidates = compatible
+			if len(candidates) == 0 {
+				return upstreamResponse{}, &requestCompatibilityError{message: fmt.Sprintf("model %q has no route accepting this request's content blocks", selected.Requested)}
+			}
+			if s.cfg.Logging.DebugRequests {
+				log.Printf("content-type compatibility route model=%q candidates=%d; skipping legs rejecting request blocks", selected.Requested, len(candidates))
 			}
 		}
 	}
@@ -7125,7 +7256,18 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	} else if history == thinkingHistoryNone && s.conversationFamily(stickyKey) == "" {
 		s.seedConversationFamily(stickyKey, s.openingConversationFamily(ctx, r, candidates))
 	}
-	candidates = s.rankCandidatesForRequest(selected, candidates, stickyKey, history == thinkingHistoryNone, history)
+	var hint taskRouteHint
+	if !countTokens {
+		hint = s.taskRouteHintForRequest(ctx, selected, payload, stickyKey)
+	}
+	applied := hint
+	if hint.Decided && s.classifierShadow() {
+		applied = taskRouteHint{}
+	}
+	candidates = s.rankCandidatesForRequest(selected, candidates, stickyKey, history == thinkingHistoryNone, history, applied)
+	if hint.Decided && s.classifierShadow() {
+		s.logTaskShadowRoute(selected, candidates, stickyKey, history == thinkingHistoryNone, history, hint)
+	}
 	if s.cfg.Definition == nil {
 		candidates = s.deferInstabilityQuarantinedCandidates(r, candidates)
 	}
@@ -7133,14 +7275,23 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	initialReservation, _ := r.Context().Value(claudeAccountReservationContextKey{}).(claudeAccountReservation)
 	initialReservationKey := claudeProfileRegistryKey(initialReservation.profile)
 	trace := requestTrace{
+		Attribution:    requestUsageAttribution(r),
 		LastExecution:  &attemptOutcome{},
 		ID:             requestID,
 		Path:           r.URL.Path,
+		Client:         requestClientLabel(r.UserAgent(), requestListenerPort(r)),
+		SessionID:      sessionIDFromContext(ctx),
+		TaskTier:       hint.Tier,
+		TaskShadow:     hint.Decided && s.classifierShadow(),
+		TaskSample:     hint.Sample,
 		CandidateCount: len(attempts),
 		ChainStarted:   time.Now(),
 		ChainBudget:    fallbackChainHeaderBudget(body),
 	}
 	trace.Ingress, _ = r.Context().Value(proxyIngressContextKey{}).(time.Time)
+	if selectionMS, ok := r.Context().Value(accountSelectionTimingKey{}).(int64); ok {
+		trace.AccountSelectionMS = &selectionMS
+	}
 	var lastErr error
 	var lastStatus int
 	var lastBody []byte
@@ -7153,7 +7304,15 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	anthropicTransportFailures := 0
 	paidEvidence := paidFallbackEvidence{}
 	paidStarted := s.cfg.Definition != nil && s.cfg.Providers[selected.Provider].Billing == "metered"
+	// All Claude accounts share one host: a transport error is environmental
+	// (WiFi flap, DNS, conn reset), never account-specific. Iterating other
+	// accounts on a blip only re-pins the lease to whoever answers.
+	skipProfilesForUpstream := ""
 	for i, accountAttempt := range attempts {
+		if accountAttempt.profile.Name != "" && skipProfilesForUpstream != "" && accountAttempt.model.Upstream == skipProfilesForUpstream {
+			continue
+		}
+		skipProfilesForUpstream = ""
 		// A policy skip must not inherit timing/concurrency from a prior leg.
 		trace.Execution, trace.Timing = nil, nil
 		trace.HeadersMS, trace.FirstEventMS = 0, 0
@@ -7173,7 +7332,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		}
 		providerName := firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider)
 		if s.cfg.Definition != nil && !paidStarted && s.cfg.Providers[providerName].Billing == "metered" {
-			if !paidEvidence.allowed(selected) {
+			if !paidEvidence.allowed(selected) && !paidEvidence.loadAllowed(selected) {
 				lastErr = errors.New("metered fallback suppressed by configured cost policy")
 				s.recordAttempt(trace, selected, candidate, i, time.Now(), 0, false, "paid_fallback_suppressed")
 				log.Printf("metered fallback suppressed request=%s provider=%s model=%q reason=configured_cost_policy", trace.ID, providerName, selected.Requested)
@@ -7244,11 +7403,26 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					log.Printf("Claude subscription reserve active, skipping provider=%s upstream=%q model=%q reason=%q", providerName, candidate.Upstream, candidate.Requested, reason)
 				}
 				s.recordAttempt(trace, selected, candidate, i, time.Now(), 0, i < len(attempts)-1, "claude_"+reason)
-				lastErr = fmt.Errorf("Claude subscription upstream %q unavailable: %s", candidate.Upstream, reason)
+				if reason == "configured_quota_limit" {
+					// Later exhausted accounts must not disguise an earlier actual
+					// upstream throttle as a gateway/network failure.
+					var previousLimit *upstreamRateLimitError
+					if !errors.As(lastErr, &previousLimit) {
+						lastErr = &upstreamRateLimitError{
+							retryAt: time.Now().Add(time.Minute), reason: reason,
+							message: fmt.Sprintf("gateway quota precheck rejected account %q for model %q; no upstream request sent for this account; retry delay is not a confirmed quota reset", candidate.ClaudeProfile, candidate.Upstream),
+						}
+					}
+				} else {
+					lastErr = fmt.Errorf("Claude subscription upstream %q unavailable: %s", candidate.Upstream, reason)
+				}
 				continue
 			}
 		}
 		if blocked, state := s.providerBlockForCandidate(runtimeProviderName, candidate); blocked {
+			if strings.HasPrefix(state.Reason, "instability_") && containsString(selected.PaidFallbackOn, "route-unavailable") {
+				paidEvidence[evidenceKey] = "route-unavailable"
+			}
 			if isQuotaReason(state.Reason) {
 				paidEvidence[evidenceKey] = "quota-exhausted"
 			}
@@ -7271,11 +7445,17 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}
 				s.recordAttempt(trace, selected, candidate, i, time.Now(), 0, i < len(attempts)-1, "provider_limited")
 				lastErr = fmt.Errorf("provider %s limited until %s", providerName, state.BlockedUntil.UTC().Format(time.RFC3339))
+				if isQuotaReason(state.Reason) || state.Reason == temporaryRateLimitReason {
+					lastErr = &upstreamRateLimitError{retryAt: state.BlockedUntil, reason: state.Reason}
+				}
 				continue
 			}
 		}
 		circuitAllowed, circuitProbe := s.acquireCircuitAttempt(runtimeProviderName, candidate, i == len(attempts)-1)
 		if !circuitAllowed {
+			if containsString(selected.PaidFallbackOn, "route-unavailable") {
+				paidEvidence[evidenceKey] = "route-unavailable"
+			}
 			if s.cfg.Definition != nil && s.updateOutageEvidence(evidenceKey, "", 0) {
 				paidEvidence[evidenceKey] = "confirmed-provider-outage"
 			}
@@ -7289,7 +7469,17 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			lastErr = fmt.Errorf("provider %s upstream %q circuit open (recent failures)", providerName, candidate.Upstream)
 			continue
 		}
+		if !countTokens && selected.SoftConcurrency > 0 && i < len(attempts)-1 && s.routeActive(providerName, candidate.Upstream) >= selected.SoftConcurrency {
+			releaseCircuitProbe(circuitProbe)
+			if s.cfg.Providers[providerName].Billing != "metered" {
+				paidEvidence[evidenceKey] = "load_spill"
+			}
+			s.recordAttempt(trace, selected, candidate, i, time.Now(), 0, true, "load_spill")
+			continue
+		}
+		transformStarted := time.Now()
 		attemptBody, err := s.buildAttemptBody(body, payload, candidate, providerName, r.URL.Path)
+		transformMS := time.Since(transformStarted).Milliseconds()
 		if err != nil {
 			releaseCircuitProbe(circuitProbe)
 			return upstreamResponse{}, err
@@ -7339,6 +7529,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		releaseRoute := s.reserveRoute(runtimeProviderName, candidate)
 		execution, releaseTelemetry := s.passiveConcurrency.begin(providerName, candidate.ClaudeProfile, candidate.Upstream, s.telemetryChain(selected), trace.Path)
 		trace.Execution = &execution
+		execution.TransformMS = transformMS
 		execution.Number = trace.LastExecution.Executions + 1
 		execution.BeforeAttemptMS = time.Since(trace.ChainStarted).Milliseconds()
 		if trace.LastExecution.Executions > 0 {
@@ -7405,10 +7596,13 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				networkDecision = s.observeNetworkTransportFailure(runtimeProviderName, signal, err)
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
-				} else {
+				} else if accountAttempt.profile.Name == "" {
 					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), signal)
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
+				// Profile attempts share one host: a transport error can never
+				// be attributed to the account, so it must not feed the
+				// per-account circuit — that would break the pin on a blip.
 			}
 			if providerName == s.cfg.ClaudeUsage.Provider {
 				if authFailure {
@@ -7429,9 +7623,18 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, 0, false, failureReason)
 				return upstreamResponse{}, &retryableNetworkError{message: "local network unavailable; retry shortly"}
 			}
+			// Explicit per-chain opt-in only: no response headers or client
+			// output have arrived. Never turn local network failure or caller
+			// cancellation into permission to spend on another provider.
+			if headerTimeout != nil && !networkDecision.SuppressProviderPenalty && r.Context().Err() == nil && s.cfg.Providers[providerName].Billing != "metered" {
+				paidEvidence[evidenceKey] = "response-header-timeout"
+			}
 			s.recordAttempt(trace, selected, candidate, i, attemptStarted, 0, i < len(attempts)-1, failureReason)
 			lastErr = err
 			log.Printf("provider fallback candidate failed request=%s model=%q provider=%s upstream=%q error=%v", trace.ID, candidate.Requested, providerName, candidate.Upstream, err)
+			if accountAttempt.profile.Name != "" && !authFailure && !chainLimited {
+				skipProfilesForUpstream = candidate.Upstream
+			}
 			continue
 		}
 		if resp.Body != nil {
@@ -7464,7 +7667,25 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			if primeBudget <= 0 {
 				primeErr = fmt.Errorf("first-event budget exhausted")
 			} else {
-				primedBody, primeErr = primeSSEBody(resp.Body, primeBudget)
+				preludeIdle := time.Duration(0)
+				if providerName == "ollama" || s.cfg.Providers[providerName].Variant == "ollama" {
+					preludeIdle = streamIdleTimeout(s.cfg.Providers[providerName])
+				}
+				var firstEventAt time.Time
+				primedBody, primeErr = primeSSEBodyObserved(resp.Body, primeBudget, preludeIdle, func() {
+					firstEventAt = time.Now()
+					trace.FirstEventMS = time.Since(attemptStarted).Milliseconds()
+				}, func(kind string) {
+					execution.PrimedFrames++
+					execution.PrimeLastFrame = kind
+				})
+				if preludeIdle > 0 && !firstEventAt.IsZero() {
+					// Thinking after a valid initial event belongs to the stream
+					// idle allowance, not another provider's header reserve.
+					preludeWait := time.Since(firstEventAt)
+					execution.PreludeMS = preludeWait.Milliseconds()
+					trace.ChainBudget += preludeWait
+				}
 			}
 			if primeErr != nil {
 				_ = resp.Body.Close()
@@ -7484,10 +7705,13 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}
 				quotaError := kind == "rate_limit_error"
 				authError := kind == "authentication_error" || kind == "permission_error"
+				var limitErr *upstreamRateLimitError
 				if quotaError {
+					limitErr = s.rememberRateLimit(providerName, runtimeProviderName, candidate, resp.Header, []byte(providerError.message))
+					failureReason = limitErr.reason
+					// Preserve explicitly opted-in fallback policy for 429s;
+					// cooldown scope/classification does not enable a new route.
 					paidEvidence[evidenceKey] = "quota-exhausted"
-					failureReason = "quota_or_rate_limit"
-					s.markProviderBlocked(s.quotaBlockKeyForResponse(runtimeProviderName, candidate, resp.Header), failureReason, providerCooldown(resp.Header, nil))
 				}
 				if authError {
 					failureReason = "auth_exhausted"
@@ -7498,7 +7722,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
-				} else if !quotaError && !authError {
+				} else if !quotaError && !authError && accountAttempt.profile.Name == "" {
 					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), "stream_start")
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
@@ -7518,14 +7742,22 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, i < len(attempts)-1, failureReason)
 				lastErr = fmt.Errorf("provider %s upstream %q failed before first stream event: %w", providerName, candidate.Upstream, primeErr)
+				if limitErr != nil {
+					lastErr = limitErr
+				}
 				log.Printf("provider fallback stream start failed request=%s model=%q provider=%s upstream=%q error=%v", trace.ID, candidate.Requested, providerName, candidate.Upstream, primeErr)
 				if networkDecision.StopFallback {
 					return upstreamResponse{}, &retryableNetworkError{message: "local network unavailable; retry shortly"}
 				}
+				if accountAttempt.profile.Name != "" && !quotaError && !authError {
+					skipProfilesForUpstream = candidate.Upstream
+				}
 				continue
 			}
 			resp.Body = primedBody
-			trace.FirstEventMS = time.Since(attemptStarted).Milliseconds()
+			if trace.FirstEventMS == 0 {
+				trace.FirstEventMS = time.Since(attemptStarted).Milliseconds()
+			}
 		}
 		s.observeNetworkSuccess()
 		if s.cfg.Definition != nil {
@@ -7539,13 +7771,31 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		networkRecovered = true
 		unstable := false
 		responseFailureReason := ""
+		// Inspect every 429, including the final/only candidate. Otherwise a
+		// single-model route hammers a throttled upstream on every SDK retry.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			execution.observeGatewayError(errorBody)
+			execution.ResponseReadError = readErr != nil
+			_ = resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(errorBody))
+			if readErr != nil && ctx.Err() != nil {
+				return upstreamResponse{}, ctx.Err()
+			}
+			limitErr := s.rateLimitResponse(providerName, runtimeProviderName, candidate, resp.Header, errorBody, !countTokens)
+			responseFailureReason = limitErr.reason
+			lastErr = limitErr
+			if resp.Header.Get("Retry-After") == "" {
+				resp.Header.Set("Retry-After", limitErr.retryAfter())
+			}
+			if isQuotaReason(responseFailureReason) {
+				paidEvidence[evidenceKey] = "quota-exhausted"
+			}
+		}
 		if !countTokens {
-			ttfb := time.Since(attemptStarted)
 			signal := ""
 			instabilityKey := routeHealthKey(runtimeProviderName, candidate)
 			switch {
-			case resp.StatusCode == http.StatusTooManyRequests && !s.explicitAnthropicPrimary(selected):
-				signal = "http_rate_limit"
 			case resp.StatusCode >= http.StatusInternalServerError:
 				signal = "http_5xx"
 				if providerName == s.cfg.ClaudeUsage.Provider {
@@ -7558,15 +7808,10 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 						anthropicServiceSignalRecorded = true
 					}
 				}
-			case resp.StatusCode < http.StatusBadRequest && s.excessiveTTFB(ttfb):
-				signal = "excessive_ttfb"
 			}
 			if signal != "" {
 				unstable = true
 				s.observeProviderInstability(instabilityKey, signal)
-			}
-			if resp.StatusCode == http.StatusTooManyRequests && !s.explicitAnthropicPrimary(selected) {
-				s.markProviderBlocked(runtimeProviderName, "quota_or_rate_limit", providerCooldown(resp.Header, nil))
 			}
 		}
 		if !countTokens {
@@ -7612,7 +7857,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, true, "route_incompatible")
 				lastStatus = resp.StatusCode
 				lastBody = errorBody
-				log.Printf("provider fallback route incompatibility request=%s model=%q provider=%s upstream=%q status=%d body=%q", trace.ID, candidate.Requested, providerName, candidate.Upstream, resp.StatusCode, trimForLog(string(errorBody), 240))
+				log.Printf("provider fallback route incompatibility request=%s model=%q provider=%s upstream=%q status=%d contentTypes=%s body=%q", trace.ID, candidate.Requested, providerName, candidate.Upstream, resp.StatusCode, formatContentTypes(requestTypes), trimForLog(string(errorBody), 240))
 				continue
 			}
 			// Some gateways incorrectly label exhausted account credits as
@@ -7624,13 +7869,13 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				fourXXClassified = resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError
 				failureReason := classifyFallbackBody(errorBody)
 				if resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests {
-					failureReason = "quota_or_rate_limit"
+					failureReason = providerFailureReason(resp.StatusCode, resp.Header, errorBody)
 				}
-				if failureReason == "quota_or_rate_limit" || resp.StatusCode == http.StatusTooManyRequests {
-					blockKey := s.quotaBlockKeyForResponse(runtimeProviderName, candidate, resp.Header)
-					s.markProviderBlocked(blockKey, failureReason, providerCooldown(resp.Header, errorBody))
+				if (isQuotaReason(failureReason) || failureReason == temporaryRateLimitReason) && resp.StatusCode != http.StatusTooManyRequests {
+					blockKey := s.providerFailureBlockKey(providerName, runtimeProviderName, candidate, resp.Header, failureReason)
+					s.markProviderBlocked(blockKey, failureReason, providerCooldownForReason(failureReason, resp.Header, errorBody))
 				}
-				if !countTokens && failureReason != "quota_or_rate_limit" && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+				if !countTokens && !isQuotaReason(failureReason) && failureReason != temporaryRateLimitReason && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, true, failureReason)
@@ -7683,8 +7928,8 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(errorBody))
 				if providerQuotaBody(errorBody) {
-					responseFailureReason = "quota_or_rate_limit"
-					s.markProviderBlocked(s.quotaBlockKeyForResponse(runtimeProviderName, candidate, resp.Header), responseFailureReason, providerCooldown(resp.Header, errorBody))
+					responseFailureReason = providerFailureReason(resp.StatusCode, resp.Header, errorBody)
+					s.markProviderBlocked(s.providerFailureBlockKey(providerName, runtimeProviderName, candidate, resp.Header, responseFailureReason), responseFailureReason, providerCooldownForReason(responseFailureReason, resp.Header, errorBody))
 				} else if providerSpecificRequestIncompatibility(resp.StatusCode, errorBody) {
 					responseFailureReason = "route_incompatible"
 					if !countTokens {
@@ -7753,11 +7998,19 @@ func (s *proxyServer) doUpstream(ctx context.Context, r *http.Request, body []by
 	}
 	upstreamURL.RawQuery = r.URL.RawQuery
 
+	cacheTTLExtended := false
+	if providerName == s.cfg.ClaudeUsage.Provider {
+		if rewritten := extendCacheControlTTL(body); rewritten != nil {
+			body = rewritten
+			cacheTTLExtended = true
+		}
+	}
 	upstreamReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	copyHeaders(upstreamReq.Header, r.Header)
+	stripUsageHeaders(upstreamReq.Header)
 	if s.cfg.Definition != nil {
 		for _, key := range []string{"Authorization", "x-api-key", "api-key", "Cookie", "Proxy-Authorization"} {
 			upstreamReq.Header.Del(key)
@@ -7780,6 +8033,9 @@ func (s *proxyServer) doUpstream(ctx context.Context, r *http.Request, body []by
 		upstreamReq.Header.Del("api-key")
 		upstreamReq.Header.Set("Authorization", auth)
 		ensureCommaSeparatedHeaderValue(upstreamReq.Header, "anthropic-beta", "oauth-2025-04-20")
+		if cacheTTLExtended {
+			ensureCommaSeparatedHeaderValue(upstreamReq.Header, "anthropic-beta", "extended-cache-ttl-2025-04-11")
+		}
 	}
 	if err := s.applyProviderHeadersContext(ctx, providerName, upstreamReq.Header); err != nil {
 		return nil, err
@@ -7796,18 +8052,25 @@ func (s *proxyServer) doUpstream(ctx context.Context, r *http.Request, body []by
 		return nil, fmt.Errorf("provider %q has no HTTP client", providerName)
 	}
 	resp, err := client.Do(upstreamReq)
-	if err != nil || resp.StatusCode != http.StatusUnauthorized || provider.AuthMode != "xai-oauth" {
+	if err != nil || resp.StatusCode != http.StatusUnauthorized || provider.AuthMode != "kimi-code-oauth" {
 		return resp, err
 	}
 
-	manager := s.xaiOAuth[providerName]
-	if manager == nil || upstreamReq.GetBody == nil {
+	if upstreamReq.GetBody == nil {
 		return resp, nil
 	}
 	failedToken := strings.TrimPrefix(upstreamReq.Header.Get("Authorization"), "Bearer ")
-	refreshedToken, refreshErr := manager.refreshAfterUnauthorized(ctx, failedToken)
+	var refreshedToken string
+	var refreshErr error
+	if provider.AuthMode == "kimi-code-oauth" {
+		manager := s.kimiOAuth[providerName]
+		if manager == nil {
+			return resp, nil
+		}
+		refreshedToken, refreshErr = manager.refreshAfterUnauthorized(ctx, failedToken)
+	}
 	if refreshErr != nil {
-		log.Printf("provider=%s xAI OAuth refresh after 401 failed: %v", providerName, refreshErr)
+		log.Printf("provider=%s subscription OAuth refresh after 401 unavailable", providerName)
 		return resp, nil
 	}
 	retryBody, bodyErr := upstreamReq.GetBody()
@@ -7821,7 +8084,7 @@ func (s *proxyServer) doUpstream(ctx context.Context, r *http.Request, body []by
 	retryReq.Body = retryBody
 	retryReq.Header = upstreamReq.Header.Clone()
 	retryReq.Header.Set("Authorization", "Bearer "+refreshedToken)
-	log.Printf("provider=%s retrying once after xAI OAuth token refresh", providerName)
+	log.Printf("provider=%s retrying once after subscription OAuth token refresh", providerName)
 	return client.Do(retryReq)
 }
 
@@ -7852,9 +8115,18 @@ func (s *proxyServer) doUpstreamWithHeaderBudgetLimit(ctx context.Context, r *ht
 	}
 	attemptCtx, cancel := context.WithCancel(ctx)
 	if timing, ok := ctx.Value(upstreamTimingContextKey{}).(*upstreamTiming); ok {
+		timing.headerBudgetMS.Store(budget.Milliseconds())
+		timing.chainRemainingMS.Store(maximum.Milliseconds())
+		timing.chainLimited.Store(chainLimited)
 		traceStarted := time.Now()
 		var connectionStart, dnsStart, tlsStart atomic.Int64
 		attemptCtx = httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
+				if info.Err == nil {
+					timing.requestWrittenMS.Store(time.Since(traceStarted).Milliseconds())
+					timing.requestWritten.Store(true)
+				}
+			},
 			GetConn: func(string) { connectionStart.Store(time.Now().UnixNano()) },
 			GotConn: func(info httptrace.GotConnInfo) {
 				timing.gotConnection.Store(true)
@@ -8083,28 +8355,38 @@ func (s *proxyServer) normalizeMessages(messages []any) []any {
 }
 
 func (s *proxyServer) normalizeContentBlocks(blocks []any) []any {
-	for i, item := range blocks {
+	filtered := make([]any, 0, len(blocks))
+	for _, item := range blocks {
 		block, ok := item.(map[string]any)
 		if !ok {
+			filtered = append(filtered, item)
 			continue
 		}
 		blockType, _ := block["type"].(string)
+		if blockType == "text" {
+			if text, ok := block["text"].(string); !ok || text == "" {
+				continue
+			}
+		}
 		if replacement, replace := s.cfg.Normalize.UnsupportedContentTypes[blockType]; replace {
 			if replacement == "text" {
 				raw, _ := json.Marshal(block)
-				blocks[i] = map[string]any{
+				filtered = append(filtered, map[string]any{
 					"type": "text",
 					"text": "[" + blockType + " omitted: " + string(raw) + "]",
-				}
+				})
 				continue
 			}
 		}
 		if nested, ok := block["content"].([]any); ok {
 			block["content"] = s.normalizeContentBlocks(nested)
-			blocks[i] = block
 		}
+		filtered = append(filtered, block)
 	}
-	return blocks
+	if len(filtered) == 0 && len(blocks) > 0 {
+		return blocks
+	}
+	return filtered
 }
 
 // normalizeHistoricalToolIDs repairs model-generated IDs before replaying a
@@ -8227,492 +8509,8 @@ func isASCIIAlphaNumeric(char rune) bool {
 	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9'
 }
 
-const (
-	xaiOAuthIssuer        = "https://auth.x.ai"
-	xaiOAuthDiscoveryURL  = xaiOAuthIssuer + "/.well-known/openid-configuration"
-	xaiOAuthDeviceCodeURL = xaiOAuthIssuer + "/oauth2/device/code"
-	xaiOAuthClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
-	xaiOAuthScope         = "openid profile email offline_access grok-cli:access api:access"
-	xaiOAuthRefreshSkew   = 2 * time.Minute
-	xaiOAuthStateVersion  = 1
-)
-
 type httpDoer interface {
 	Do(*http.Request) (*http.Response, error)
-}
-
-type xaiOAuthManager struct {
-	mu        sync.Mutex
-	statePath string
-	client    httpDoer
-	state     xaiOAuthState
-}
-
-type xaiOAuthState struct {
-	Version       int       `json:"version"`
-	AuthMode      string    `json:"authMode"`
-	AccessToken   string    `json:"accessToken,omitempty"`
-	RefreshToken  string    `json:"refreshToken,omitempty"`
-	IDToken       string    `json:"idToken,omitempty"`
-	TokenType     string    `json:"tokenType,omitempty"`
-	ExpiresAt     time.Time `json:"expiresAt,omitempty"`
-	TokenEndpoint string    `json:"tokenEndpoint,omitempty"`
-	LastRefresh   time.Time `json:"lastRefresh,omitempty"`
-	LastError     string    `json:"lastError,omitempty"`
-}
-
-type xaiOIDCDiscovery struct {
-	TokenEndpoint string `json:"token_endpoint"`
-}
-
-type xaiDeviceCodeResponse struct {
-	DeviceCode              string `json:"device_code"`
-	UserCode                string `json:"user_code"`
-	VerificationURI         string `json:"verification_uri"`
-	VerificationURIComplete string `json:"verification_uri_complete"`
-	ExpiresIn               int    `json:"expires_in"`
-	Interval                int    `json:"interval"`
-}
-
-type xaiTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	IDToken      string `json:"id_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-	Error        string `json:"error"`
-	Description  string `json:"error_description"`
-}
-
-func newXAIOAuthManager(statePath string, client httpDoer) *xaiOAuthManager {
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	return &xaiOAuthManager{statePath: statePath, client: client}
-}
-
-func validateXAIOrigin(rawURL, label string) error {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return fmt.Errorf("invalid xAI %s: %w", label, err)
-	}
-	if parsed.Scheme != "https" {
-		return fmt.Errorf("xAI %s must use HTTPS", label)
-	}
-	host := strings.ToLower(parsed.Hostname())
-	if host == "" || (host != "x.ai" && !strings.HasSuffix(host, ".x.ai")) {
-		return fmt.Errorf("xAI %s host %q is outside x.ai", label, host)
-	}
-	return nil
-}
-
-func validateXAISubscriptionOrigin(rawURL, label string) error {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return fmt.Errorf("invalid xAI %s: %w", label, err)
-	}
-	if parsed.Scheme != "https" {
-		return fmt.Errorf("xAI %s must use HTTPS", label)
-	}
-	host := strings.ToLower(parsed.Hostname())
-	if host != "cli-chat-proxy.grok.com" {
-		return fmt.Errorf("xAI %s host %q is not the SuperGrok subscription origin", label, host)
-	}
-	return nil
-}
-
-func jwtExpiry(token string) time.Time {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return time.Time{}
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return time.Time{}
-	}
-	var claims struct {
-		Expires int64 `json:"exp"`
-	}
-	if json.Unmarshal(payload, &claims) != nil || claims.Expires <= 0 {
-		return time.Time{}
-	}
-	return time.Unix(claims.Expires, 0)
-}
-
-func xaiStateExpiry(state xaiOAuthState) time.Time {
-	if expiry := jwtExpiry(state.AccessToken); !expiry.IsZero() {
-		return expiry
-	}
-	return state.ExpiresAt
-}
-
-func readXAIOAuthState(path string) (xaiOAuthState, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return xaiOAuthState{}, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return xaiOAuthState{}, fmt.Errorf("xAI OAuth state %q must be a regular file, not a symlink", path)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return xaiOAuthState{}, fmt.Errorf("xAI OAuth state %q permissions are %04o, want 0600", path, info.Mode().Perm())
-	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return xaiOAuthState{}, err
-	}
-	var state xaiOAuthState
-	if err := json.Unmarshal(body, &state); err != nil {
-		return xaiOAuthState{}, fmt.Errorf("decode xAI OAuth state: %w", err)
-	}
-	if state.Version != xaiOAuthStateVersion {
-		return xaiOAuthState{}, fmt.Errorf("xAI OAuth state version %d is unsupported", state.Version)
-	}
-	if state.TokenEndpoint != "" {
-		if err := validateXAIOrigin(state.TokenEndpoint, "token endpoint"); err != nil {
-			return xaiOAuthState{}, err
-		}
-	}
-	return state, nil
-}
-
-func writeXAIOAuthState(path string, state xaiOAuthState) error {
-	if path == "" {
-		return errors.New("xAI OAuth state path is empty")
-	}
-	state.Version = xaiOAuthStateVersion
-	state.AuthMode = "oauth_device_code"
-	if state.TokenType == "" {
-		state.TokenType = "Bearer"
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return fmt.Errorf("xAI OAuth state %q must be a regular file, not a symlink", path)
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	temp, err := os.CreateTemp(dir, ".xai-oauth-*.tmp")
-	if err != nil {
-		return err
-	}
-	tempPath := temp.Name()
-	keep := false
-	defer func() {
-		_ = temp.Close()
-		if !keep {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(temp)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(state); err != nil {
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return err
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return err
-	}
-	keep = true
-	return nil
-}
-
-func (m *xaiOAuthManager) loadLocked() error {
-	state, err := readXAIOAuthState(m.statePath)
-	if err != nil {
-		return err
-	}
-	m.state = state
-	return nil
-}
-
-func (m *xaiOAuthManager) accessToken(ctx context.Context) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.state.AccessToken == "" {
-		if err := m.loadLocked(); err != nil {
-			if os.IsNotExist(err) {
-				return "", fmt.Errorf("xAI OAuth is not connected; run anthropic-proxy xai-login")
-			}
-			return "", err
-		}
-	}
-	expiresAt := xaiStateExpiry(m.state)
-	if !expiresAt.IsZero() && !time.Now().Add(xaiOAuthRefreshSkew).Before(expiresAt) {
-		if err := m.refreshLocked(ctx); err != nil {
-			return "", err
-		}
-	}
-	if strings.TrimSpace(m.state.AccessToken) == "" {
-		return "", fmt.Errorf("xAI OAuth has no usable access token; run anthropic-proxy xai-login")
-	}
-	return m.state.AccessToken, nil
-}
-
-func (m *xaiOAuthManager) refreshAfterUnauthorized(ctx context.Context, failedToken string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if diskState, err := readXAIOAuthState(m.statePath); err == nil && diskState.AccessToken != "" && diskState.AccessToken != failedToken {
-		m.state = diskState
-		return m.state.AccessToken, nil
-	}
-	if m.state.AccessToken == "" {
-		if err := m.loadLocked(); err != nil {
-			return "", err
-		}
-	}
-	if m.state.AccessToken != "" && m.state.AccessToken != failedToken {
-		return m.state.AccessToken, nil
-	}
-	if err := m.refreshLocked(ctx); err != nil {
-		return "", err
-	}
-	return m.state.AccessToken, nil
-}
-
-func (m *xaiOAuthManager) discover(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiOAuthDiscoveryURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("xAI OIDC discovery: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("xAI OIDC discovery returned HTTP %d", resp.StatusCode)
-	}
-	var discovery xaiOIDCDiscovery
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&discovery); err != nil {
-		return "", fmt.Errorf("decode xAI OIDC discovery: %w", err)
-	}
-	if err := validateXAIOrigin(discovery.TokenEndpoint, "token endpoint"); err != nil {
-		return "", err
-	}
-	return discovery.TokenEndpoint, nil
-}
-
-func (m *xaiOAuthManager) postForm(ctx context.Context, endpoint string, values url.Values) (*http.Response, error) {
-	if err := validateXAIOrigin(endpoint, "OAuth endpoint"); err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(values.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	return m.client.Do(req)
-}
-
-func decodeXAITokenResponse(resp *http.Response) (xaiTokenResponse, []byte, error) {
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return xaiTokenResponse{}, nil, err
-	}
-	var token xaiTokenResponse
-	if len(bytes.TrimSpace(body)) > 0 {
-		if err := json.Unmarshal(body, &token); err != nil {
-			return xaiTokenResponse{}, body, fmt.Errorf("decode xAI OAuth response: %w", err)
-		}
-	}
-	return token, body, nil
-}
-
-func (m *xaiOAuthManager) refreshLocked(ctx context.Context) error {
-	if strings.TrimSpace(m.state.RefreshToken) == "" {
-		return errors.New("xAI OAuth refresh token is missing; run anthropic-proxy xai-login")
-	}
-	endpoint := m.state.TokenEndpoint
-	if endpoint == "" {
-		var err error
-		endpoint, err = m.discover(ctx)
-		if err != nil {
-			return err
-		}
-	}
-	resp, err := m.postForm(ctx, endpoint, url.Values{
-		"grant_type":    {"refresh_token"},
-		"client_id":     {xaiOAuthClientID},
-		"refresh_token": {m.state.RefreshToken},
-	})
-	if err != nil {
-		return fmt.Errorf("xAI OAuth refresh: %w", err)
-	}
-	token, body, err := decodeXAITokenResponse(resp)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		detail := firstNonEmpty(token.Description, token.Error, trimForLog(string(body), 240))
-		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			m.state.AccessToken = ""
-			m.state.RefreshToken = ""
-			m.state.LastError = fmt.Sprintf("refresh HTTP %d: %s", resp.StatusCode, detail)
-			_ = writeXAIOAuthState(m.statePath, m.state)
-		}
-		return fmt.Errorf("xAI OAuth refresh returned HTTP %d: %s", resp.StatusCode, detail)
-	}
-	if strings.TrimSpace(token.AccessToken) == "" {
-		return errors.New("xAI OAuth refresh response omitted access_token")
-	}
-	m.state.AccessToken = token.AccessToken
-	if token.RefreshToken != "" {
-		m.state.RefreshToken = token.RefreshToken
-	}
-	if token.IDToken != "" {
-		m.state.IDToken = token.IDToken
-	}
-	m.state.TokenType = firstNonEmpty(token.TokenType, "Bearer")
-	m.state.TokenEndpoint = endpoint
-	m.state.LastRefresh = time.Now().UTC()
-	m.state.LastError = ""
-	if token.ExpiresIn > 0 {
-		m.state.ExpiresAt = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second).UTC()
-	} else {
-		m.state.ExpiresAt = jwtExpiry(token.AccessToken)
-	}
-	return writeXAIOAuthState(m.statePath, m.state)
-}
-
-func runXAIOAuthLogin(ctx context.Context, cfg config, output io.Writer, openBrowser bool) error {
-	var providerName string
-	var provider providerConfig
-	for name, candidate := range cfg.Providers {
-		if candidate.AuthMode == "xai-oauth" {
-			providerName, provider = name, candidate
-			break
-		}
-	}
-	if providerName == "" {
-		return errors.New("proxy config has no xai-oauth provider")
-	}
-	manager := newXAIOAuthManager(provider.AuthStatePath, &http.Client{Timeout: 30 * time.Second})
-	tokenEndpoint, err := manager.discover(ctx)
-	if err != nil {
-		return err
-	}
-	resp, err := manager.postForm(ctx, xaiOAuthDeviceCodeURL, url.Values{
-		"client_id": {xaiOAuthClientID},
-		"scope":     {xaiOAuthScope},
-	})
-	if err != nil {
-		return fmt.Errorf("xAI device authorization: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		return fmt.Errorf("xAI device authorization returned HTTP %d: %s", resp.StatusCode, trimForLog(string(body), 240))
-	}
-	var device xaiDeviceCodeResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&device); err != nil {
-		return fmt.Errorf("decode xAI device authorization: %w", err)
-	}
-	verificationURL := firstNonEmpty(device.VerificationURIComplete, device.VerificationURI)
-	if device.DeviceCode == "" || device.UserCode == "" || verificationURL == "" || device.ExpiresIn <= 0 {
-		return errors.New("xAI device authorization response is incomplete")
-	}
-	fmt.Fprintf(output, "Open: %s\nCode: %s\n", verificationURL, device.UserCode)
-	if openBrowser {
-		if openPath, err := exec.LookPath("open"); err == nil {
-			if err := exec.Command(openPath, verificationURL).Start(); err == nil {
-				fmt.Fprintln(output, "Browser opened. Waiting for approval...")
-			}
-		}
-	}
-	interval := time.Duration(device.Interval) * time.Second
-	if interval < time.Second {
-		interval = time.Second
-	}
-	deadline := time.Now().Add(time.Duration(device.ExpiresIn) * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := manager.postForm(ctx, tokenEndpoint, url.Values{
-			"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
-			"client_id":   {xaiOAuthClientID},
-			"device_code": {device.DeviceCode},
-		})
-		if err != nil {
-			return fmt.Errorf("xAI device token polling: %w", err)
-		}
-		token, body, err := decodeXAITokenResponse(resp)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode == http.StatusOK {
-			if token.AccessToken == "" || token.RefreshToken == "" {
-				return errors.New("xAI device token response omitted required tokens")
-			}
-			state := xaiOAuthState{
-				Version:       xaiOAuthStateVersion,
-				AuthMode:      "oauth_device_code",
-				AccessToken:   token.AccessToken,
-				RefreshToken:  token.RefreshToken,
-				IDToken:       token.IDToken,
-				TokenType:     firstNonEmpty(token.TokenType, "Bearer"),
-				TokenEndpoint: tokenEndpoint,
-				LastRefresh:   time.Now().UTC(),
-			}
-			if token.ExpiresIn > 0 {
-				state.ExpiresAt = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second).UTC()
-			} else {
-				state.ExpiresAt = jwtExpiry(token.AccessToken)
-			}
-			if err := writeXAIOAuthState(provider.AuthStatePath, state); err != nil {
-				return err
-			}
-			fmt.Fprintf(output, "Connected %s. Credentials: %s\n", providerName, provider.AuthStatePath)
-			return nil
-		}
-		switch token.Error {
-		case "authorization_pending":
-		case "slow_down":
-			interval += time.Second
-		default:
-			return fmt.Errorf("xAI device token polling returned HTTP %d: %s", resp.StatusCode, firstNonEmpty(token.Description, token.Error, trimForLog(string(body), 240)))
-		}
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return errors.New("xAI device authorization timed out")
-}
-
-func printXAIOAuthStatus(cfg config, output io.Writer) error {
-	for name, provider := range cfg.Providers {
-		if provider.AuthMode != "xai-oauth" {
-			continue
-		}
-		state, err := readXAIOAuthState(provider.AuthStatePath)
-		if err != nil {
-			return err
-		}
-		expiresAt := xaiStateExpiry(state)
-		fmt.Fprintf(output, "provider=%s connected=%t expiresAt=%s lastRefresh=%s\n", name, state.AccessToken != "" && state.RefreshToken != "", expiresAt.UTC().Format(time.RFC3339), state.LastRefresh.UTC().Format(time.RFC3339))
-		return nil
-	}
-	return errors.New("proxy config has no xai-oauth provider")
 }
 
 func (s *proxyServer) applyProviderHeaders(providerName string, headers http.Header) error {
@@ -8732,13 +8530,16 @@ func (s *proxyServer) applyProviderHeadersContext(ctx context.Context, providerN
 	var token string
 	var configured bool
 	var err error
-	if provider.AuthMode == "xai-oauth" {
+	if provider.AuthMode == "kimi-code-oauth" {
 		configured = true
-		manager := s.xaiOAuth[providerName]
+		manager := s.kimiOAuth[providerName]
 		if manager == nil {
-			err = errors.New("xAI OAuth manager is unavailable")
+			err = errors.New("Kimi OAuth manager is unavailable")
 		} else {
 			token, err = manager.accessToken(ctx)
+			if err == nil {
+				err = manager.deviceHeaders(headers)
+			}
 		}
 	} else {
 		token, configured, err = providerAuthToken(providerName, provider)
@@ -8937,6 +8738,7 @@ func contextOverflowBody(body []byte) bool {
 		"context limit",
 		"too many tokens",
 		"maximum context",
+		"model token limit",
 		"input length and `max_tokens` exceed context limit",
 	} {
 		if strings.Contains(text, needle) {
@@ -9011,6 +8813,14 @@ func providerSpecificRequestIncompatibility(status int, body []byte) bool {
 	if strings.Contains(text, "deferred custom tools are only supported") && strings.Contains(text, "implement deferral") {
 		return true
 	}
+	// Bare generic rejections carry no actionable detail: some providers
+	// (e.g. Kimi Code) answer an unsupported content block such as a PDF
+	// document or encrypted web-search results with an unexplained
+	// invalid_request_error. That is a route capability gap, not a
+	// malformed request — try the next leg.
+	if strings.Contains(text, "invalid request error") || strings.Contains(text, "ciphertext too short") {
+		return true
+	}
 	capability := strings.Contains(text, "image input") || strings.Contains(text, "vision") ||
 		strings.Contains(text, "tool choice") || strings.Contains(text, "structured output")
 	parameter := strings.Contains(text, "temperature") || strings.Contains(text, "parameter") ||
@@ -9045,17 +8855,58 @@ func classifyFallbackBody(body []byte) string {
 	return "availability"
 }
 
-func providerCooldown(headers http.Header, body []byte) time.Duration {
-	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
-		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
-			return time.Duration(seconds) * time.Second
-		}
-		if resetAt, err := http.ParseTime(raw); err == nil && resetAt.After(time.Now()) {
-			return time.Until(resetAt)
+const temporaryRateLimitReason = "rate_limited"
+
+// providerFailureReason separates a retryable provider throttle from a real
+// account/billing limit. Generic 429s must not make an account appear FULL.
+func providerFailureReason(status int, headers http.Header, body []byte) string {
+	text := strings.ToLower(string(body))
+	hardQuota := status == http.StatusPaymentRequired || unifiedQuotaRejected(headers) || hardQuotaBody(text)
+	if hardQuota {
+		return "quota_or_rate_limit"
+	}
+	if status == http.StatusTooManyRequests || genericRateLimitBody(text) {
+		return temporaryRateLimitReason
+	}
+	return classifyFallbackBody(body)
+}
+
+func unifiedQuotaRejected(headers http.Header) bool {
+	return strings.EqualFold(strings.TrimSpace(headers.Get("Anthropic-Ratelimit-Unified-5h-Status")), "rejected") ||
+		strings.EqualFold(strings.TrimSpace(headers.Get("Anthropic-Ratelimit-Unified-7d-Status")), "rejected")
+}
+
+func hardQuotaBody(text string) bool {
+	for _, needle := range []string{
+		"usage limit", "5 hour", "5-hour", "weekly limit", "monthly limit",
+		"quota", "billing", "credit", "exhausted", "insufficient", "使用上限", "[1308]",
+	} {
+		if strings.Contains(text, needle) {
+			return true
 		}
 	}
-	if resetAt, ok := resetTimestampFromBody(string(body)); ok && resetAt.After(time.Now()) {
-		return time.Until(resetAt)
+	return false
+}
+
+func genericRateLimitBody(text string) bool {
+	return strings.Contains(text, "rate limit") || strings.Contains(text, "rate_limit") ||
+		strings.Contains(text, "too many requests")
+}
+
+func providerCooldownForReason(reason string, headers http.Header, body []byte) time.Duration {
+	if duration, known := explicitProviderCooldown(headers, body); known {
+		return duration
+	}
+	cooldown := providerCooldown(headers, body)
+	if reason == temporaryRateLimitReason && cooldown > 2*time.Minute {
+		return 2 * time.Minute
+	}
+	return cooldown
+}
+
+func providerCooldown(headers http.Header, body []byte) time.Duration {
+	if duration, known := explicitProviderCooldown(headers, body); known {
+		return duration
 	}
 	text := strings.ToLower(string(body))
 	if strings.Contains(text, "usage limit") || strings.Contains(text, "rate limit") || strings.Contains(text, "rate_limit") || strings.Contains(text, "quota") || strings.Contains(text, "exhausted") || strings.Contains(text, "insufficient") {
@@ -9175,7 +9026,9 @@ func streamIdleTimeout(provider providerConfig) time.Duration {
 }
 
 type streamStats struct {
+	Usage                      usageTelemetry
 	ReportedBackend            atomic.Value // Explicit upstream-reported identifier, never inferred.
+	ReportedModel              atomic.Value
 	InputEstimated             atomic.Bool
 	CacheReadTokens            atomic.Int64
 	CacheWriteTokens           atomic.Int64
@@ -9200,6 +9053,14 @@ type streamStats struct {
 func recordReportedBackend(stats *streamStats, payload map[string]any) {
 	if stats == nil {
 		return
+	}
+	model, _ := payload["model"].(string)
+	if message, ok := payload["message"].(map[string]any); ok && model == "" {
+		model, _ = message["model"].(string)
+	}
+	// Capture before client aliases are rewritten. Model IDs may contain '/'.
+	if stats.ReportedModel.Load() == nil && len(model) > 0 && len(model) <= 160 && strings.IndexFunc(model, func(r rune) bool { return r < 33 || r > 126 }) < 0 {
+		stats.ReportedModel.Store(model)
 	}
 	name, _ := payload["provider"].(string)
 	if name == "" {
@@ -9384,13 +9245,17 @@ type bufferedReadCloser struct {
 	reader *strings.Reader
 }
 
-func newJSONFilterReadCloser(source io.ReadCloser, dropTypes map[string]bool, responseAlias string) io.ReadCloser {
+func newJSONFilterReadCloser(source io.ReadCloser, dropTypes map[string]bool, responseAlias string, telemetry ...*streamStats) io.ReadCloser {
 	body, err := io.ReadAll(source)
 	if err != nil {
 		return &bufferedReadCloser{source: source, reader: strings.NewReader(string(body))}
 	}
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) == nil {
+		if len(telemetry) > 0 && telemetry[0] != nil {
+			telemetry[0].Usage.observeAnthropic(payload)
+			recordReportedBackend(telemetry[0], payload)
+		}
 		setResponseModelAlias(payload, responseAlias)
 		if content, ok := payload["content"].([]any); ok {
 			payload["content"] = filterContentBlocks(content, dropTypes)
@@ -9542,6 +9407,8 @@ func filterSSE(source io.Reader, writer io.Writer, dropTypes map[string]bool, in
 			_, _ = io.WriteString(writer, formatSSEEvent("error", `{"type":"error","error":{"type":"api_error","message":`+strconv.Quote("malformed upstream Anthropic SSE: "+validationErr.Error())+`}}`))
 			return fmt.Errorf("malformed Anthropic SSE: %w", validationErr)
 		}
+		// Upstream activity counts even when thinking is filtered from client output.
+		watchdog.activity()
 		out, eventType, stopReason, _, outputTokens := filterSSEEvent(lines, state, dropTypes, inputTokenHint, responseAlias, stats)
 		lines = nil
 		if eventType == "" {
@@ -9585,7 +9452,6 @@ func filterSSE(source io.Reader, writer io.Writer, dropTypes map[string]bool, in
 				stats.Events.Add(1)
 				stats.noteEvent()
 			}
-			watchdog.activity()
 		}
 		_, err := io.WriteString(writer, out)
 		return err
@@ -9597,6 +9463,7 @@ func filterSSE(source io.Reader, writer io.Writer, dropTypes map[string]bool, in
 		if len(line) > 0 {
 			if strings.TrimRight(line, "\r\n") == "" {
 				if len(lines) == 0 {
+					watchdog.activity()
 					// Standalone blank line (keep-alive): forward verbatim so the
 					// client sees liveness during long generation pauses.
 					if _, writeErr := io.WriteString(writer, line); writeErr != nil {
@@ -9655,8 +9522,7 @@ var anthropicSSEEventTypes = map[string]bool{
 }
 
 // validateAnthropicSSEEvent rejects wire data that Claude Code cannot safely
-// interpret. Comment-only frames remain valid keep-alives, but they do not
-// reset the event watchdog.
+// interpret. Comment-only frames remain valid keep-alives and reset the idle watchdog.
 func validateAnthropicSSEEvent(lines []string, sawMessageStart, sawTerminal bool) (string, error) {
 	eventName := ""
 	dataLines := []string{}
@@ -9756,6 +9622,7 @@ func filterSSEEvent(lines []string, state *sseFilterState, dropTypes map[string]
 	if len(telemetry) > 0 && telemetry[0] != nil {
 		stats := telemetry[0]
 		recordReportedBackend(stats, payload)
+		stats.Usage.observeAnthropic(payload)
 		usage, _ := payload["usage"].(map[string]any)
 		if message, ok := payload["message"].(map[string]any); ok {
 			if nested, ok := message["usage"].(map[string]any); ok {
@@ -10388,6 +10255,9 @@ func translateOpenAIStreamWithStats(source io.Reader, writer io.Writer, response
 		}
 		chunk = unwrapOpenAIEnvelope(chunk)
 		recordReportedBackend(stats, chunk)
+		if stats != nil {
+			stats.Usage.observeOpenAI(chunk)
+		}
 		if errPayload, ok := chunk["error"].(map[string]any); ok {
 			// Upstream sent an OpenAI-shaped error mid-stream (or as the whole
 			// response body with a 200 status): surface it as an Anthropic
@@ -10717,6 +10587,14 @@ func newOpenAIJSONReadCloser(source io.ReadCloser, responseAlias string) io.Read
 
 func newOpenAIJSONReadCloserWithStats(source io.ReadCloser, responseAlias string, stats *streamStats) io.ReadCloser {
 	body, err := io.ReadAll(source)
+	if stats != nil {
+		var original map[string]any
+		if json.Unmarshal(body, &original) == nil {
+			original = unwrapOpenAIEnvelope(original)
+			stats.Usage.observeOpenAI(original)
+			recordReportedBackend(stats, original)
+		}
+	}
 	if err != nil {
 		return &bufferedReadCloser{source: source, reader: strings.NewReader(string(body))}
 	}

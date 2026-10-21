@@ -236,10 +236,9 @@ func TestBrowserUsageFeedsHeadroomAndRetainsKnownExhaustion(t *testing.T) {
 		"version":1,
 		"updatedAt":%q,
 		"providers":{
-			"opencode-go":{"source":"ego-browser","status":"ok","fetchedAt":%q,"utilization":1,"windows":{"weekly":{"percentUsed":100}}},
-			"commandcode":{"source":"ego-browser","status":"ok","fetchedAt":%q,"utilization":0.73,"windows":{"weekly":{"percentUsed":73}}}
+			"opencode-go":{"source":"ego-browser","status":"ok","fetchedAt":%q,"utilization":1,"windows":{"weekly":{"percentUsed":100}}}
 		}
-	}`, now.Format(time.RFC3339), now.Format(time.RFC3339), now.Format(time.RFC3339))
+	}`, now.Format(time.RFC3339), now.Format(time.RFC3339))
 	if err := os.WriteFile(usagePath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +247,6 @@ func TestBrowserUsageFeedsHeadroomAndRetainsKnownExhaustion(t *testing.T) {
 		Providers: map[string]providerConfig{
 			"opencode-go":           {BaseURL: "https://opencode.example"},
 			"opencode-go-anthropic": {BaseURL: "https://opencode.example"},
-			"commandcode":           {BaseURL: "https://command.example"},
 		},
 		Metrics: metricsConfig{Path: filepath.Join(tempDir, "proxy-metrics.jsonl")},
 	})
@@ -265,9 +263,6 @@ func TestBrowserUsageFeedsHeadroomAndRetainsKnownExhaustion(t *testing.T) {
 		if exhausted, reason := server.browserUsageExhausted(provider); !exhausted || reason != "browser_usage_limit_exhausted" {
 			t.Fatalf("%s exhausted = %v %q, want true browser limit", provider, exhausted, reason)
 		}
-	}
-	if got, known := server.providerUsageUtilization("commandcode"); !known || got != 0.73 {
-		t.Fatalf("commandcode utilization = %.2f known=%v, want 0.73 true", got, known)
 	}
 
 	server.clockNow = func() time.Time { return now.Add(browserUsageFreshDuration + time.Second) }
@@ -436,6 +431,8 @@ func TestClaudeAccountAutoSelectionBalancesUnifiedPoolAndSticks(t *testing.T) {
 }
 
 func TestClaudeAccountStickinessBreaksForMaterialHeadroom(t *testing.T) {
+	// Pin-until-broken: a materially worse but still-eligible pinned account
+	// keeps the conversation — the pin only breaks on unavailability.
 	sticky := claudeUsageProfile{Name: "sticky", CredentialsService: "sticky-service"}
 	idle := claudeUsageProfile{Name: "idle", CredentialsService: "idle-service"}
 	server := &proxyServer{
@@ -443,19 +440,32 @@ func TestClaudeAccountStickinessBreaksForMaterialHeadroom(t *testing.T) {
 		claudeAccounts:        map[string]claudeAccountSticky{"conversation": {Profile: sticky, Until: time.Now().Add(time.Minute)}},
 		claudeAccountInFlight: map[string]int{},
 	}
-	chosen, _, _ := server.chooseClaudeAccount([]availableClaudeAccount{
+	chosen, _, changed := server.chooseClaudeAccount([]availableClaudeAccount{
 		{profile: sticky, snapshot: claudeUsageSnapshot{FiveHour: claudeUsageWindow{Utilization: 72}, SevenDay: claudeUsageWindow{Utilization: 40}}},
 		{profile: idle, snapshot: claudeUsageSnapshot{FiveHour: claudeUsageWindow{Utilization: 10}, SevenDay: claudeUsageWindow{Utilization: 20}}},
 	}, "conversation", sticky, false)
-	if chosen.profile.Name != "idle" {
-		t.Fatalf("chosen profile = %q, want materially healthier account", chosen.profile.Name)
+	if chosen.profile.Name != "sticky" {
+		t.Fatalf("chosen profile = %q, want pinned account to hold", chosen.profile.Name)
+	}
+	if changed {
+		t.Fatal("pin must not report changed while the pinned account can serve")
+	}
+	if lease := server.claudeAccounts["conversation"]; lease.Profile.Name != "sticky" {
+		t.Fatalf("lease = %#v, want pinned account", lease)
+	}
+	// Pin breaks only when the pinned account is not eligible at all.
+	chosen, _, changed = server.chooseClaudeAccount([]availableClaudeAccount{
+		{profile: idle, snapshot: claudeUsageSnapshot{FiveHour: claudeUsageWindow{Utilization: 10}, SevenDay: claudeUsageWindow{Utilization: 20}}},
+	}, "conversation", sticky, false)
+	if chosen.profile.Name != "idle" || !changed {
+		t.Fatalf("unavailable pin must move: chosen=%q changed=%t", chosen.profile.Name, changed)
 	}
 	if lease := server.claudeAccounts["conversation"]; lease.Profile.Name != "idle" {
-		t.Fatalf("lease = %#v, want switched account", lease)
+		t.Fatalf("lease after broken pin = %#v, want re-pinned account", lease)
 	}
 }
 
-func TestClaudeAccountReservationsSpreadParallelRequestsAndPreserveStickyLease(t *testing.T) {
+func TestClaudeAccountReservationsPreservePinUnderParallelLoad(t *testing.T) {
 	const (
 		primaryService = "test-claude-primary-account-reservation"
 		secondService  = "test-claude-second-account-reservation"
@@ -510,17 +520,19 @@ func TestClaudeAccountReservationsSpreadParallelRequestsAndPreserveStickyLease(t
 	if !ok || firstProfile.Name != "primary" {
 		t.Fatalf("first profile = %#v ok=%v, want primary", firstProfile, ok)
 	}
+	// Pin-until-broken: a parallel request on the same conversation stays on
+	// the pinned account — spilling it would cold-write a second cache.
 	second, releaseSecond := server.bindClaudeAccount(context.Background(), request, selected, payload, true)
 	secondProfile, ok := selectedClaudeProfile(second)
-	if !ok || secondProfile.Name != "backup" {
-		t.Fatalf("parallel profile = %#v ok=%v, want idle backup", secondProfile, ok)
+	if !ok || secondProfile.Name != "primary" {
+		t.Fatalf("parallel profile = %#v ok=%v, want pinned primary", secondProfile, ok)
 	}
 	if lease := server.claudeAccounts[stickyKey]; lease.Profile.Name != "primary" {
-		t.Fatalf("parallel spill changed sticky lease to %#v, want primary", lease)
+		t.Fatalf("parallel request changed sticky lease to %#v, want primary", lease)
 	}
 	attempts := server.expandClaudeAccountAttempts(first, []modelConfig{selected}, selected)
-	if len(attempts) != 3 || attempts[0].profile.Name != "primary" || attempts[1].profile.Name != "third" || attempts[2].profile.Name != "backup" {
-		t.Fatalf("replacement order = %#v, want selected primary then idle third then busy backup", attempts)
+	if len(attempts) != 3 || attempts[0].profile.Name != "primary" || attempts[1].profile.Name != "backup" || attempts[2].profile.Name != "third" {
+		t.Fatalf("replacement order = %#v, want selected primary then lowest-usage backup then third", attempts)
 	}
 
 	releaseSecond()
@@ -530,6 +542,104 @@ func TestClaudeAccountReservationsSpreadParallelRequestsAndPreserveStickyLease(t
 	thirdProfile, ok := selectedClaudeProfile(third)
 	if !ok || thirdProfile.Name != "primary" {
 		t.Fatalf("post-release profile = %#v ok=%v, want sticky primary", thirdProfile, ok)
+	}
+}
+
+func TestClaudeAccountTransportBlipSkipsRemainingProfiles(t *testing.T) {
+	const (
+		primaryService = "test-claude-primary-account-blip"
+		secondService  = "test-claude-second-account-blip"
+		thirdService   = "test-claude-third-account-blip"
+	)
+	claudeOAuthCredentials.Store(primaryService, cachedClaudeOAuthCredential{token: "sk-ant-oat-test-primary-blip", fetchedAt: time.Now()})
+	claudeOAuthCredentials.Store(secondService, cachedClaudeOAuthCredential{token: "sk-ant-oat-test-second-blip", fetchedAt: time.Now()})
+	claudeOAuthCredentials.Store(thirdService, cachedClaudeOAuthCredential{token: "sk-ant-oat-test-third-blip", fetchedAt: time.Now()})
+	t.Cleanup(func() {
+		claudeOAuthCredentials.Delete(primaryService)
+		claudeOAuthCredentials.Delete(secondService)
+		claudeOAuthCredentials.Delete(thirdService)
+	})
+
+	var anthropicConns int32
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/oauth/usage") {
+			_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":5},"seven_day":{"utilization":20}}`)
+			return
+		}
+		// Kill the TCP connection: a transport error, never an HTTP status.
+		atomic.AddInt32(&anthropicConns, 1)
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		}
+	}))
+	defer anthropic.Close()
+
+	kimi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","model":"moonshotai/kimi-k3","content":[]}`))
+	}))
+	defer kimi.Close()
+
+	server, err := newProxyServer(config{
+		Providers: map[string]providerConfig{
+			"anthropic": {BaseURL: anthropic.URL},
+			"kimi":      {BaseURL: kimi.URL},
+		},
+		ClaudeUsage: claudeUsageConfig{
+			Provider: "anthropic", AutoSelectAccounts: true, AccountStickySeconds: 300,
+			EligibleUpstreams:    []string{"claude-fable-5"},
+			FiveHourThresholdPct: 95, SevenDayThresholdPct: 95, CacheTTLSeconds: 300,
+			StaleTTLSeconds: 1800, RequestTimeoutMS: 1000,
+			AccountPool: []string{"primary", "backup", "third"},
+			AccountProfiles: map[string]claudeUsageProfile{
+				"primary": testClaudeProfile(t, "primary", primaryService, "primary-blip"),
+				"backup":  testClaudeProfile(t, "backup", secondService, "second-blip"),
+				"third":   testClaudeProfile(t, "third", thirdService, "third-blip"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := modelConfig{
+		Provider: "anthropic", Upstream: "claude-fable-5", Requested: "claude-fable-5",
+		Fallbacks: []modelConfig{{Provider: "kimi", Upstream: "moonshotai/kimi-k3", ResponseAlias: "kimi-k3[1m]"}},
+	}
+	body := []byte(`{"model":"claude-fable-5","messages":[{"role":"user","content":"hello"}]}`)
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:48104/v1/messages", nil)
+	bound, release := server.bindClaudeAccount(context.Background(), request, selected, payload, true)
+	defer release()
+	pinned := ""
+	if p, ok := selectedClaudeProfile(bound); ok {
+		pinned = p.Name
+	}
+	if pinned == "" {
+		t.Fatal("no account pinned for the conversation")
+	}
+
+	upstream, err := server.doWithFallbacks(context.Background(), bound, body, payload, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.resp.Body.Close()
+	if upstream.providerName != "kimi" || upstream.resp.StatusCode != http.StatusOK {
+		t.Fatalf("upstream = %q status=%d, want kimi 200", upstream.providerName, upstream.resp.StatusCode)
+	}
+	// One host, one blip: the pinned account failed at transport level, so the
+	// remaining pool accounts must not be tried — and the pin must not move.
+	if got := atomic.LoadInt32(&anthropicConns); got != 1 {
+		t.Fatalf("anthropic connections = %d, want 1 (remaining profiles skipped)", got)
+	}
+	if lease := server.claudeAccounts[routingStickyKey(selected, payload)]; lease.Profile.Name != pinned {
+		t.Fatalf("lease moved to %q after a transport blip, want pinned %q", lease.Profile.Name, pinned)
+	}
+	if server.circuitOpen("anthropic@"+pinned, selected) {
+		t.Fatal("transport blip tripped the pinned account's circuit")
 	}
 }
 
@@ -1431,6 +1541,86 @@ func TestClaudeRefreshOutcomeRequiresFreshUsableProfileStatus(t *testing.T) {
 	}
 	if _, _, err := server.validateClaudeScheduledRefreshOutcome(started.Add(time.Second)); err == nil {
 		t.Fatal("stale refresh status accepted")
+	}
+}
+
+func TestClaudeCredentialQuarantineAfterRepeatedRefreshFailures(t *testing.T) {
+	profile := testClaudeProfile(t, "primary", "service-quarantine", "quarantine")
+	server := &proxyServer{
+		cfg: config{ClaudeUsage: claudeUsageConfig{
+			Provider:         "anthropic",
+			ListenerProfiles: map[string]claudeUsageProfile{"48104": profile},
+		}},
+		providerStates: map[string]providerRuntimeState{},
+	}
+	for i := 1; i < claudeCredentialQuarantineThreshold; i++ {
+		server.noteClaudeCredentialRefreshResult(profile, false)
+		if blocked, _ := server.providerBlockForCandidate("anthropic@primary", modelConfig{}); blocked {
+			t.Fatalf("account quarantined after %d consecutive refresh failures", i)
+		}
+	}
+	server.noteClaudeCredentialRefreshResult(profile, false)
+	blocked, state := server.providerBlockForCandidate("anthropic@primary", modelConfig{})
+	if !blocked || state.Reason != "auth_quarantined" {
+		t.Fatalf("blocked=%v state=%#v", blocked, state)
+	}
+	server.noteClaudeCredentialRefreshResult(profile, true)
+	if blocked, _ := server.providerBlockForCandidate("anthropic@primary", modelConfig{}); blocked {
+		t.Fatal("quarantine persisted after successful refresh")
+	}
+	server.noteClaudeCredentialRefreshResult(profile, false)
+	if blocked, _ := server.providerBlockForCandidate("anthropic@primary", modelConfig{}); blocked {
+		t.Fatal("quarantine counter survived a successful refresh")
+	}
+}
+
+func TestClaudeScheduledRefreshReconcilesCredentialQuarantine(t *testing.T) {
+	directory := t.TempDir()
+	statusPath := filepath.Join(directory, "status.json")
+	primary := testClaudeProfile(t, "primary", "service-reconcile-primary", "reconcile-primary")
+	dead := testClaudeProfile(t, "dead", "service-reconcile-dead", "reconcile-dead")
+	server := &proxyServer{
+		cfg: config{ClaudeUsage: claudeUsageConfig{
+			Provider:         "anthropic",
+			ListenerProfiles: map[string]claudeUsageProfile{"48104": primary},
+			AccountProfiles:  map[string]claudeUsageProfile{"dead": dead},
+		}},
+		claudeRefreshStatus: statusPath,
+		providerStates:      map[string]providerRuntimeState{},
+	}
+	started := time.Now().UTC().Truncate(time.Second)
+	writeStatus := func(generatedAt time.Time, deadState string, remaining int64) {
+		status := fmt.Sprintf(`{"generatedAt":%q,"profiles":{"primary":{"state":"valid","remainingSeconds":3600},"dead":{"state":%q,"remainingSeconds":%d,"error":"claude_cli_failed"}}}`, generatedAt.Format(time.RFC3339), deadState, remaining)
+		if err := os.WriteFile(statusPath, []byte(status), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeStatus(started, "refresh_failed", -1)
+	for i := 0; i < claudeCredentialQuarantineThreshold; i++ {
+		server.reconcileClaudeCredentialQuarantine(started)
+	}
+	blocked, state := server.providerBlockForCandidate("anthropic@dead", modelConfig{})
+	if !blocked || state.Reason != "auth_quarantined" {
+		t.Fatalf("blocked=%v state=%#v", blocked, state)
+	}
+	if blocked, _ := server.providerBlockForCandidate("anthropic@primary", modelConfig{}); blocked {
+		t.Fatal("healthy account quarantined")
+	}
+	server.claudeRefreshMu.Lock()
+	strikes := server.claudeRefreshFailures["dead"]
+	server.claudeRefreshMu.Unlock()
+	server.reconcileClaudeCredentialQuarantine(started.Add(time.Second))
+	server.claudeRefreshMu.Lock()
+	if server.claudeRefreshFailures["dead"] != strikes {
+		server.claudeRefreshMu.Unlock()
+		t.Fatal("stale refresh status added a quarantine strike")
+	}
+	server.claudeRefreshMu.Unlock()
+	recoveredAt := time.Now().UTC()
+	writeStatus(recoveredAt, "refreshed", 3600)
+	server.reconcileClaudeCredentialQuarantine(recoveredAt)
+	if blocked, _ := server.providerBlockForCandidate("anthropic@dead", modelConfig{}); blocked {
+		t.Fatal("recovered credential stayed quarantined")
 	}
 }
 
@@ -2580,6 +2770,27 @@ func TestNormalizeRequestRepairsCrossModelToolIDs(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequestDropsEmptyTextBlocks(t *testing.T) {
+	server := &proxyServer{cfg: config{
+		Normalize: normalizeConfig{UnsupportedContentTypes: map[string]string{"tool_reference": "text"}},
+		Models:    map[string]modelConfig{"fable": {Provider: "anthropic"}},
+	}}
+	body := []byte(`{"model":"fable","messages":[{"role":"user","content":[{"type":"text","text":""},{"type":"text","text":"hi"},{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":""},{"type":"text","text":"ok"}]}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	_, payload, _, err := server.normalizeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := payload["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("top-level blocks = %d, want 2: %v", len(content), content)
+	}
+	nested := content[1].(map[string]any)["content"].([]any)
+	if len(nested) != 1 || nested[0].(map[string]any)["text"] != "ok" {
+		t.Fatalf("nested blocks = %v, want single non-empty text", nested)
+	}
+}
+
 func TestProxyRejectsUnknownModelBeforeUpstreamIO(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2636,7 +2847,7 @@ func TestExplicitDirectFamilyUsesCostPhases(t *testing.T) {
 	server := &proxyServer{
 		cfg: config{ClaudeUsage: claudeUsageConfig{Provider: "anthropic"}, AdaptiveRouting: adaptiveRoutingConfig{
 			Enabled: true, MinSamples: 4, RefreshSeconds: 60, ExploreEvery: 1000,
-			ProviderTiers: map[string]int{"subscription": 0, "xai-oauth": 90, "paygo": 100, "other-sub": 10},
+			ProviderTiers: map[string]int{"subscription": 0, "alternate-sub": 90, "paygo": 100, "other-sub": 10},
 		}},
 		adaptive:       adaptiveState{performance: map[string]routePerformance{}, refreshedAt: time.Now(), sticky: map[string]stickyRoute{}},
 		providerStates: map[string]providerRuntimeState{},
@@ -2645,12 +2856,12 @@ func TestExplicitDirectFamilyUsesCostPhases(t *testing.T) {
 	candidates := []modelConfig{
 		{Provider: "paygo", Upstream: "deepseek-v4-flash"},
 		{Provider: "other-sub", Upstream: "glm-5.3-flash"},
-		{Provider: "xai-oauth", Upstream: "grok-build-0.1"},
+		{Provider: "alternate-sub", Upstream: "glm-5.3-flash"},
 		selected,
 	}
 	ranked := server.rankCandidates(selected, candidates)
 	got := []string{ranked[0].Provider, ranked[1].Provider, ranked[2].Provider, ranked[3].Provider}
-	want := []string{"subscription", "xai-oauth", "paygo", "other-sub"}
+	want := []string{"subscription", "paygo", "other-sub", "alternate-sub"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("providers=%v, want %v", got, want)
 	}
@@ -2789,7 +3000,7 @@ func TestAdaptiveRoutingKeepsEstablishedModelFamilyBeforePayGoAlternatives(t *te
 		{Provider: "ollama", Upstream: "deepseek-v4-flash:cloud"},
 		{Provider: "vercel-glm", Upstream: "zai/glm-5.3-flash"},
 	}
-	ranked := server.rankCandidatesForRequest(modelConfig{Requested: "sonnet"}, candidates, "conversation", false, thinkingHistoryNonAnthropic)
+	ranked := server.rankCandidatesForRequest(modelConfig{Requested: "sonnet"}, candidates, "conversation", false, thinkingHistoryNonAnthropic, taskRouteHint{})
 	if got := []string{ranked[0].Provider, ranked[1].Provider, ranked[2].Provider}; !reflect.DeepEqual(got, []string{"bigmodel", "vercel-glm", "ollama"}) {
 		t.Fatalf("providers = %#v, want same-family GLM chain before DeepSeek", got)
 	}
@@ -2819,7 +3030,7 @@ func TestSignedHistoryAnchorsSameFamilyOnFirstRequestAfterRestart(t *testing.T) 
 		{Provider: "cline", Upstream: "deepseek-v4-flash"},
 		{Provider: "vercel-glm", Upstream: "zai/glm-5.3-flash"},
 	}
-	ranked := server.rankCandidatesForRequest(modelConfig{Requested: "sonnet"}, candidates, "new-after-restart", false, thinkingHistoryNonAnthropic)
+	ranked := server.rankCandidatesForRequest(modelConfig{Requested: "sonnet"}, candidates, "new-after-restart", false, thinkingHistoryNonAnthropic, taskRouteHint{})
 	if got := []string{ranked[0].Provider, ranked[1].Provider}; !reflect.DeepEqual(got, []string{"bigmodel", "vercel-glm"}) {
 		t.Fatalf("providers = %#v, want immediate same-family GLM fallback", got)
 	}
@@ -3059,7 +3270,7 @@ func TestRoutePerformanceExcludesQuotaAndPolicySkips(t *testing.T) {
 		{Timestamp: time.Now().Add(-time.Second).Format(time.RFC3339Nano), Provider: "ollama", Upstream: "deepseek", Status: 200, Success: true, LatencyMS: 800, TokensPerSecond: 60},
 		{Timestamp: time.Now().Format(time.RFC3339Nano), Provider: "anthropic", Upstream: "sonnet", FailureReason: "claude_five_hour_reserve"},
 		{Timestamp: time.Now().Format(time.RFC3339Nano), Provider: "anthropic", Upstream: "sonnet", FailureReason: "provider_wide_outage"},
-		{Timestamp: time.Now().Format(time.RFC3339Nano), Provider: "commandcode", Upstream: "deepseek", FailureReason: "browser_usage_exhausted"},
+		{Timestamp: time.Now().Format(time.RFC3339Nano), Provider: "opencode-go", Upstream: "deepseek", FailureReason: "browser_usage_exhausted"},
 		{Timestamp: time.Now().Format(time.RFC3339Nano), Provider: "bigmodel", Upstream: "glm", Status: 400, FailureReason: "thinking_signature_mismatch"},
 	}
 	performance := buildRoutePerformance(samples)
@@ -3073,8 +3284,8 @@ func TestRoutePerformanceExcludesQuotaAndPolicySkips(t *testing.T) {
 	if _, exists := performance["bigmodel|glm"]; exists {
 		t.Fatalf("thinking compatibility skip entered route performance: %#v", performance["bigmodel|glm"])
 	}
-	if _, exists := performance["commandcode|deepseek"]; exists {
-		t.Fatalf("browser usage skip entered route performance: %#v", performance["commandcode|deepseek"])
+	if _, exists := performance["opencode-go|deepseek"]; exists {
+		t.Fatalf("browser usage skip entered route performance: %#v", performance["opencode-go|deepseek"])
 	}
 }
 
@@ -3127,8 +3338,13 @@ func TestClaudeTransportNeedsTwoProfilesBeforeRequestWideShortCircuit(t *testing
 	}
 }
 
-func TestClaudeTransportTimeoutContinuesToNextAccount(t *testing.T) {
+func TestClaudeTransportTimeoutDoesNotIterateAccounts(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls[r.Header.Get("Authorization")]++
+		mu.Unlock()
 		if r.Header.Get("Authorization") == "Bearer token-one" {
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -3180,13 +3396,18 @@ func TestClaudeTransportTimeoutContinuesToNextAccount(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	body := []byte(`{"model":"claude-opus-4-8","messages":[],"max_tokens":1}`)
 	selected := modelConfig{Requested: "claude-opus-4-8", Provider: "anthropic", Upstream: "claude-opus-4-8"}
+	// A TTFB timeout is transport-class: every pool account shares one host,
+	// so iterating accounts is pointless and would re-pin the lease. The
+	// single-leg chain simply fails.
 	result, err := server.doWithFallbacks(context.Background(), request, body, map[string]any{"model": selected.Requested}, selected)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		_ = result.resp.Body.Close()
+		t.Fatal("expected failure after the only leg's transport timeout")
 	}
-	defer result.resp.Body.Close()
-	if result.model.ClaudeProfile != profileTwo.Name || result.attempt != 1 {
-		t.Fatalf("result profile=%q attempt=%d, want second account attempt 1", result.model.ClaudeProfile, result.attempt)
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["Bearer token-one"] != 1 || calls["Bearer token-two"] != 0 {
+		t.Fatalf("calls = %v, want token-one tried once, token-two never", calls)
 	}
 }
 
@@ -3207,8 +3428,8 @@ func TestFallbackChainBudgetAndFreeRouteReserve(t *testing.T) {
 	server := &proxyServer{}
 	trace := requestTrace{CandidateCount: len(attempts), ChainStarted: time.Now(), ChainBudget: time.Minute}
 	first, deferred := server.remainingAttemptHeaderBudget(trace, attempts, 0, "anthropic")
-	if deferred || first > 50*time.Second || first < 49*time.Second {
-		t.Fatalf("first budget = %s deferred=%v, want about 50s with free-route reserve", first, deferred)
+	if deferred || first > 35*time.Second || first < 34*time.Second {
+		t.Fatalf("first budget = %s deferred=%v, want about 35s with free-route reserve", first, deferred)
 	}
 	lastFree, deferred := server.remainingAttemptHeaderBudget(trace, attempts, 1, "bigmodel")
 	if deferred || lastFree < 59*time.Second {
@@ -3286,6 +3507,38 @@ func TestProviderCooldownTreatsRateLimitAsExtended(t *testing.T) {
 		if got := providerCooldown(http.Header{}, body); got != 5*time.Minute {
 			t.Fatalf("body=%s cooldown=%s, want 5m", body, got)
 		}
+	}
+}
+
+func TestProviderFailureReasonSeparatesThrottleFromQuota(t *testing.T) {
+	if got := providerFailureReason(http.StatusTooManyRequests, http.Header{}, []byte(`{"error":{"message":"rate limit"}}`)); got != temporaryRateLimitReason {
+		t.Fatalf("generic 429 reason = %q, want %q", got, temporaryRateLimitReason)
+	}
+	if got := providerFailureReason(http.StatusTooManyRequests, http.Header{"Anthropic-Ratelimit-Unified-5h-Status": []string{"rejected"}}, nil); got != "quota_or_rate_limit" {
+		t.Fatalf("rejected usage header reason = %q, want quota", got)
+	}
+	if got := providerFailureReason(http.StatusTooManyRequests, http.Header{}, []byte(`{"error":{"message":"usage limit reached"}}`)); got != "quota_or_rate_limit" {
+		t.Fatalf("usage-limit body reason = %q, want quota", got)
+	}
+	if got := providerFailureReason(http.StatusBadRequest, http.Header{}, []byte(`{"error":{"type":"rate_limit_error"}}`)); got != temporaryRateLimitReason {
+		t.Fatalf("rate-limit body reason = %q, want %q", got, temporaryRateLimitReason)
+	}
+	server := &proxyServer{cfg: config{ClaudeUsage: claudeUsageConfig{Provider: "anthropic"}}}
+	candidate := modelConfig{Upstream: "glm-5.3-flash"}
+	if got := server.providerFailureBlockKey("vercel", "vercel", candidate, nil, temporaryRateLimitReason); got != "vercel|model=glm-5.3-flash" {
+		t.Fatalf("gateway throttle key = %q, want model-scoped key", got)
+	}
+}
+
+func TestTemporaryRateLimitCooldownHonorsExplicitDelay(t *testing.T) {
+	if got := providerCooldownForReason(temporaryRateLimitReason, http.Header{"Retry-After": []string{"3600"}}, nil); got != time.Hour {
+		t.Fatalf("explicit temporary cooldown = %s, want 1h", got)
+	}
+	if got := providerCooldownForReason(temporaryRateLimitReason, http.Header{"Retry-After": []string{"45"}}, nil); got != 45*time.Second {
+		t.Fatalf("explicit temporary cooldown = %s, want 45s", got)
+	}
+	if got := providerCooldownForReason(temporaryRateLimitReason, nil, []byte(`{"error":{"message":"rate limit"}}`)); got != 2*time.Minute {
+		t.Fatalf("inferred temporary cooldown = %s, want 2m", got)
 	}
 }
 
@@ -3476,30 +3729,30 @@ func TestFallbackSuccessDoesNotHealFailedClaudeAccount(t *testing.T) {
 			return
 		}
 		calls["fallback"]++
-		_, _ = fmt.Fprint(w, `{"type":"message","model":"claude-fable-5-1","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}`)
+		_, _ = fmt.Fprint(w, `{"type":"message","model":"claude-haiku-5-5","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}`)
 	}))
 	defer upstream.Close()
 	server, err := newProxyServer(config{
 		DefaultProvider: "anthropic",
 		Providers:       map[string]providerConfig{"anthropic": {BaseURL: upstream.URL}},
-		Models:          map[string]modelConfig{"claude-fable-5-1": {Provider: "anthropic", Upstream: "claude-fable-5-1"}},
+		Models:          map[string]modelConfig{"claude-haiku-5-5": {Provider: "anthropic", Upstream: "claude-haiku-5-5"}},
 		ClaudeUsage: claudeUsageConfig{
 			Provider: "anthropic", AutoSelectAccounts: true,
 			AccountPool: []string{"audit-primary", "audit-fallback"}, AccountProfiles: profiles,
-			EligibleUpstreams: []string{"claude-fable-5-1"}, FiveHourThresholdPct: 100, SevenDayThresholdPct: 100,
+			EligibleUpstreams: []string{"claude-haiku-5-5"}, FiveHourThresholdPct: 100, SevenDayThresholdPct: 100,
 			CacheTTLSeconds: 300, StaleTTLSeconds: 1800, RequestTimeoutMS: 1000,
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:48104/v1/messages", strings.NewReader(`{"model":"claude-fable-5-1","messages":[{"role":"user","content":"test"}]}`))
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:48104/v1/messages", strings.NewReader(`{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"test"}]}`))
 	response := httptest.NewRecorder()
 	server.handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || calls["primary"] != 1 || calls["fallback"] != 1 {
 		t.Fatalf("status=%d calls=%v, want primary/fallback once", response.Code, calls)
 	}
-	if blocked, state := server.providerBlocked("anthropic@audit-primary#fable"); !blocked {
+	if blocked, state := server.providerBlockForCandidate("anthropic@audit-primary", modelConfig{Upstream: "claude-haiku-5-5"}); !blocked {
 		t.Fatalf("failed account block was healed by fallback success: %#v", state)
 	}
 }
@@ -3771,22 +4024,67 @@ func TestLongSteadySSEStreamDoesNotStall(t *testing.T) {
 	}
 }
 
-func TestSSEWatchdogDetectsNoEventStallDespiteKeepAliveBytes(t *testing.T) {
+func TestReasoningFriendlyTimeoutDefaults(t *testing.T) {
+	cfg, err := normalizeRuntimeConfig("test.json", nil, config{
+		DefaultProvider: "test",
+		Providers:       map[string]providerConfig{"test": {BaseURL: "http://localhost"}},
+		Quarantine:      providerQuarantineConfig{Enabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &proxyServer{cfg: cfg}
+	for level, want := range map[int]time.Duration{1: 30 * time.Second, 2: time.Minute, 3: 2 * time.Minute, 10: 2 * time.Minute} {
+		if got := server.quarantineDuration(level); got != want {
+			t.Fatalf("level %d cooldown = %s, want %s", level, got, want)
+		}
+	}
+	if got := server.streamEventStallTimeout(); got != 5*time.Minute {
+		t.Fatalf("event idle timeout = %s", got)
+	}
+	if got := streamIdleTimeout(providerConfig{}); got != 5*time.Minute {
+		t.Fatalf("byte idle timeout = %s", got)
+	}
+}
+
+func TestSSEWatchdogAllowsFilteredThinking(t *testing.T) {
 	reader, writer := io.Pipe()
 	stats := &streamStats{}
-	filtered := newSSEFilterReadCloser(reader, nil, 0, "deepseek", 30*time.Millisecond, stats)
+	filtered := newSSEFilterReadCloser(reader, map[string]bool{"thinking": true}, 0, "deepseek", 200*time.Millisecond, stats)
+	defer filtered.Close()
 	go func() {
 		defer writer.Close()
-		for {
+		_, _ = io.WriteString(writer, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n")
+		for i := 0; i < 30; i++ {
+			if _, err := io.WriteString(writer, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"working\"}}\n\n"); err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_, _ = io.WriteString(writer, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}()
+	body, err := io.ReadAll(filtered)
+	if err != nil || stats.StreamStalled.Load() || strings.Contains(string(body), "working") {
+		t.Fatalf("filtered thinking failed: err=%v stalled=%v body=%s", err, stats.StreamStalled.Load(), body)
+	}
+}
+
+func TestSSEWatchdogAllowsKeepAliveBytes(t *testing.T) {
+	reader, writer := io.Pipe()
+	stats := &streamStats{}
+	filtered := newSSEFilterReadCloser(reader, nil, 0, "deepseek", 200*time.Millisecond, stats)
+	go func() {
+		defer writer.Close()
+		for i := 0; i < 30; i++ {
 			if _, err := io.WriteString(writer, ": keep-alive\n\n"); err != nil {
 				return
 			}
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 	_, _ = io.ReadAll(filtered)
-	if !stats.StreamStalled.Load() {
-		t.Fatal("keep-alive-only stream did not trip no-event watchdog")
+	if stats.StreamStalled.Load() {
+		t.Fatal("active keep-alive stream tripped idle watchdog")
 	}
 }
 
@@ -3893,7 +4191,7 @@ func TestDeepContextExpandsCandidateHeaderBudgetWithinProviderMaximum(t *testing
 	}
 }
 
-func TestHTTPFailuresAndExcessiveTTFBFeedQuarantine(t *testing.T) {
+func TestHTTPFailuresButNotSlowSuccessFeedQuarantine(t *testing.T) {
 	tests := []struct {
 		name      string
 		status    int
@@ -3930,8 +4228,13 @@ func TestHTTPFailuresAndExcessiveTTFBFeedQuarantine(t *testing.T) {
 				}
 				_ = response.resp.Body.Close()
 			}
-			if blocked, state := server.providerBlockForCandidate("provider", selected); !blocked || !strings.HasPrefix(state.Reason, "instability_") {
-				t.Fatalf("provider state = %#v, want instability quarantine", state)
+			blocked, state := server.providerBlockForCandidate("provider", selected)
+			if test.status >= 500 {
+				if !blocked || !strings.HasPrefix(state.Reason, "instability_") {
+					t.Fatalf("provider state = %#v, want instability quarantine", state)
+				}
+			} else if blocked || state.InstabilitySignals != 0 || state.QuarantineLevel != 0 {
+				t.Fatalf("slow successful response affected provider: %#v", state)
 			}
 		})
 	}
@@ -4539,277 +4842,6 @@ func expireProviderQuarantine(server *proxyServer, provider string) {
 	server.providerBlocked(provider)
 }
 
-func TestXAIOAuthStateRoundTripUsesPrivatePermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "xai-oauth.json")
-	want := xaiOAuthState{
-		Version:       xaiOAuthStateVersion,
-		AuthMode:      "xai-oauth",
-		AccessToken:   "access-secret",
-		RefreshToken:  "refresh-secret",
-		TokenEndpoint: xaiOAuthIssuer + "/oauth2/token",
-		ExpiresAt:     time.Now().Add(time.Hour).UTC().Truncate(time.Second),
-	}
-	if err := writeXAIOAuthState(path, want); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("permissions = %04o, want 0600", info.Mode().Perm())
-	}
-	got, err := readXAIOAuthState(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken || !got.ExpiresAt.Equal(want.ExpiresAt) {
-		t.Fatalf("state = %#v, want persisted tokens and expiry", got)
-	}
-}
-
-func TestXAIOAuthStateRejectsSymlink(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target.json")
-	link := filepath.Join(dir, "xai-oauth.json")
-	if err := os.WriteFile(target, []byte(`{"version":1}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readXAIOAuthState(link); err == nil || !strings.Contains(err.Error(), "regular file") {
-		t.Fatalf("read error = %v, want symlink rejection", err)
-	}
-	if err := writeXAIOAuthState(link, xaiOAuthState{}); err == nil || !strings.Contains(err.Error(), "regular file") {
-		t.Fatalf("write error = %v, want symlink rejection", err)
-	}
-}
-
-func TestXAIOAuthRefreshRotatesAndPersistsTokens(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "xai-oauth.json")
-	if err := writeXAIOAuthState(path, xaiOAuthState{
-		Version:       xaiOAuthStateVersion,
-		AuthMode:      "xai-oauth",
-		AccessToken:   "expired-access",
-		RefreshToken:  "old-refresh",
-		TokenEndpoint: xaiOAuthIssuer + "/oauth2/token",
-		ExpiresAt:     time.Now().Add(-time.Minute),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	manager := newXAIOAuthManager(path, testHTTPDoer(func(request *http.Request) (*http.Response, error) {
-		if request.URL.String() != xaiOAuthIssuer+"/oauth2/token" {
-			t.Fatalf("refresh URL = %q", request.URL.String())
-		}
-		if err := request.ParseForm(); err != nil {
-			t.Fatal(err)
-		}
-		if request.Form.Get("grant_type") != "refresh_token" || request.Form.Get("client_id") != xaiOAuthClientID || request.Form.Get("refresh_token") != "old-refresh" {
-			t.Fatalf("refresh form = %#v", request.Form)
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600}`)),
-		}, nil
-	}))
-	token, err := manager.accessToken(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "new-access" {
-		t.Fatalf("access token = %q, want new-access", token)
-	}
-	persisted, err := readXAIOAuthState(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted.AccessToken != "new-access" || persisted.RefreshToken != "new-refresh" || persisted.LastRefresh.IsZero() {
-		t.Fatalf("persisted state = %#v, want rotated tokens", persisted)
-	}
-}
-
-func TestXAIOAuthHeadersStripClientCredentials(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "xai-oauth.json")
-	if err := writeXAIOAuthState(path, xaiOAuthState{
-		Version:      xaiOAuthStateVersion,
-		AuthMode:     "xai-oauth",
-		AccessToken:  "subscription-access",
-		RefreshToken: "subscription-refresh",
-		ExpiresAt:    time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	server := &proxyServer{
-		cfg: config{Providers: map[string]providerConfig{
-			"xai": {AuthMode: "xai-oauth", AuthHeader: "Authorization", AuthPrefix: "Bearer "},
-		}},
-		xaiOAuth: map[string]*xaiOAuthManager{"xai": newXAIOAuthManager(path, nil)},
-	}
-	headers := http.Header{
-		"Authorization": []string{"Bearer client-token"},
-		"x-api-key":     []string{"client-api-key"},
-	}
-	if err := server.applyProviderHeadersContext(context.Background(), "xai", headers); err != nil {
-		t.Fatal(err)
-	}
-	if headers.Get("Authorization") != "Bearer subscription-access" || headers.Get("x-api-key") != "" {
-		t.Fatalf("headers = %#v, want only subscription OAuth", headers)
-	}
-}
-
-func TestXAIOAuthRetriesOnceAfterUnauthorized(t *testing.T) {
-	statePath := filepath.Join(t.TempDir(), "xai-oauth.json")
-	if err := writeXAIOAuthState(statePath, xaiOAuthState{
-		Version:       xaiOAuthStateVersion,
-		AuthMode:      "xai-oauth",
-		AccessToken:   "old-access",
-		RefreshToken:  "old-refresh",
-		TokenEndpoint: xaiOAuthIssuer + "/oauth2/token",
-		ExpiresAt:     time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var inferenceCalls atomic.Int32
-	inference := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		inferenceCalls.Add(1)
-		switch request.Header.Get("Authorization") {
-		case "Bearer old-access":
-			http.Error(writer, "expired", http.StatusUnauthorized)
-		case "Bearer new-access":
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
-		default:
-			http.Error(writer, "unexpected auth", http.StatusForbidden)
-		}
-	}))
-	defer inference.Close()
-
-	server, err := newProxyServer(config{
-		Providers: map[string]providerConfig{
-			"xai": {
-				BaseURL:       inference.URL + "/v1",
-				Format:        "openai-chat",
-				AuthMode:      "xai-oauth",
-				AuthStatePath: statePath,
-				AuthHeader:    "Authorization",
-				AuthPrefix:    "Bearer ",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	server.xaiOAuth["xai"].client = testHTTPDoer(func(request *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600}`)),
-		}, nil
-	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-build-0.1","messages":[]}`))
-	response, err := server.doUpstream(context.Background(), request, []byte(`{"model":"grok-build-0.1","messages":[]}`), modelConfig{
-		Requested: "grok-build-0.1",
-		Provider:  "xai",
-		Upstream:  "grok-build-0.1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || inferenceCalls.Load() != 2 {
-		t.Fatalf("status=%d calls=%d, want 200 and one retry", response.StatusCode, inferenceCalls.Load())
-	}
-}
-
-func TestXAIUsageReadsSuperGrokWeeklyBilling(t *testing.T) {
-	statePath := filepath.Join(t.TempDir(), "xai-oauth.json")
-	if err := writeXAIOAuthState(statePath, xaiOAuthState{
-		Version:       xaiOAuthStateVersion,
-		AuthMode:      "xai-oauth",
-		AccessToken:   "subscription-access",
-		RefreshToken:  "subscription-refresh",
-		TokenEndpoint: xaiOAuthIssuer + "/oauth2/token",
-		ExpiresAt:     time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	reset := time.Now().UTC().Add(7 * 24 * time.Hour).Truncate(time.Second)
-	var calls atomic.Int32
-	billing := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		calls.Add(1)
-		if request.URL.Path != "/v1/billing" || request.URL.Query().Get("format") != "credits" {
-			t.Fatalf("billing URL = %s", request.URL.String())
-		}
-		for key, want := range map[string]string{
-			"Authorization":            "Bearer subscription-access",
-			"Accept":                   "application/json",
-			"X-XAI-Token-Auth":         "xai-grok-cli",
-			"X-Grok-Client-Identifier": "grok-shell",
-		} {
-			if got := request.Header.Get(key); got != want {
-				t.Fatalf("header %s = %q, want %q", key, got, want)
-			}
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(writer, `{"config":{"creditUsagePercent":18,"currentPeriod":{"start":%q,"end":%q,"type":"USAGE_PERIOD_TYPE_WEEKLY"},"productUsage":[{"product":"GrokBuild","usagePercent":16},{"product":"Api","usagePercent":2}],"isUnifiedBillingUser":false}}`, reset.Add(-7*24*time.Hour).Format(time.RFC3339), reset.Format(time.RFC3339))
-	}))
-	defer billing.Close()
-	server, err := newProxyServer(config{Providers: map[string]providerConfig{
-		"xai-oauth": {
-			BaseURL:       billing.URL,
-			Format:        "openai-chat",
-			AuthMode:      "xai-oauth",
-			AuthStatePath: statePath,
-			AuthHeader:    "Authorization",
-			AuthPrefix:    "Bearer ",
-			Headers: map[string]string{
-				"X-XAI-Token-Auth":         "xai-grok-cli",
-				"X-Grok-Client-Identifier": "grok-shell",
-			},
-		},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := server.fetchXAIUsageSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 1 || snapshot.BillingKind != "weekly" || snapshot.Windows["weekly"].PercentUsed != 18 || snapshot.Products["GrokBuild"] != 16 {
-		t.Fatalf("calls=%d snapshot=%#v", calls.Load(), snapshot)
-	}
-}
-
-func TestXAIUsageParsesUnifiedMonthlyBilling(t *testing.T) {
-	start := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)
-	end := start.Add(30 * 24 * time.Hour)
-	snapshot, err := parseXAIMonthlyUsage(xaiBillingConfig{
-		MonthlyLimit:       xaiBillingAmount{Val: 15000},
-		Used:               xaiBillingAmount{Val: 10500},
-		BillingPeriodStart: start.Format(time.RFC3339),
-		BillingPeriodEnd:   end.Format(time.RFC3339),
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapshot.BillingKind != "monthly" || snapshot.Windows["monthly"].PercentUsed != 70 || !snapshot.Windows["monthly"].ResetsAt.Equal(end) {
-		t.Fatalf("snapshot = %#v", snapshot)
-	}
-}
-
-func TestXAISubscriptionOriginRejectsDeveloperAPI(t *testing.T) {
-	if err := validateXAISubscriptionOrigin("https://cli-chat-proxy.grok.com", "inference baseURL"); err != nil {
-		t.Fatal(err)
-	}
-	for _, raw := range []string{"https://api.x.ai", "http://cli-chat-proxy.grok.com", "https://cli-chat-proxy.grok.com.evil.test"} {
-		if err := validateXAISubscriptionOrigin(raw, "inference baseURL"); err == nil {
-			t.Fatalf("origin %q unexpectedly accepted", raw)
-		}
-	}
-}
-
 func TestNamedChainsCompileAndEnforceContracts(t *testing.T) {
 	vision := true
 	tier := 0
@@ -4884,6 +4916,77 @@ func TestImageCompatibilityRejectsKnownTextOnlyChain(t *testing.T) {
 	})
 	if !changed || len(candidates) != 0 {
 		t.Fatalf("candidates=%#v changed=%v, want empty incompatible route", candidates, changed)
+	}
+}
+
+func TestDocumentCompatibilityFiltersUnsupportedRoute(t *testing.T) {
+	noDocs := false
+	candidates, changed := documentCompatibleCandidates([]modelConfig{
+		{Provider: "one", Upstream: "kimi-for-coding", SupportsDocuments: &noDocs},
+		{Provider: "two", Upstream: "claude-opus-5"},
+	})
+	if !changed || len(candidates) != 1 || candidates[0].Upstream != "claude-opus-5" {
+		t.Fatalf("candidates=%#v changed=%v, want only the default-capable route", candidates, changed)
+	}
+}
+
+func TestRequestContentTypesNestedInToolResult(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": []any{
+				map[string]any{"type": "document", "source": map[string]any{"type": "base64", "media_type": "application/pdf", "data": "x"}},
+				map[string]any{"type": "tool_reference", "tool_name": "mcp__x__y"},
+			}},
+		}},
+	}}
+	types := requestContentTypes(payload)
+	if !types["document"] || !types["tool_reference"] || !types["tool_result"] {
+		t.Fatalf("nested content types not collected: %v", types)
+	}
+	plain := requestContentTypes(map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "no documents here"},
+	}})
+	if plain["document"] {
+		t.Fatal("plain request misdetected as document-carrying")
+	}
+}
+
+func TestContentCompatibilityFiltersUnsupportedBlocks(t *testing.T) {
+	candidates, changed := contentCompatibleCandidates([]modelConfig{
+		{Provider: "moonshot", Upstream: "kimi-for-coding", UnsupportedContentTypes: []string{"tool_reference", "document"}},
+		{Provider: "ollama", Upstream: "kimi-k3:cloud"},
+		{Provider: "anthropic", Upstream: "claude-opus-5"},
+	}, map[string]bool{"tool_reference": true, "text": true})
+	if !changed || len(candidates) != 2 {
+		t.Fatalf("candidates=%#v changed=%v, want 2 compatible routes", candidates, changed)
+	}
+	if candidates[0].Provider != "ollama" {
+		t.Fatalf("moonshot leg not filtered: %#v", candidates)
+	}
+}
+
+func TestGenericInvalidRequestErrorIsRouteIncompatible(t *testing.T) {
+	generic := []byte(`{"error":{"type":"invalid_request_error","message":"Invalid request Error"},"type":"error"}`)
+	if !providerSpecificRequestIncompatibility(400, generic) {
+		t.Fatal("generic invalid_request_error not classified route_incompatible")
+	}
+	ciphertext := []byte(`{"error":{"type":"invalid_request_error","message":"Invalid request: ciphertext too short"},"type":"error"}`)
+	if !providerSpecificRequestIncompatibility(400, ciphertext) {
+		t.Fatal("ciphertext rejection not classified route_incompatible")
+	}
+	detailed := []byte(`{"error":{"type":"invalid_request_error","message":"Invalid request: Your request exceeded model token limit: 1048576 (requested: 2048100)"},"type":"error"}`)
+	if providerSpecificRequestIncompatibility(400, detailed) {
+		t.Fatal("detailed token-limit rejection misclassified as route_incompatible")
+	}
+	if !contextOverflowBody(detailed) {
+		t.Fatal("model token limit not detected as context overflow")
+	}
+	malformed := []byte(`{"error":{"type":"invalid_request_error","message":"messages: text content blocks must be non-empty"},"type":"error"}`)
+	if providerSpecificRequestIncompatibility(400, malformed) {
+		t.Fatal("real malformed-request error misclassified as route_incompatible")
+	}
+	if !recognizedClientPayloadError(400, malformed) {
+		t.Fatal("real malformed-request error no longer recognized as client_invalid")
 	}
 }
 
@@ -5030,5 +5133,53 @@ func TestFallbackRetriesSSEFailureBeforeFirstEvent(t *testing.T) {
 	}
 	if failedCalls.Load() != 1 || healthyCalls.Load() != 1 {
 		t.Fatalf("calls failed=%d healthy=%d, want 1/1", failedCalls.Load(), healthyCalls.Load())
+	}
+}
+
+func TestExtendCacheControlTTL(t *testing.T) {
+	// Ephemeral breakpoints without ttl get 1h; explicit ttl preserved; other
+	// cache_control types untouched.
+	body := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]},
+		{"role":"assistant","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"5m"}}]},
+		{"role":"user","content":[{"type":"text","text":"y","cache_control":{"type":"other"}}]}
+	],"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}]}`)
+	out := extendCacheControlTTL(body)
+	if out == nil {
+		t.Fatal("expected rewrite")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	msgs := got["messages"].([]any)
+	cc0 := msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"].(map[string]any)
+	if cc0["ttl"] != "1h" {
+		t.Fatalf("ephemeral breakpoint not extended: %v", cc0)
+	}
+	cc1 := msgs[1].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"].(map[string]any)
+	if cc1["ttl"] != "5m" {
+		t.Fatalf("explicit ttl overwritten: %v", cc1)
+	}
+	cc2 := msgs[2].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"].(map[string]any)
+	if cc2["ttl"] != nil {
+		t.Fatalf("non-ephemeral cache_control mutated: %v", cc2)
+	}
+	sys := got["system"].([]any)[0].(map[string]any)["cache_control"].(map[string]any)
+	if sys["ttl"] != "1h" {
+		t.Fatalf("system breakpoint not extended: %v", sys)
+	}
+
+	// No cache_control anywhere -> nil (no rewrite, no unmarshal cost path).
+	if out := extendCacheControlTTL([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)); out != nil {
+		t.Fatal("rewrote a body with no breakpoints")
+	}
+	// Malformed JSON -> nil.
+	if out := extendCacheControlTTL([]byte(`{"cache_control":`)); out != nil {
+		t.Fatal("rewrote malformed body")
+	}
+	// Already fully ttled -> nil.
+	if out := extendCacheControlTTL([]byte(`{"messages":[{"role":"user","content":[{"type":"text","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)); out != nil {
+		t.Fatal("rewrote fully-ttled body")
 	}
 }

@@ -85,7 +85,7 @@ Adapter options: `dropResponseContentTypes` may contain `thinking` and
 
 Protocols: `anthropic` (native Messages), `openai-chat-completions` (Messages-to-Chat translation and response translation). Not OpenAI Responses/realtime or arbitrary endpoints.
 
-Variants: `generic` default, `claude-subscription`, `ollama-cloud`, `opencode-go`, `clinepass`, `command-code`, `bigmodel`, `vercel-gateway`, `merge-gateway`, `xai-subscription`. These identify built-in auth, telemetry, and timing behavior; they do not supply credentials, model lists, entitlements, or fallback chains. OAuth variants require their corresponding protocol and subscription billing.
+Variants: `generic` default, `claude-subscription`, `kimi-subscription`, `ollama-cloud`, `opencode-go`, `clinepass`, `bigmodel`, `vercel-gateway`. These identify built-in auth, telemetry, and timing behavior; they do not supply credentials, model lists, entitlements, or fallback chains. OAuth variants require their corresponding protocol and subscription billing.
 
 Billing: `subscription`, `metered`, `local`. Classification is the operator's assertion, not price discovery. Disable provider-side extra usage if unwanted; the proxy cannot prove remote billing behavior.
 
@@ -100,7 +100,7 @@ Default suffix: `/v1/messages` or `/v1/chat/completions`. If the base already en
 | `https://example.test` | Anthropic | `/v1/messages` |
 | `https://example.test/v1` | Chat | `/v1/chat/completions` |
 | `https://example.test/prefix/v1` | Anthropic | `/prefix/v1/messages` |
-| `https://api-gateway.merge.dev/v1/anthropic` | Anthropic | `/v1/anthropic/v1/messages` |
+| `https://gateway.example/v1/anthropic` | Anthropic | `/v1/anthropic/v1/messages` |
 
 Timeouts are milliseconds; 0 selects inherited defaults, negatives are rejected. Header timeout is an upper bound: adaptive timing, first-event timing, and the chain deadline may end an attempt earlier. Streaming idle timeout is separate. Partial client-visible streams are reported as interrupted, never replayed on a different provider.
 
@@ -110,9 +110,43 @@ Timeouts are milliseconds; 0 selects inherited defaults, negatives are rejected.
 - `{"type":"command","command":["/absolute/path/helper","argument"]}`: trusted executable prints only the token; output bounded to 64 KiB, execution to five seconds. Successful credentials are cached and invalidated on HTTP 401/403.
 - `{"type":"none"}`: requires explicit `local` billing.
 - `{"type":"claude-profile-pool","pool":"pool-id"}`: native configured Claude credentials; requires `claude-subscription`, Anthropic protocol, and exactly `https://api.anthropic.com`.
-- `{"type":"device-oauth","statePath":"./state/xai-oauth.json"}`: existing provider-specific xAI device flow; requires `xai-subscription` and Chat protocol. `xai-login --no-browser` prints authorization instructions without launching a browser. Not generic website OAuth.
+- `{"type":"kimi-code-oauth","statePath":"/absolute/native/credentials/REGION-SCOPED-SLOT.json"}`: shares existing native Kimi Code subscription login; requires `kimi-subscription` and Anthropic protocol. See below.
 
 API-key/helper auth defaults to `Authorization: Bearer <token>`. Override `auth.header` and `auth.prefix` for other endpoints, e.g. `x-api-key` and `""`. OAuth header overrides are rejected. Inline credential/cookie/host headers are rejected; use auth references.
+
+#### Native Kimi Code subscription OAuth
+
+Set provider `variant` to `kimi-subscription`, `protocol` to `anthropic`,
+`billing` to `subscription`, and `baseURL` to `https://api.kimi.ai/coding/`
+(or the native `.com` regional coding endpoint). Use
+`auth: {"type":"kimi-code-oauth","statePath":"/absolute/path/to/native-cli/credentials/REGION-SCOPED-SLOT.json"}`.
+Find the existing slot through the native CLI's `providers.managed:kimi-code.oauth`
+configuration; do not copy tokens into configuration. The slot must match the
+configured region. Platform endpoints such as `api.moonshot.ai` are rejected.
+
+Login remains the native CLI's responsibility. The adapter reads its private
+0600 credentials and existing `device_id`; it does not launch login, create a
+device ID, change CLI configuration, or maintain a second credential copy.
+Refresh uses the native OAuth issuer, client ID, refresh threshold, rotating
+token format, and cross-process `.lock` directory/heartbeat protocol. It reloads
+credentials after taking the lock and atomically persists rotations, retaining
+unknown credential fields. Network errors and rejected refreshes never delete
+CLI credentials. No auth/refresh work occurs during config validation or
+dashboard polling.
+
+The proxy never steals a foreign lock, even one whose heartbeat looks stale:
+stat-then-delete can remove a newly replaced live lock. Stale locks fail closed
+and use normal fallback; recovery stays with the native CLI. Do not remove a
+lock until its owner is confirmed stopped.
+
+The existing device identity is preserved. Caller User-Agent is not rewritten
+to impersonate Kimi CLI; refresh requests identify the actual gateway.
+Static auth/header overrides are forbidden. A 401 may trigger one refresh and
+one retry before returning a response; successful or partial streams are never
+replayed. Other failures use the existing sequential fallback machinery.
+
+This integration reads native CLI storage format and must be rechecked when
+that CLI changes its OAuth protocol. It is not a metered platform-key adapter.
 
 ## Models, model pools, chains
 
@@ -129,7 +163,7 @@ Chain fields: `steps`, `allowPaidFallback` (false), `paidFallbackOn`, `minimumCo
 
 ## Optional browser snapshots
 
-Omitted usage or `{"mode":"passive"}` performs no collection. API mode is explicit: `{"mode":"api","pollIntervalSeconds":60}`. Readers exist for Claude, Ollama, ClinePass, and xAI. Unsupported readers fail validation with instructions to use passive mode. Reader failure does not establish inference failure. Ollama's reader uses the origin's `/api/usage` path; other readers retain their provider-native endpoint conventions.
+Omitted usage or `{"mode":"passive"}` performs no collection. API mode is explicit: `{"mode":"api","pollIntervalSeconds":60}`. Readers exist for Claude, Ollama, and ClinePass. Unsupported readers fail validation with instructions to use passive mode. Reader failure does not establish inference failure. Ollama's reader uses the origin's `/api/usage` path; other readers retain their provider-native endpoint conventions.
 
 Browser mode reads only a configured file:
 

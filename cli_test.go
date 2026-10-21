@@ -28,7 +28,7 @@ func TestCLIConfigArgumentDoesNotChangeProcessState(t *testing.T) {
 
 func TestCLIRejectsInvalidCommandsBeforeLoadingConfig(t *testing.T) {
 	t.Setenv("CLAUDE_PROXY_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
-	for _, args := range [][]string{{"--config"}, {"--config", "--help"}, {"unknown"}, {"serve", "extra"}, {"xai-login", "--unexpected"}} {
+	for _, args := range [][]string{{"--config"}, {"--config", "--help"}, {"unknown"}, {"serve", "extra"}, {"validate-config", "--unexpected"}} {
 		if err := runCLI(context.Background(), args, nil, io.Discard, io.Discard); err == nil || strings.Contains(err.Error(), "no such file") {
 			t.Fatalf("args=%q error=%v", args, err)
 		}

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // fileConfig is the JSON schema; config contains compiled routing tables.
@@ -23,6 +24,7 @@ type fileConfig struct {
 	AlsoListen         []string                         `json:"alsoListen,omitempty"`
 	Normalize          normalizeConfig                  `json:"normalize,omitempty"`
 	AdaptiveRouting    *adaptiveRoutingConfig           `json:"adaptiveRouting,omitempty"`
+	Classifier         *classifierDefinition            `json:"classifier,omitempty"`
 	ProviderQuarantine *providerQuarantineConfig        `json:"providerQuarantine,omitempty"`
 	StateDir           string                           `json:"stateDir"`
 	ErrorTrace         errorTraceConfig                 `json:"errorTrace,omitempty"`
@@ -36,12 +38,13 @@ type fileConfig struct {
 	Aliases            map[string]string                `json:"aliases"`
 }
 type clientDefinition struct {
-	Command     []string `json:"command"`
-	ConfigDir   string   `json:"configDir"`
-	Model       string   `json:"model"`
-	OpusModel   string   `json:"opusModel"`
-	SonnetModel string   `json:"sonnetModel"`
-	HaikuModel  string   `json:"haikuModel"`
+	MenuModels  map[string]string `json:"menuModels,omitempty"`
+	Command     []string          `json:"command"`
+	ConfigDir   string            `json:"configDir"`
+	Model       string            `json:"model"`
+	OpusModel   string            `json:"opusModel"`
+	SonnetModel string            `json:"sonnetModel"`
+	HaikuModel  string            `json:"haikuModel"`
 }
 type profileDefinition struct {
 	DefaultDirectory     bool     `json:"-"`
@@ -56,11 +59,16 @@ type profileDefinition struct {
 	RefreshCommand []string `json:"refreshCommand"`
 }
 type accountPoolDefinition struct {
-	WorkerUtilizationLimitPct float64  `json:"workerUtilizationLimitPct,omitempty"`
-	Profiles                  []string `json:"profiles"`
-	FiveHourThresholdPct      float64  `json:"fiveHourThresholdPct"`
-	SevenDayThresholdPct      float64  `json:"sevenDayThresholdPct"`
-	StickySeconds             int      `json:"stickySeconds"`
+	FableMinWeeklyRemainingPct float64 `json:"fableMinWeeklyRemainingPct,omitempty"`
+	FablePaceGuard             bool    `json:"fablePaceGuard,omitempty"`
+	WorkerUtilizationLimitPct  float64 `json:"workerUtilizationLimitPct,omitempty"`
+	// Weekly-only variant of WorkerUtilizationLimitPct: applies solely to the
+	// seven-day window, leaving the five-hour window to the generic limit.
+	WorkerWeeklyUtilizationLimitPct float64  `json:"workerWeeklyUtilizationLimitPct,omitempty"`
+	Profiles                        []string `json:"profiles"`
+	FiveHourThresholdPct            float64  `json:"fiveHourThresholdPct"`
+	SevenDayThresholdPct            float64  `json:"sevenDayThresholdPct"`
+	StickySeconds                   int      `json:"stickySeconds"`
 }
 type usageDefinition struct {
 	Mode                string   `json:"mode"`
@@ -81,6 +89,14 @@ type authDefinition struct {
 	Header    string   `json:"header"`
 	Prefix    *string  `json:"prefix"`
 }
+
+// pricingDefinition makes metered-provider spend visible in metrics and
+// rollups. Values are USD per million tokens; zero means unpriced.
+type pricingDefinition struct {
+	InputPerMillionTokens     float64 `json:"inputPerMillionTokens"`
+	OutputPerMillionTokens    float64 `json:"outputPerMillionTokens"`
+	CacheReadPerMillionTokens float64 `json:"cacheReadPerMillionTokens,omitempty"`
+}
 type providerDefinition struct {
 	DisplayName              string            `json:"displayName"`
 	Protocol                 string            `json:"protocol"`
@@ -88,6 +104,7 @@ type providerDefinition struct {
 	BaseURL                  string            `json:"baseURL"`
 	MessagesPath             string            `json:"messagesPath"`
 	Billing                  string            `json:"billing"`
+	Pricing                  pricingDefinition `json:"pricing,omitempty"`
 	Auth                     authDefinition    `json:"auth"`
 	Usage                    usageDefinition   `json:"usage"`
 	Headers                  map[string]string `json:"headers"`
@@ -99,13 +116,25 @@ type providerDefinition struct {
 	CircuitBreaker           *bool             `json:"circuitBreaker,omitempty"`
 }
 type modelDefinition struct {
-	Provider         string         `json:"provider"`
-	Upstream         string         `json:"upstream"`
-	ResponseAlias    string         `json:"responseAlias,omitempty"`
-	AccountPool      string         `json:"accountPool"`
-	ContextWindow    int            `json:"contextWindow"`
-	SupportsImages   bool           `json:"supportsImages"`
-	SupportsTools    bool           `json:"supportsTools"`
+	Provider       string `json:"provider"`
+	Upstream       string `json:"upstream"`
+	ResponseAlias  string `json:"responseAlias,omitempty"`
+	AccountPool    string `json:"accountPool"`
+	ContextWindow  int    `json:"contextWindow"`
+	SupportsImages bool   `json:"supportsImages"`
+	SupportsTools  bool   `json:"supportsTools"`
+	// SupportsDocuments defaults to capable (nil): only providers known to
+	// reject `document` content blocks set it explicitly false.
+	SupportsDocuments *bool `json:"supportsDocuments,omitempty"`
+	// UnsupportedContentTypes lists message content-block `type` values this
+	// route rejects outright (e.g. Anthropic-proprietary deferred-tool and
+	// server-side blocks on non-Anthropic providers). Requests carrying one
+	// skip the leg instead of failing on it.
+	UnsupportedContentTypes []string `json:"unsupportedContentTypes,omitempty"`
+	// TaskClass optionally marks the work tier this route serves
+	// ("fast"|"balanced"|"deep"). The classifier stage boosts candidates
+	// whose class matches the evaluated task tier.
+	TaskClass        string         `json:"taskClass,omitempty"`
 	RequestOverrides map[string]any `json:"requestOverrides"`
 }
 type modelPoolDefinition struct {
@@ -120,6 +149,7 @@ type chainStep struct {
 	Pool  string `json:"pool"`
 }
 type chainDefinition struct {
+	SoftConcurrency      int         `json:"softConcurrency,omitempty"`
 	Steps                []chainStep `json:"steps"`
 	AllowPaidFallback    bool        `json:"allowPaidFallback"`
 	PaidFallbackOn       []string    `json:"paidFallbackOn"`
@@ -321,6 +351,11 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			return config{}, fmt.Errorf("client references unknown model alias %q", alias)
 		}
 	}
+	for alias := range f.Client.MenuModels {
+		if f.Aliases[alias] == "" {
+			return config{}, fmt.Errorf("client menu references unknown model alias %q", alias)
+		}
+	}
 	cfg := config{Definition: &f, Listen: f.Listen, Providers: map[string]providerConfig{}, Models: map[string]modelConfig{}, Chains: map[string]routeChain{}}
 	cfg.AlsoListen = append([]string(nil), f.AlsoListen...)
 	cfg.Normalize = f.Normalize
@@ -387,8 +422,14 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	for _, id := range sortedKeys(f.AccountPools) {
 		p := f.AccountPools[id]
+		if p.FableMinWeeklyRemainingPct < 0 || p.FableMinWeeklyRemainingPct > 100 {
+			return config{}, fmt.Errorf("invalid Fable weekly remaining limit for pool %s", id)
+		}
 		if p.WorkerUtilizationLimitPct < 0 || p.WorkerUtilizationLimitPct > 100 {
 			return config{}, fmt.Errorf("invalid worker utilization limit for pool %s", id)
+		}
+		if p.WorkerWeeklyUtilizationLimitPct < 0 || p.WorkerWeeklyUtilizationLimitPct > 100 {
+			return config{}, fmt.Errorf("invalid worker weekly utilization limit for pool %s", id)
 		}
 		if !validID(id) || len(p.Profiles) == 0 {
 			return config{}, fmt.Errorf("account pool %q is empty or invalid", id)
@@ -421,12 +462,12 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		}
 		p.DisplayName = firstNonEmpty(p.DisplayName, id)
 		p.Variant = firstNonEmpty(p.Variant, "generic")
-		allowed := map[string]bool{"generic": true, "claude-subscription": true, "ollama-cloud": true, "opencode-go": true, "clinepass": true, "command-code": true, "bigmodel": true, "vercel-gateway": true, "merge-gateway": true, "xai-subscription": true}
+		allowed := map[string]bool{"generic": true, "claude-subscription": true, "kimi-subscription": true, "ollama-cloud": true, "opencode-go": true, "clinepass": true, "bigmodel": true, "vercel-gateway": true}
 		if !allowed[p.Variant] {
 			return config{}, fmt.Errorf("unknown provider variant %q", p.Variant)
 		}
-		if p.Protocol != "anthropic" && p.Protocol != "openai-chat-completions" {
-			return config{}, fmt.Errorf("provider %s requires anthropic or openai-chat-completions protocol", id)
+		if p.Protocol != "anthropic" && p.Protocol != "openai-chat-completions" && p.Protocol != "evaluation" {
+			return config{}, fmt.Errorf("provider %s requires anthropic, openai-chat-completions, or evaluation protocol", id)
 		}
 		if p.Billing != "subscription" && p.Billing != "metered" && p.Billing != "local" {
 			return config{}, fmt.Errorf("provider %s requires explicit billing: subscription, metered, or local", id)
@@ -442,6 +483,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if p.ResponseHeaderTimeoutMS < 0 || p.StreamIdleTimeoutMS < 0 {
 			return config{}, fmt.Errorf("provider %s timeouts must be nonnegative", id)
 		}
+		if p.Pricing.InputPerMillionTokens < 0 || p.Pricing.OutputPerMillionTokens < 0 || p.Pricing.CacheReadPerMillionTokens < 0 {
+			return config{}, fmt.Errorf("provider %s pricing must be nonnegative", id)
+		}
 		for k, v := range p.Headers {
 			if strings.ContainsAny(k+v, "\r\n") || strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, "api-key") || strings.EqualFold(k, "proxy-authorization") || strings.EqualFold(k, "cookie") || strings.EqualFold(k, "host") {
 				return config{}, fmt.Errorf("provider %s: use auth references, not credential/host headers", id)
@@ -450,7 +494,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if e := validateOverrides(p.RequestOverrides); e != nil {
 			return config{}, e
 		}
-		q := providerConfig{BaseURL: p.BaseURL, Headers: p.Headers, RequestOverrides: p.RequestOverrides, Variant: p.Variant, Billing: p.Billing, DisplayName: p.DisplayName, Usage: p.Usage, ResponseHeaderTimeoutMS: p.ResponseHeaderTimeoutMS, StreamIdleTimeoutMS: p.StreamIdleTimeoutMS}
+		q := providerConfig{BaseURL: p.BaseURL, Headers: p.Headers, RequestOverrides: p.RequestOverrides, Variant: p.Variant, Billing: p.Billing, Pricing: p.Pricing, DisplayName: p.DisplayName, Usage: p.Usage, ResponseHeaderTimeoutMS: p.ResponseHeaderTimeoutMS, StreamIdleTimeoutMS: p.StreamIdleTimeoutMS}
 		for _, contentType := range p.DropResponseContentTypes {
 			if contentType != "thinking" && contentType != "redacted_thinking" {
 				return config{}, errors.New("dropResponseContentTypes supports only thinking and redacted_thinking")
@@ -476,7 +520,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			return config{}, fmt.Errorf("provider %s has invalid messagesPath suffix", id)
 		}
 		q.MessagesPath = suffix
-		if p.Auth.Type != "env" && p.Auth.Name != "" || p.Auth.Type != "command" && len(p.Auth.Command) > 0 || p.Auth.Type != "claude-profile-pool" && p.Auth.Pool != "" || p.Auth.Type != "device-oauth" && p.Auth.StatePath != "" {
+		if p.Auth.Type != "env" && p.Auth.Name != "" || p.Auth.Type != "command" && len(p.Auth.Command) > 0 || p.Auth.Type != "claude-profile-pool" && p.Auth.Pool != "" || p.Auth.Type != "kimi-code-oauth" && p.Auth.StatePath != "" {
 			return config{}, fmt.Errorf("provider %s has conflicting auth fields", id)
 		}
 		switch p.Auth.Type {
@@ -517,26 +561,28 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 				}
 				cfg.ClaudeUsage.AccountProfiles[name] = claudeUsageProfile{Name: name, CachePath: cachePath, CredentialsService: profile.CredentialsService, SevenDayThresholdPct: &weekly}
 			}
-		case "device-oauth":
-			if p.Variant != "xai-subscription" || p.Protocol != "openai-chat-completions" || p.Billing != "subscription" {
-				return config{}, errors.New("device-oauth requires xai-subscription with OpenAI protocol and subscription billing")
+		case "kimi-code-oauth":
+			if p.Variant != "kimi-subscription" || p.Protocol != "anthropic" || p.Billing != "subscription" || p.Auth.StatePath == "" {
+				return config{}, errors.New("kimi-code-oauth requires kimi-subscription, Anthropic protocol, subscription billing and explicit native CLI statePath")
 			}
-			q.AuthMode = "xai-oauth"
-			state := p.Auth.StatePath
-			if state == "" {
-				state = filepath.Join(f.StateDir, id+"-oauth.json")
-			}
-			q.AuthStatePath, e = configPath(base, state)
+			q.AuthMode = "kimi-code-oauth"
+			q.AuthStatePath, e = configPath(base, p.Auth.StatePath)
 			if e != nil {
 				return config{}, e
+			}
+			if e = validateKimiCredentialSlot(q.AuthStatePath, p.BaseURL); e != nil {
+				return config{}, e
+			}
+			if p.MessagesPath != "" {
+				return config{}, errors.New("Kimi OAuth messagesPath override is not permitted")
 			}
 		default:
 			return config{}, fmt.Errorf("provider %s has unsupported auth type %q", id, p.Auth.Type)
 		}
-		if p.Variant == "claude-subscription" && p.Auth.Type != "claude-profile-pool" || p.Variant == "xai-subscription" && p.Auth.Type != "device-oauth" {
+		if p.Variant == "claude-subscription" && p.Auth.Type != "claude-profile-pool" || p.Variant == "kimi-subscription" && p.Auth.Type != "kimi-code-oauth" {
 			return config{}, errors.New("subscription variant requires its corresponding subscription auth type")
 		}
-		if p.Auth.Type == "claude-profile-pool" || p.Auth.Type == "device-oauth" {
+		if p.Auth.Type == "claude-profile-pool" || p.Auth.Type == "kimi-code-oauth" {
 			if p.Auth.Header != "" || p.Auth.Prefix != nil {
 				return config{}, errors.New("subscription auth header overrides are not permitted")
 			}
@@ -588,7 +634,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 				return config{}, errors.New("API polling interval must be at least 30 seconds")
 			}
 			switch p.Variant {
-			case "claude-subscription", "ollama-cloud", "clinepass", "xai-subscription":
+			case "claude-subscription", "ollama-cloud", "clinepass":
 			default:
 				return config{}, fmt.Errorf("variant %s has no API quota reader; use passive or opt-in browser mode", p.Variant)
 			}
@@ -635,6 +681,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if m.AccountPool != "" && p.Variant != "claude-subscription" {
 			return config{}, errors.New("accountPool only applies to Claude subscription models")
 		}
+		if m.TaskClass != "" && !validTaskClass(m.TaskClass) {
+			return config{}, fmt.Errorf("model %s has invalid taskClass %q", id, m.TaskClass)
+		}
 		if p.Variant == "claude-subscription" {
 			m.AccountPool = firstNonEmpty(m.AccountPool, p.Auth.Pool)
 			if _, ok := f.AccountPools[m.AccountPool]; !ok {
@@ -646,7 +695,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			cfg.OllamaUsage.EligibleUpstreams = append(cfg.OllamaUsage.EligibleUpstreams, m.Upstream)
 		}
 		images := m.SupportsImages
-		normalizedModels[id] = modelConfig{ModelID: id, Provider: m.Provider, Upstream: m.Upstream, ResponseAlias: m.ResponseAlias, AccountPool: m.AccountPool, AccountStickySeconds: f.AccountPools[m.AccountPool].StickySeconds, ContextWindow: m.ContextWindow, SupportsImages: &images, SupportsTools: m.SupportsTools, ModelOverrides: m.RequestOverrides}
+		normalizedModels[id] = modelConfig{ModelID: id, Provider: m.Provider, Upstream: m.Upstream, ResponseAlias: m.ResponseAlias, AccountPool: m.AccountPool, AccountStickySeconds: f.AccountPools[m.AccountPool].StickySeconds, ContextWindow: m.ContextWindow, SupportsImages: &images, SupportsDocuments: m.SupportsDocuments, UnsupportedContentTypes: m.UnsupportedContentTypes, SupportsTools: m.SupportsTools, TaskClass: m.TaskClass, ModelOverrides: m.RequestOverrides}
 		f.Models[id] = m
 	}
 	for _, id := range sortedKeys(f.ModelPools) {
@@ -674,6 +723,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	compiled := map[string]modelConfig{}
 	for _, id := range sortedKeys(f.Chains) {
 		c := f.Chains[id]
+		if c.SoftConcurrency < 0 || (c.SoftConcurrency > 0 && !c.AllowPaidFallback) {
+			return config{}, errors.New("softConcurrency requires a positive value and allowPaidFallback")
+		}
 		if !validID(id) || len(c.Steps) == 0 {
 			return config{}, fmt.Errorf("invalid/empty chain %s", id)
 		}
@@ -685,8 +737,8 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		}
 		seenReasons := map[string]bool{}
 		for _, r := range c.PaidFallbackOn {
-			if (r != "quota-exhausted" && r != "confirmed-provider-outage") || seenReasons[r] {
-				return config{}, errors.New("paidFallbackOn allows unique quota-exhausted and confirmed-provider-outage only")
+			if (r != "quota-exhausted" && r != "confirmed-provider-outage" && r != "response-header-timeout" && r != "route-unavailable") || seenReasons[r] {
+				return config{}, errors.New("paidFallbackOn allows unique quota-exhausted, confirmed-provider-outage, response-header-timeout and route-unavailable only")
 			}
 			seenReasons[r] = true
 		}
@@ -722,6 +774,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 				m.Tier = &tier
 				m.ConfiguredPool = step.Pool
 				m.AllowPaidFallback = c.AllowPaidFallback
+				m.SoftConcurrency = c.SoftConcurrency
 				m.PaidFallbackOn = c.PaidFallbackOn
 				if len(members) > 0 && cfg.Providers[m.Provider].Billing == "metered" && !c.AllowPaidFallback {
 					return config{}, fmt.Errorf("chain %s includes metered fallback without opt-in", id)
@@ -757,7 +810,70 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	if f.AdaptiveRouting != nil {
 		cfg.AdaptiveRouting = *f.AdaptiveRouting
 	}
+	if f.Classifier != nil {
+		compiled, e := compileClassifier(f.Classifier, f.Providers)
+		if e != nil {
+			return config{}, e
+		}
+		cfg.Classifier = compiled
+	}
 	return normalizeRuntimeConfig(path, body, cfg)
+}
+
+func compileClassifier(d *classifierDefinition, providers map[string]providerDefinition) (*classifierConfig, error) {
+	if !d.Enabled {
+		return &classifierConfig{Enabled: false}, nil
+	}
+	if _, ok := providers[d.Provider]; !ok {
+		return nil, fmt.Errorf("classifier references missing provider %q", d.Provider)
+	}
+	if strings.TrimSpace(d.Model) == "" {
+		return nil, errors.New("classifier requires a model")
+	}
+	for _, v := range []float64{d.MinUpgradeConfidence, d.MinDowngradeConfidence, d.RiskyThreshold} {
+		if v < 0 || v > 1 {
+			return nil, errors.New("classifier confidence/risky thresholds must be in [0,1]")
+		}
+	}
+	if d.TimeoutMS < 0 || d.CacheTTLSeconds < 0 || d.DedupeTTLSeconds < 0 || d.FailureBackoffSeconds < 0 || d.MaxPromptChars < 0 || d.ShadowPromptChars < 0 {
+		return nil, errors.New("classifier timeouts/TTL/prompt limits must be nonnegative")
+	}
+	for alias, class := range d.AliasClasses {
+		if !validTaskClass(class) {
+			return nil, fmt.Errorf("classifier aliasClasses %q has invalid class %q", alias, class)
+		}
+	}
+	risky := map[string]bool{}
+	for _, name := range d.RiskyProviders {
+		if _, ok := providers[name]; !ok {
+			return nil, fmt.Errorf("classifier riskyProviders references missing provider %q", name)
+		}
+		risky[name] = true
+	}
+	return &classifierConfig{
+		Enabled: true, Shadow: d.Shadow, ShadowPromptChars: d.ShadowPromptChars, Provider: d.Provider, Model: d.Model,
+		Timeout:              time.Duration(firstInt(d.TimeoutMS, 10000)) * time.Millisecond,
+		CacheTTL:             time.Duration(firstInt(d.CacheTTLSeconds, 600)) * time.Second,
+		DedupeTTL:            time.Duration(firstInt(d.DedupeTTLSeconds, 3600)) * time.Second,
+		FailureBackoff:       time.Duration(firstInt(d.FailureBackoffSeconds, 60)) * time.Second,
+		MinUpgradeConfidence: d.MinUpgradeConfidence, MinDowngradeConfidence: d.MinDowngradeConfidence,
+		RiskyThreshold: firstFloat(d.RiskyThreshold, 0.7), TierMatchBonus: firstFloat(d.TierMatchBonus, 25),
+		RiskyProviders: risky, RiskyBonus: firstFloat(d.RiskyBonus, 30),
+		MaxPromptChars: firstInt(d.MaxPromptChars, 3000), AliasClasses: d.AliasClasses,
+	}, nil
+}
+
+func firstInt(v, fallback int) int {
+	if v == 0 {
+		return fallback
+	}
+	return v
+}
+func firstFloat(v, fallback float64) float64 {
+	if v == 0 {
+		return fallback
+	}
+	return v
 }
 
 func validateOverrides(m map[string]any) error {

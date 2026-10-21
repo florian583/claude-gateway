@@ -454,7 +454,7 @@ func TestHardeningStatusAndDrain(t *testing.T) {
 
 func TestHardeningClaudePaidGuardMatrix(t *testing.T) {
 	for _, model := range []string{"claude-sonnet-5", "claude-opus-4-8", "claude-fable-5-1"} {
-		for _, paidProvider := range []string{"vercel-glm53-flash", "vercel-deepseek", "vercel-kimi", "merge-gateway-kimi"} {
+		for _, paidProvider := range []string{"vercel-glm53-flash", "vercel-deepseek", "vercel-kimi"} {
 			for _, tc := range []struct {
 				name         string
 				status       int

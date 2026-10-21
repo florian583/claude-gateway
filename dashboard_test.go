@@ -92,6 +92,16 @@ func TestDashboardFreshnessAndWindowReset(t *testing.T) {
 	}
 }
 
+func TestDashboardTemporaryRateLimitIsNotFull(t *testing.T) {
+	now := time.Now()
+	if got := dashboardBlock(providerRuntimeState{BlockedUntil: now.Add(time.Minute), Reason: temporaryRateLimitReason}, now); got != "THROTTLED" {
+		t.Fatalf("temporary rate-limit state = %q, want THROTTLED", got)
+	}
+	if got := dashboardBlock(providerRuntimeState{BlockedUntil: now.Add(time.Minute), Reason: "quota_or_rate_limit"}, now); got != "FULL" {
+		t.Fatalf("quota state = %q, want FULL", got)
+	}
+}
+
 func TestDashboardFableLimitIsModelSpecificAndReadOnly(t *testing.T) {
 	f := testClaudeConfig(t)
 	m := f.Models["model"]

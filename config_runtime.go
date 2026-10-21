@@ -78,7 +78,7 @@ func (s *proxyServer) expandConfiguredClaudeAttempts(r *http.Request, candidates
 		}
 		profiles := s.profilesForCandidate(m, r)
 		if p, ok := selectedClaudeProfile(r); ok && profileInClaudePool(p, profiles) {
-			profiles = s.orderClaudeFallbackProfiles(profiles, p)
+			profiles = s.orderClaudeFallbackProfiles(profiles, p, s.preserveSonnetSubscriptionOrder(m))
 		}
 		for _, p := range profiles {
 			key := p.CredentialsService + "|" + m.Upstream
@@ -95,7 +95,8 @@ func (s *proxyServer) expandConfiguredClaudeAttempts(r *http.Request, candidates
 }
 func configuredCompatibleCandidates(candidates []modelConfig, payload map[string]any) []modelConfig {
 	tools, _ := payload["tools"].([]any)
-	images := requestContainsImage(payload)
+	types := requestContentTypes(payload)
+	images := types["image"] || types["image_url"] || types["input_image"]
 	result := make([]modelConfig, 0, len(candidates))
 	for _, m := range candidates {
 		if len(tools) > 0 && !m.SupportsTools {
@@ -108,7 +109,7 @@ func configuredCompatibleCandidates(candidates []modelConfig, payload map[string
 	}
 	return result
 }
-func (s *proxyServer) rankConfiguredCandidates(candidates []modelConfig, stickyKey string) []modelConfig {
+func (s *proxyServer) rankConfiguredCandidates(candidates []modelConfig, stickyKey string, hint taskRouteHint) []modelConfig {
 	result := append([]modelConfig(nil), candidates...)
 	perf := s.adaptivePerformance()
 	s.adaptive.mu.Lock()
@@ -124,10 +125,17 @@ func (s *proxyServer) rankConfiguredCandidates(candidates []modelConfig, stickyK
 		if key == sticky.Key && time.Now().Before(sticky.Until) {
 			v += 25
 		}
+		v += s.hintBonus(m, hint)
 		return v
 	}
 	sort.SliceStable(result, func(i, j int) bool {
 		a, b := result[i], result[j]
+		if hint.Decided {
+			pa, pb := s.hintMatches(a, hint), s.hintMatches(b, hint)
+			if pa != pb {
+				return pa
+			}
+		}
 		ta, tb := 0, 0
 		if a.Tier != nil {
 			ta = *a.Tier

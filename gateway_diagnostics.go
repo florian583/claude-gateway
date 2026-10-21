@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -51,9 +52,52 @@ func (e *attemptExecution) noteDiagnostic(key, value string) {
 }
 
 func (e *attemptExecution) observeGatewayHeaders(header http.Header) {
-	for _, key := range []string{"request-id", "x-request-id", "x-vercel-id", "cf-ray", "x-provider", "x-backend", "x-upstream-provider", "x-vercel-ai-gateway-provider"} {
+	for _, key := range []string{"request-id", "x-request-id", "x-vercel-id", "cf-ray", "x-provider", "x-backend", "x-upstream-provider", "x-vercel-ai-gateway-provider", "retry-after"} {
 		e.noteDiagnostic("header."+key, header.Get(key))
 	}
+	// Rate-limit header families carry only counts, percentages, and reset
+	// timestamps — fixed-vocabulary numeric metadata, still sanitized by
+	// diagnosticIdentifier. Captured on every response, not just 429s, so
+	// limiter state is visible before exhaustion.
+	for name := range header {
+		lower := strings.ToLower(name)
+		for _, prefix := range []string{"anthropic-ratelimit-", "x-ratelimit-"} {
+			if strings.HasPrefix(lower, prefix) {
+				e.noteDiagnostic("header."+lower, header.Get(name))
+				break
+			}
+		}
+	}
+}
+
+// errorMessageVocabulary is the fixed set of request-shape keywords an error
+// message is fingerprinted against. The output vocabulary never leaves this
+// list, so provider text — which may echo request values — is never persisted.
+var errorMessageVocabulary = []string{
+	"max_tokens", "max_completion_tokens", "messages", "model", "tools",
+	"tool_choice", "thinking", "budget", "system", "metadata", "user_id",
+	"stop_sequences", "temperature", "top_p", "top_k", "context", "quota",
+	"required", "invalid", "unsupported", "empty", "too long", "too large",
+	"not found", "exceed", "must be",
+}
+
+func errorMessageFingerprint(message string) string {
+	lower := strings.ToLower(message)
+	out := ""
+	for _, kw := range errorMessageVocabulary {
+		if !strings.Contains(lower, kw) {
+			continue
+		}
+		next := kw
+		if out != "" {
+			next = out + " " + kw
+		}
+		if len(next) > 150 {
+			break
+		}
+		out = next
+	}
+	return out
 }
 
 func (e *attemptExecution) observeGatewayError(body []byte) {
@@ -69,5 +113,13 @@ func (e *attemptExecution) observeGatewayError(body []byte) {
 		}
 		value, _ := current.(string)
 		e.noteDiagnostic("body."+strings.Join(path, "."), value)
+	}
+	if errObj, ok := payload["error"].(map[string]any); ok {
+		if msg, _ := errObj["message"].(string); msg != "" {
+			if fp := errorMessageFingerprint(msg); fp != "" {
+				e.noteDiagnostic("body.error.message_keys", fp)
+				e.noteDiagnostic("body.error.message_len", strconv.Itoa(len(msg)))
+			}
+		}
 	}
 }
