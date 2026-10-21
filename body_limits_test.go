@@ -177,3 +177,32 @@ func TestBodyLimitsConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestBodyLimitExactBoundary(t *testing.T) {
+	for _, size := range []int{1023, 1024, 1025} {
+		body, err := readBoundedResponseBody(context.Background(), io.NopCloser(strings.NewReader(strings.Repeat("x", size))), 1024, time.Second)
+		if size > 1024 {
+			if !errors.Is(err, errBodyTooLarge) || len(body) != 0 {
+				t.Fatalf("size=%d bytes=%d error=%v", size, len(body), err)
+			}
+		} else if err != nil || len(body) != size {
+			t.Fatalf("size=%d bytes=%d error=%v", size, len(body), err)
+		}
+	}
+}
+
+func TestBodyLimitsConfigRoundTrip(t *testing.T) {
+	f := testConfig("http://127.0.0.1:1", "anthropic")
+	f.BodyLimits = bodyLimitsConfig{RequestMaxBytes: 96 << 20, JSONMaxBytes: 48 << 20, RequestReadTimeoutMS: 45000, JSONReadTimeoutMS: 30000, ErrorReadTimeoutMS: 2000}
+	encoded, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := decodeFileConfig("/synthetic/config.json", encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BodyLimits != f.BodyLimits {
+		t.Fatalf("body limits changed: %+v", cfg.BodyLimits)
+	}
+}
