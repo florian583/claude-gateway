@@ -24,26 +24,26 @@ import (
 // matching `taskClass` legs receive a bonus and `risky` turns prefer trusted
 // providers. Every failure is fail-open: the request proceeds unmodified.
 type classifierDefinition struct {
-	Enabled               bool              `json:"enabled"`
-	Shadow                bool              `json:"shadow"`
-	ShadowPromptChars     int               `json:"shadowPromptChars"`
-	Provider              string            `json:"provider"`
-	Model                 string            `json:"model"`
-	TimeoutMS             int               `json:"timeoutMS"`
-	CacheTTLSeconds       int               `json:"cacheTTLSeconds"`
+	Enabled           bool   `json:"enabled"`
+	Shadow            bool   `json:"shadow"`
+	ShadowPromptChars int    `json:"shadowPromptChars"`
+	Provider          string `json:"provider"`
+	Model             string `json:"model"`
+	TimeoutMS         int    `json:"timeoutMS"`
+	CacheTTLSeconds   int    `json:"cacheTTLSeconds"`
 	// DedupeTTLSeconds is the lifetime of the textHash->hint dedupe cache —
 	// identical prompt text across conversations reuses the classification for
 	// this long. Kept longer than CacheTTLSeconds because identical literal
 	// text deserves the same tier far beyond a conversation's context window.
-	DedupeTTLSeconds      int               `json:"dedupeTTLSeconds"`
-	FailureBackoffSeconds int               `json:"failureBackoffSeconds"`
-	MinUpgradeConfidence  float64           `json:"minUpgradeConfidence"`
-	MinDowngradeConfidence float64          `json:"minDowngradeConfidence"`
-	RiskyThreshold        float64           `json:"riskyThreshold"`
-	TierMatchBonus        float64           `json:"tierMatchBonus"`
-	RiskyProviders        []string          `json:"riskyProviders"`
-	RiskyBonus            float64           `json:"riskyBonus"`
-	MaxPromptChars        int               `json:"maxPromptChars"`
+	DedupeTTLSeconds       int      `json:"dedupeTTLSeconds"`
+	FailureBackoffSeconds  int      `json:"failureBackoffSeconds"`
+	MinUpgradeConfidence   float64  `json:"minUpgradeConfidence"`
+	MinDowngradeConfidence float64  `json:"minDowngradeConfidence"`
+	RiskyThreshold         float64  `json:"riskyThreshold"`
+	TierMatchBonus         float64  `json:"tierMatchBonus"`
+	RiskyProviders         []string `json:"riskyProviders"`
+	RiskyBonus             float64  `json:"riskyBonus"`
+	MaxPromptChars         int      `json:"maxPromptChars"`
 	// AliasClasses maps a request alias (e.g. "fable") to the natural task
 	// class it was configured for ("fast"|"balanced"|"deep"). It anchors the
 	// asymmetric confidence bars: downgrading needs more confidence than
@@ -52,38 +52,38 @@ type classifierDefinition struct {
 }
 
 type classifierConfig struct {
-	Enabled               bool
-	Shadow                bool
-	ShadowPromptChars     int
-	Provider              string
-	Model                 string
-	Timeout               time.Duration
-	CacheTTL              time.Duration
-	DedupeTTL             time.Duration
-	FailureBackoff        time.Duration
-	MinUpgradeConfidence  float64
+	Enabled                bool
+	Shadow                 bool
+	ShadowPromptChars      int
+	Provider               string
+	Model                  string
+	Timeout                time.Duration
+	CacheTTL               time.Duration
+	DedupeTTL              time.Duration
+	FailureBackoff         time.Duration
+	MinUpgradeConfidence   float64
 	MinDowngradeConfidence float64
-	RiskyThreshold        float64
-	TierMatchBonus        float64
-	RiskyProviders        map[string]bool
-	RiskyBonus            float64
-	MaxPromptChars        int
-	AliasClasses          map[string]string
+	RiskyThreshold         float64
+	TierMatchBonus         float64
+	RiskyProviders         map[string]bool
+	RiskyBonus             float64
+	MaxPromptChars         int
+	AliasClasses           map[string]string
 }
 
 // taskDecision is the raw evaluation-model answer, before policy.
 type taskDecision struct {
-	Tier         string
+	Tier             string
 	TierConfidence   float64 // 0 when the backend reports none
-	Effort       float64
+	Effort           float64
 	EffortConfidence float64
-	Risky        float64
+	Risky            float64
 }
 
 // taskRouteHint is the policy output consumed by candidate ranking.
 type taskRouteHint struct {
 	Decided bool
-	Tier    string  // "fast" | "balanced" | "deep" after confidence gating
+	Tier    string // "fast" | "balanced" | "deep" after confidence gating
 	Risky   bool
 	Effort  float64
 	Sample  string // truncated classified input, only when shadowPromptChars > 0
@@ -221,14 +221,14 @@ func claudeInternalPrompt(text string) bool {
 // protocol (specification version 4). `criteria` for a choice question is a
 // map of option->description; for a score question it is the rubric array.
 type evaluationRequest struct {
-	State     map[string]any               `json:"state"`
+	State     map[string]any                `json:"state"`
 	Questions map[string]evaluationQuestion `json:"questions"`
 }
 
 type evaluationQuestion struct {
-	Type         string   `json:"type"`
-	Instructions string   `json:"instructions"`
-	Criteria     any      `json:"criteria"`
+	Type         string `json:"type"`
+	Instructions string `json:"instructions"`
+	Criteria     any    `json:"criteria"`
 }
 
 var tierCriteria = map[string]string{

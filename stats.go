@@ -47,20 +47,20 @@ func parseStatsArgs(args []string) (statsFlags, error) {
 type providerStats struct {
 	Completions, Successes, Failures, Fallbacks, Cancels int64
 	InputTokens, OutputTokens, CacheReadTokens           int64
-	CostUSD                                             float64
-	FirstContent, TPS                                   []int64
+	CostUSD                                              float64
+	FirstContent, TPS                                    []int64
 }
 
 type statsReport struct {
-	SinceHours float64                          `json:"sinceHours"`
-	Providers  map[string]providerStats         `json:"providers"`
-	ModelMix   map[string]map[string]int64      `json:"modelMix"`
-	Failures   map[string]int64                 `json:"failures"`
-	Skips      map[string]int64                 `json:"policySkips"`
-	Clients    map[string]int64                 `json:"clients"`
-	SpendByDay map[string]map[string]float64    `json:"spendByDay"`
-	Quota      map[string]usageHistoryEntry     `json:"quotaLatest"`
-	Events     []proxyEvent                     `json:"events"`
+	SinceHours float64                       `json:"sinceHours"`
+	Providers  map[string]providerStats      `json:"providers"`
+	ModelMix   map[string]map[string]int64   `json:"modelMix"`
+	Failures   map[string]int64              `json:"failures"`
+	Skips      map[string]int64              `json:"policySkips"`
+	Clients    map[string]int64              `json:"clients"`
+	SpendByDay map[string]map[string]float64 `json:"spendByDay"`
+	Quota      map[string]usageHistoryEntry  `json:"quotaLatest"`
+	Events     []proxyEvent                  `json:"events"`
 }
 
 func buildStatsReport(stateDir string, since time.Duration) (statsReport, error) {

@@ -77,6 +77,13 @@ func (s *proxyServer) expandConfiguredClaudeAttempts(r *http.Request, candidates
 			continue
 		}
 		profiles := s.profilesForCandidate(m, r)
+		if m.AccountScope == "pinned" {
+			p, ok := selectedClaudeProfile(r)
+			if !ok || !profileInClaudePool(p, profiles) {
+				continue
+			}
+			profiles = []claudeUsageProfile{p}
+		}
 		if p, ok := selectedClaudeProfile(r); ok && profileInClaudePool(p, profiles) {
 			profiles = s.orderClaudeFallbackProfiles(profiles, p, s.preserveSonnetSubscriptionOrder(m))
 		}
@@ -386,15 +393,19 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 		return ctx.Err()
 	}
 	defer func() { <-gate }()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	before, _ := resolveClaudeProfileOAuthToken(ctx, profile, true)
 	cmd, e := makeProfileCommand(ctx, p, p.RefreshCommand, nil)
 	if e != nil {
 		return e
 	}
-	cmd.Stdout = nil
-	output, e := cmd.Output()
-	if e != nil {
-		return errors.New("configured refresh command failed")
+	var output limitedBuffer
+	output.limit = 4096
+	cmd.Stdout = &output
+	runErr := cmd.Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	clearClaudeProfileOAuthToken(profile)
 	after, e := resolveClaudeProfileOAuthToken(ctx, profile, true)
@@ -406,7 +417,7 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 			Version      int  `json:"version"`
 			AuthVerified bool `json:"authVerified"`
 		}
-		if json.Unmarshal(output, &receipt) != nil || receipt.Version != 1 || !receipt.AuthVerified {
+		if runErr != nil || json.Unmarshal(output.Bytes(), &receipt) != nil || receipt.Version != 1 || !receipt.AuthVerified {
 			return errors.New("refresh command did not rotate credential or verify authentication")
 		}
 	}
@@ -438,7 +449,7 @@ func (s *proxyServer) monitorProfileCredentials(ctx context.Context) {
 				return
 			}
 			raw, ok := claudeOAuthCredentials.Load(profile.CredentialsService)
-			if e != nil || !ok || (!raw.(cachedClaudeOAuthCredential).expiresAt.IsZero() && raw.(cachedClaudeOAuthCredential).expiresAt.Before(time.Now().Add(2*time.Minute))) {
+			if e != nil || !ok || !raw.(cachedClaudeOAuthCredential).expiresAt.After(time.Now().Add(2*time.Minute)) {
 				s.triggerClaudeOAuthRefresh(profile)
 			}
 		}

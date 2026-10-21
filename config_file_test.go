@@ -258,3 +258,14 @@ func TestConfiguredProfileCommandIsolation(t *testing.T) {
 		t.Fatalf("bad status output %s", out.String())
 	}
 }
+
+func TestExplicitNonLoopbackListener(t *testing.T) {
+	f := testConfig("http://127.0.0.1:1", "anthropic")
+	f.AllowNonLoopbackListen = true
+	f.Listen = "0.0.0.0:48104"
+	f.AlsoListen = []string{"127.0.0.1:48107"}
+	cfg := compileFixture(t, f)
+	if cfg.Listen != f.Listen {
+		t.Fatal("listener changed")
+	}
+}

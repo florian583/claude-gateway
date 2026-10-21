@@ -19,23 +19,24 @@ import (
 
 // fileConfig is the JSON schema; config contains compiled routing tables.
 type fileConfig struct {
-	Version            int                              `json:"version"`
-	Listen             string                           `json:"listen"`
-	AlsoListen         []string                         `json:"alsoListen,omitempty"`
-	Normalize          normalizeConfig                  `json:"normalize,omitempty"`
-	AdaptiveRouting    *adaptiveRoutingConfig           `json:"adaptiveRouting,omitempty"`
-	Classifier         *classifierDefinition            `json:"classifier,omitempty"`
-	ProviderQuarantine *providerQuarantineConfig        `json:"providerQuarantine,omitempty"`
-	StateDir           string                           `json:"stateDir"`
-	ErrorTrace         errorTraceConfig                 `json:"errorTrace,omitempty"`
-	Client             clientDefinition                 `json:"client"`
-	Profiles           map[string]profileDefinition     `json:"profiles"`
-	AccountPools       map[string]accountPoolDefinition `json:"accountPools"`
-	Providers          map[string]providerDefinition    `json:"providers"`
-	Models             map[string]modelDefinition       `json:"models"`
-	ModelPools         map[string]modelPoolDefinition   `json:"modelPools"`
-	Chains             map[string]chainDefinition       `json:"chains"`
-	Aliases            map[string]string                `json:"aliases"`
+	AllowNonLoopbackListen bool                             `json:"allowNonLoopbackListen,omitempty"`
+	Version                int                              `json:"version"`
+	Listen                 string                           `json:"listen"`
+	AlsoListen             []string                         `json:"alsoListen,omitempty"`
+	Normalize              normalizeConfig                  `json:"normalize,omitempty"`
+	AdaptiveRouting        *adaptiveRoutingConfig           `json:"adaptiveRouting,omitempty"`
+	Classifier             *classifierDefinition            `json:"classifier,omitempty"`
+	ProviderQuarantine     *providerQuarantineConfig        `json:"providerQuarantine,omitempty"`
+	StateDir               string                           `json:"stateDir"`
+	ErrorTrace             errorTraceConfig                 `json:"errorTrace,omitempty"`
+	Client                 clientDefinition                 `json:"client"`
+	Profiles               map[string]profileDefinition     `json:"profiles"`
+	AccountPools           map[string]accountPoolDefinition `json:"accountPools"`
+	Providers              map[string]providerDefinition    `json:"providers"`
+	Models                 map[string]modelDefinition       `json:"models"`
+	ModelPools             map[string]modelPoolDefinition   `json:"modelPools"`
+	Chains                 map[string]chainDefinition       `json:"chains"`
+	Aliases                map[string]string                `json:"aliases"`
 }
 type clientDefinition struct {
 	MenuModels  map[string]string `json:"menuModels,omitempty"`
@@ -149,6 +150,7 @@ type chainStep struct {
 	Pool  string `json:"pool"`
 }
 type chainDefinition struct {
+	AccountScope         string      `json:"accountScope,omitempty"`
 	SoftConcurrency      int         `json:"softConcurrency,omitempty"`
 	Steps                []chainStep `json:"steps"`
 	AllowPaidFallback    bool        `json:"allowPaidFallback"`
@@ -316,14 +318,14 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	host, port, e := net.SplitHostPort(f.Listen)
 	portNumber, portErr := strconv.Atoi(port)
-	if e != nil || portErr != nil || portNumber < 0 || portNumber > 65535 || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+	if e != nil || portErr != nil || portNumber < 0 || portNumber > 65535 || net.ParseIP(host) == nil || (!net.ParseIP(host).IsLoopback() && !f.AllowNonLoopbackListen) {
 		return config{}, errors.New("listen must be a literal loopback IP and port")
 	}
 	seenListeners := map[string]bool{f.Listen: true}
 	for _, addr := range f.AlsoListen {
 		h, p, err := net.SplitHostPort(addr)
 		n, parseErr := strconv.Atoi(p)
-		if err != nil || parseErr != nil || n < 1 || n > 65535 || net.ParseIP(h) == nil || !net.ParseIP(h).IsLoopback() || seenListeners[addr] {
+		if err != nil || parseErr != nil || n < 1 || n > 65535 || net.ParseIP(h) == nil || (!net.ParseIP(h).IsLoopback() && !f.AllowNonLoopbackListen) || seenListeners[addr] {
 			return config{}, errors.New("alsoListen requires unique literal loopback addresses and nonzero ports")
 		}
 		seenListeners[addr] = true
@@ -723,6 +725,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	compiled := map[string]modelConfig{}
 	for _, id := range sortedKeys(f.Chains) {
 		c := f.Chains[id]
+		if c.AccountScope != "" && c.AccountScope != "pinned" {
+			return config{}, fmt.Errorf("chain %s has invalid accountScope", id)
+		}
 		if c.SoftConcurrency < 0 || (c.SoftConcurrency > 0 && !c.AllowPaidFallback) {
 			return config{}, errors.New("softConcurrency requires a positive value and allowPaidFallback")
 		}
@@ -743,6 +748,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			seenReasons[r] = true
 		}
 		var members []modelConfig
+		pinnedPool := ""
 		seen := map[string]bool{}
 		for stage, step := range c.Steps {
 			if (step.Model == "") == (step.Pool == "") {
@@ -772,6 +778,16 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 					tier += offset
 				}
 				m.Tier = &tier
+				if c.AccountScope == "pinned" && cfg.Providers[m.Provider].Variant == "claude-subscription" {
+					if len(members) > 0 && pinnedPool == "" {
+						return config{}, fmt.Errorf("pinned chain %s must start with Claude", id)
+					}
+					if pinnedPool != "" && pinnedPool != m.AccountPool {
+						return config{}, fmt.Errorf("pinned chain %s requires one Claude account pool", id)
+					}
+					pinnedPool = m.AccountPool
+				}
+				m.AccountScope = c.AccountScope
 				m.ConfiguredPool = step.Pool
 				m.AllowPaidFallback = c.AllowPaidFallback
 				m.SoftConcurrency = c.SoftConcurrency

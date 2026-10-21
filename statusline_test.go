@@ -77,7 +77,7 @@ func TestLastRouteEndpoint(t *testing.T) {
 func TestLastRouteSessionCap(t *testing.T) {
 	s := &proxyServer{}
 	for i := 0; i < lastRouteMaxSessions+5; i++ {
-		s.noteLastRoute(lastRouteInfo{SessionID: string(rune('a' + i%26)) + string(rune('a'+i/26)), At: time.Now()})
+		s.noteLastRoute(lastRouteInfo{SessionID: string(rune('a'+i%26)) + string(rune('a'+i/26)), At: time.Now()})
 	}
 	s.lastRoutesMu.Lock()
 	defer s.lastRoutesMu.Unlock()

@@ -114,6 +114,7 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
+	AccountScope         string         `json:"-"`
 	SoftConcurrency      int            `json:"-"`
 	ModelID              string         `json:"-"`
 	AccountStickySeconds int            `json:"-"`
@@ -3104,7 +3105,7 @@ func (s *proxyServer) rankCandidates(selected modelConfig, candidates []modelCon
 // switching a signed tool conversation mid-turn invalidates thinking blocks.
 func (s *proxyServer) rankCandidatesForRequest(selected modelConfig, candidates []modelConfig, stickyKey string, allowExplore bool, history thinkingHistoryKind, hint taskRouteHint) []modelConfig {
 	if s.cfg.Definition != nil {
-		if s.preserveSonnetSubscriptionOrder(selected) {
+		if selected.AccountScope == "pinned" || s.preserveSonnetSubscriptionOrder(selected) {
 			hint = taskRouteHint{}
 		}
 		return s.rankConfiguredCandidates(candidates, stickyKey, hint)
@@ -3307,6 +3308,9 @@ func (s *proxyServer) claudeModelQuotaBlockKey(runtimeProviderName string, candi
 	providerName := s.cfg.ClaudeUsage.Provider
 	if providerName == "" || (runtimeProviderName != providerName && !strings.HasPrefix(runtimeProviderName, providerName+"@")) {
 		return ""
+	}
+	if candidate.AccountScope == "pinned" {
+		return runtimeProviderName + "#model:" + candidate.Upstream
 	}
 	if family := claudeQuotaFamily(candidate); family != "" {
 		return runtimeProviderName + "#" + family
@@ -4668,11 +4672,17 @@ func (s *proxyServer) triggerClaudeOAuthRefresh(profile claudeUsageProfile) {
 			s.claudeRefreshMu.Unlock()
 		}()
 		started := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		timeout := 2 * time.Minute
+		if s.cfg.Definition != nil {
+			timeout *= time.Duration(len(s.cfg.Definition.Profiles) + 1)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := s.claudeRefreshRunner(ctx, profile); err != nil {
-			s.noteClaudeCredentialRefreshResult(profile, false, started)
-			clearClaudeProfileOAuthToken(profile)
+			if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.noteClaudeCredentialRefreshResult(profile, false, started)
+				clearClaudeProfileOAuthToken(profile)
+			}
 			log.Printf("Claude OAuth refresh helper profile=%q failed", profile.Name)
 			return
 		}
@@ -5497,6 +5507,10 @@ func (s *proxyServer) selectClaudeProfile(ctx context.Context, r *http.Request, 
 	for _, profile := range profiles {
 		runtimeKey := s.cfg.ClaudeUsage.Provider + "@" + profile.Name
 		blocked, state := s.providerBlockForCandidate(runtimeKey, candidate)
+		if candidate.AccountScope == "pinned" {
+			blocked, state = s.providerBlocked(runtimeKey)
+			blocked = blocked && (state.Reason == "auth_unavailable" || state.Reason == "auth_exhausted" || state.Reason == "auth_quarantined" || isQuotaReason(state.Reason))
+		}
 		if blocked {
 			failures = append(failures, profile.Name+":"+firstNonEmpty(state.Reason, "blocked"))
 			continue
@@ -7257,7 +7271,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		s.seedConversationFamily(stickyKey, s.openingConversationFamily(ctx, r, candidates))
 	}
 	var hint taskRouteHint
-	if !countTokens {
+	if !countTokens && selected.AccountScope != "pinned" {
 		hint = s.taskRouteHintForRequest(ctx, selected, payload, stickyKey)
 	}
 	applied := hint
@@ -7616,7 +7630,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 						anthropicOutageConfirmed = s.observeClaudeServiceFailure()
 						anthropicServiceSignalRecorded = true
 					}
-					anthropicServiceOutage = shouldShortCircuitClaudeTransport(anthropicTransportFailures, anthropicOutageConfirmed)
+					anthropicServiceOutage = candidate.AccountScope != "pinned" && shouldShortCircuitClaudeTransport(anthropicTransportFailures, anthropicOutageConfirmed)
 				}
 			}
 			if networkDecision.StopFallback {
@@ -7799,7 +7813,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			case resp.StatusCode >= http.StatusInternalServerError:
 				signal = "http_5xx"
 				if providerName == s.cfg.ClaudeUsage.Provider {
-					anthropicServiceOutage = true
+					anthropicServiceOutage = candidate.AccountScope != "pinned"
 					if anthropicFailureClass != "auth_or_client" {
 						anthropicFailureClass = "service"
 					}

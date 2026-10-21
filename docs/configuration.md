@@ -198,3 +198,23 @@ eligible until real exhaustion. Values must be in 0..100; zero disables that
 threshold. Requires API mode and at least one threshold and reserve upstream.
 These deliberate quota skips qualify as quota evidence for an explicitly enabled
 paid fallback, but authentication or network failures do not.
+
+## Pinned worker chains
+
+Set `accountScope: "pinned"` on a chain to bind its Claude stages to one account per request. Omit the field to keep pool-wide fallback. A pinned chain starts with Claude and uses one Claude account pool.
+
+Use ordered stages for Haiku 5.5, Sonnet 5.5, then the GLM 5.3 flash pool. Both Claude attempts use the selected account. Model rate limits and failures preserve its lease. Known account auth failures or quota thresholds permit replacement when the next request selects an account. No selected account means Claude stages are skipped.
+
+A model-scoped 429 allows the next model; explicit global quota headers still block the account. Claude 5xx responses allow the next pinned model before external fallback. Paid-fallback, context, image, tool, cancellation and stream-commit rules still apply. A failed response after client-visible output is never replayed.
+
+## Credential renewal
+
+Each profile needs an explicit `refreshCommand` to enable background renewal, including dormant profiles. The monitor checks once per minute, without inference, and invokes the configured helper when expiry is within two minutes, unknown, or unreadable. The helper controls whether renewal itself invokes inference. Missing refresh commands disable this monitor for that profile.
+
+Refresh succeeds only after rereading a usable credential. A changed token is accepted even if the helper exits nonzero after rotating it. For an unchanged token, a successful helper must emit `{"version":1,"authVerified":true}` to confirm authentication. An expired credential, unverified no-op, or failed helper without rotation never clears an auth block. Output is bounded to 4 KiB and is never logged.
+
+Background checks cannot restore a revoked refresh token or a removed Keychain entry. Those require account login. A healthy expiry alone does not prove upstream authentication.
+
+### Private network listeners
+
+Listeners require loopback addresses by default. Set `allowNonLoopbackListen: true` only when the host firewall controls access to the gateway. This explicit opt-in permits literal non-loopback listener addresses, including wildcard addresses. It does not add authentication to the gateway.
