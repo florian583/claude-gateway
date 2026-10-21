@@ -1075,6 +1075,7 @@ type proxyServer struct {
 	claudeAccountMu          sync.Mutex
 	claudeAccounts           map[string]claudeAccountSticky
 	claudePersistentPins     map[string]persistedAccountPin
+	claudePinWriter          *accountPinWriter
 	claudeAccountInFlight    map[string]int
 	claudeSelectionLogMu     sync.Mutex
 	claudeSelectionLogged    map[string]string
@@ -1130,6 +1131,7 @@ func serve(cfg config) error {
 		return err
 	}
 	defer server.metrics.close()
+	defer server.closeClaudeAccountPins()
 	defer server.events.close()
 	defer server.usageHistory.close()
 

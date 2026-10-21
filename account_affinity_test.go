@@ -46,6 +46,10 @@ func TestAccountPinsPersistAndValidatePool(t *testing.T) {
 	profile := claudeUsageProfile{Name: "test-primary", CredentialsService: "synthetic-service"}
 	key := "synthetic-conversation-identity"
 	s.refreshClaudeAccountLease(key, profile)
+	t.Cleanup(func() { _ = s.closeClaudeAccountPins() })
+	if err := s.flushClaudeAccountPins(); err != nil {
+		t.Fatal(err)
+	}
 	file := s.accountPinPath()
 	data, err := os.ReadFile(file)
 	if err != nil {
@@ -76,6 +80,9 @@ func TestAccountPinsPersistAndValidatePool(t *testing.T) {
 	chosen, _, changed := restarted.chooseClaudeAccountWithPolicy([]availableClaudeAccount{{profile: other}}, key, profile, false, false)
 	if chosen.profile.Name != other.Name || !changed {
 		t.Fatal("unavailable pinned account did not fail over")
+	}
+	if err := restarted.closeClaudeAccountPins(); err != nil {
+		t.Fatal(err)
 	}
 	restarted.loadClaudeAccountPins()
 	pin, ok = restarted.restoreClaudeAccountPinLocked(key, []claudeUsageProfile{profile, other})
