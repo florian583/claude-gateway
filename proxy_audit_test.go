@@ -140,10 +140,10 @@ func TestAuditMetricsPendingGrowsOnDiskFailure(t *testing.T) {
 	m.mu.Lock()
 	pending := len(m.pending)
 	m.mu.Unlock()
-	if pending != 300 {
+	if pending != 10 || m.persistenceDropped() != 290 {
 		t.Fatalf("pending=%d", pending)
 	}
-	t.Logf("pending=%d despite MaxSamples=10 after repeated disk failures", pending)
+	t.Logf("pending=%d, dropped=%d after repeated disk failures", pending, m.persistenceDropped())
 }
 
 func BenchmarkAuditRequestProcessing(b *testing.B) {
