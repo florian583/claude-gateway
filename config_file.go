@@ -19,6 +19,7 @@ import (
 
 // fileConfig is the JSON schema; config contains compiled routing tables.
 type fileConfig struct {
+	BodyLimits             bodyLimitsConfig                 `json:"bodyLimits,omitempty"`
 	AllowNonLoopbackListen bool                             `json:"allowNonLoopbackListen,omitempty"`
 	Version                int                              `json:"version"`
 	Listen                 string                           `json:"listen"`
@@ -360,6 +361,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	cfg := config{Definition: &f, Listen: f.Listen, Providers: map[string]providerConfig{}, Models: map[string]modelConfig{}, Chains: map[string]routeChain{}}
 	cfg.AlsoListen = append([]string(nil), f.AlsoListen...)
+	cfg.BodyLimits = f.BodyLimits
 	cfg.Normalize = f.Normalize
 	for from, to := range f.Normalize.UnsupportedContentTypes {
 		if from != "tool_reference" || to != "text" {

@@ -51,6 +51,7 @@ func TestAuditErrorBodyOutlivesHeaderDeadline(t *testing.T) {
 	f.Models["backup"] = m
 	f.Chains["main"] = chainDefinition{Steps: []chainStep{{Model: "model"}, {Model: "backup"}}}
 	cfg := compileFixture(t, f)
+	cfg.BodyLimits.ErrorReadTimeoutMS = 30
 	pc := cfg.Providers["endpoint"]
 	pc.ResponseHeaderTimeoutMS = 20
 	cfg.Providers["endpoint"] = pc
@@ -68,22 +69,13 @@ func TestAuditErrorBodyOutlivesHeaderDeadline(t *testing.T) {
 	}
 	select {
 	case <-done:
-		t.Fatal("stalled body unexpectedly finished")
-	case <-time.After(200 * time.Millisecond):
-	}
-	if fallback.Load() != 0 {
-		t.Fatal("fallback ran before body completed")
-	}
-	unblock()
-	select {
-	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("did not recover after body completed")
+		t.Fatal("stalled error body prevented fallback")
 	}
 	if fallback.Load() != 1 || w.Code != 200 {
 		t.Fatalf("fallback=%d status=%d", fallback.Load(), w.Code)
 	}
-	t.Log("429 body blocked fallback for >200ms despite 20ms header deadline")
+
 }
 
 func TestAuditTruncatedJSONRecordedAsSuccess(t *testing.T) {
@@ -95,23 +87,23 @@ func TestAuditTruncatedJSONRecordedAsSuccess(t *testing.T) {
 	defer upstream.Close()
 	s := testProxy(t, compileFixture(t, testConfig(upstream.URL, "anthropic")))
 	w := sendTestRequest(s, `{"model":"test","messages":[{"role":"user","content":"hello"}]}`)
-	if w.Code != 200 || json.Valid(w.Body.Bytes()) {
+	if w.Code != 502 || !json.Valid(w.Body.Bytes()) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 	samples := s.metrics.readPerRoute(100)
 	found := false
 	for _, sample := range samples {
-		if sample.RecordKind == "completion" {
+		if sample.FailureReason != "" {
 			found = true
-			if !sample.Success {
-				t.Fatal("truncated response correctly marked failed")
+			if sample.Success {
+				t.Fatal("truncated response marked successful")
 			}
 		}
 	}
 	if !found {
 		t.Fatal("no completion evidence")
 	}
-	t.Log("truncated upstream JSON forwarded as HTTP 200 and recorded as successful completion")
+
 }
 
 func TestAuditExpiredAccountPinsAccumulate(t *testing.T) {

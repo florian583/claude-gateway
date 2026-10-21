@@ -30,6 +30,7 @@ import (
 )
 
 type config struct {
+	BodyLimits      bodyLimitsConfig          `json:"bodyLimits,omitempty"`
 	Definition      *fileConfig               `json:"-"`
 	SourcePath      string                    `json:"-"`
 	SourceHash      string                    `json:"-"`
@@ -1233,6 +1234,10 @@ func (s *proxyServer) handler() http.Handler {
 }
 
 func normalizeRuntimeConfig(path string, body []byte, cfg config) (config, error) {
+	if err := cfg.BodyLimits.validate(); err != nil {
+		return config{}, err
+	}
+	cfg.BodyLimits = cfg.BodyLimits.defaults()
 	cfg.SourcePath = path
 	cfg.SourceHash = fmt.Sprintf("%x", sha256.Sum256(body))
 	if cfg.Listen == "" {
@@ -6555,8 +6560,19 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	r, requestID := ensureProxyRequestID(r)
 	requestStarted := time.Now()
 	w.Header().Set("X-Proxy-Request-ID", requestID)
+	limits := s.cfg.BodyLimits.defaults()
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(time.Duration(limits.RequestReadTimeoutMS) * time.Millisecond))
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, limits.RequestMaxBytes)
+	}
 	body, payload, selectedModel, err := s.normalizeRequest(r)
-	if r.Context().Err() != nil {
+	if err == nil {
+		_ = controller.SetReadDeadline(time.Time{})
+	}
+
+	requestErrorStatus, requestErrorReason := requestBodyFailure(err)
+	if r.Context().Err() != nil && (err == nil || requestErrorStatus != http.StatusRequestTimeout) {
 		s.recordRequestTerminal(requestID, r, selectedModel, 499, "client_cancel", requestStarted)
 		return
 	}
@@ -6566,8 +6582,9 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-		s.recordRequestTerminal(requestID, r, selectedModel, http.StatusInternalServerError, "normalize_error", requestStarted)
-		writeAPIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		w.Header().Set("Connection", "close")
+		s.recordRequestTerminal(requestID, r, selectedModel, requestErrorStatus, requestErrorReason, requestStarted)
+		writeAPIError(w, requestErrorStatus, "invalid_request_error", err.Error())
 		return
 	}
 	if session := payloadSessionID(payload); session != "" {
@@ -6661,9 +6678,9 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(contentType, "application/json"):
 		var source io.ReadCloser = resp.Body
 		if openAIChat {
-			source = newOpenAIJSONReadCloserWithStats(source, responseAlias, stats)
+			source = newOpenAIJSONReadCloserWithStats(source, responseAlias, stats, s.cfg.BodyLimits)
 		}
-		responseBody = newJSONFilterReadCloser(source, dropTypes, responseAlias, stats)
+		responseBody = newJSONFilterReadCloserWithLimits(source, dropTypes, responseAlias, s.cfg.BodyLimits, stats)
 	default:
 		responseBody = resp.Body
 	}
@@ -7773,6 +7790,36 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				trace.FirstEventMS = time.Since(attemptStarted).Milliseconds()
 			}
 		}
+		if resp.Body != nil {
+			if bodyErr := s.bufferUpstreamBody(ctx, resp, trace); bodyErr != nil {
+				execution.ResponseReadError = true
+				if ctx.Err() != nil {
+					return upstreamResponse{}, ctx.Err()
+				}
+				reason := bodyReadFailure(ctx, bodyErr)
+				if resp.StatusCode == http.StatusTooManyRequests {
+					limitErr := s.rateLimitResponse(providerName, runtimeProviderName, candidate, resp.Header, nil, !countTokens)
+					paidEvidence[evidenceKey] = "quota-exhausted"
+					lastErr = limitErr
+				} else {
+					lastErr = responseBodyError(providerName, bodyErr)
+				}
+				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+					authTokenCache.Delete(providerName)
+					if providerName == s.cfg.ClaudeUsage.Provider {
+						profile := s.claudeProfileForRequest(attemptRequest)
+						clearClaudeProfileOAuthToken(profile)
+						s.triggerClaudeOAuthRefresh(profile)
+						s.markProviderBlocked(runtimeProviderName, "auth_exhausted", time.Minute)
+					}
+				}
+				if !countTokens && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), "provider_protocol_error")
+				}
+				s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, i < len(attempts)-1, reason)
+				continue
+			}
+		}
 		s.observeNetworkSuccess()
 		if s.cfg.Definition != nil {
 			if s.updateOutageEvidence(evidenceKey, trace.ID, resp.StatusCode) && resp.StatusCode >= 500 {
@@ -8224,11 +8271,17 @@ func (s *proxyServer) normalizeRequest(r *http.Request) ([]byte, map[string]any,
 		}
 		return nil, nil, modelConfig{}, nil
 	}
-	body, err := io.ReadAll(r.Body)
+	limit := s.cfg.BodyLimits.defaults().RequestMaxBytes
+	if r.ContentLength > limit {
+		return nil, nil, modelConfig{}, errBodyTooLarge
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(body)) > limit {
+		return nil, nil, modelConfig{}, errBodyTooLarge
+	}
 	if err != nil {
 		return nil, nil, modelConfig{}, err
 	}
-	_ = r.Body.Close()
 	if len(body) == 0 {
 		if s.cfg.Definition != nil {
 			return invalid()
@@ -9256,13 +9309,19 @@ func joinURLPath(basePath, requestPath string) string {
 
 type bufferedReadCloser struct {
 	source io.ReadCloser
-	reader *strings.Reader
+	reader io.Reader
 }
 
 func newJSONFilterReadCloser(source io.ReadCloser, dropTypes map[string]bool, responseAlias string, telemetry ...*streamStats) io.ReadCloser {
-	body, err := io.ReadAll(source)
+	return newJSONFilterReadCloserWithLimits(source, dropTypes, responseAlias, bodyLimitsConfig{}, telemetry...)
+}
+func newJSONFilterReadCloserWithLimits(source io.ReadCloser, dropTypes map[string]bool, responseAlias string, limits bodyLimitsConfig, telemetry ...*streamStats) io.ReadCloser {
+	body, err := readBoundedResponseBody(context.Background(), source, limits.defaults().JSONMaxBytes, time.Duration(limits.defaults().JSONReadTimeoutMS)*time.Millisecond)
+	if err == nil && !validResponseJSONObject(body) {
+		err = errInvalidResponseJSON
+	}
 	if err != nil {
-		return &bufferedReadCloser{source: source, reader: strings.NewReader(string(body))}
+		return &bufferedReadCloser{source: source, reader: failedBodyReader{err}}
 	}
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) == nil {
@@ -10599,8 +10658,15 @@ func newOpenAIJSONReadCloser(source io.ReadCloser, responseAlias string) io.Read
 	return newOpenAIJSONReadCloserWithStats(source, responseAlias, nil)
 }
 
-func newOpenAIJSONReadCloserWithStats(source io.ReadCloser, responseAlias string, stats *streamStats) io.ReadCloser {
-	body, err := io.ReadAll(source)
+func newOpenAIJSONReadCloserWithStats(source io.ReadCloser, responseAlias string, stats *streamStats, configured ...bodyLimitsConfig) io.ReadCloser {
+	limits := bodyLimitsConfig{}.defaults()
+	if len(configured) > 0 {
+		limits = configured[0].defaults()
+	}
+	body, err := readBoundedResponseBody(context.Background(), source, limits.JSONMaxBytes, time.Duration(limits.JSONReadTimeoutMS)*time.Millisecond)
+	if err == nil && !validResponseJSONObject(body) {
+		err = errInvalidResponseJSON
+	}
 	if stats != nil {
 		var original map[string]any
 		if json.Unmarshal(body, &original) == nil {
@@ -10610,7 +10676,7 @@ func newOpenAIJSONReadCloserWithStats(source io.ReadCloser, responseAlias string
 		}
 	}
 	if err != nil {
-		return &bufferedReadCloser{source: source, reader: strings.NewReader(string(body))}
+		return &bufferedReadCloser{source: source, reader: failedBodyReader{err}}
 	}
 	translated, protocolError := translateOpenAIJSONResponseChecked(body, responseAlias)
 	if protocolError && stats != nil {
