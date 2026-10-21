@@ -7856,17 +7856,25 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			if bodyErr := s.bufferUpstreamBody(ctx, resp, trace); bodyErr != nil {
 				execution.ResponseReadError = true
 				if ctx.Err() != nil {
+					s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, false, "client_cancel")
 					return upstreamResponse{}, ctx.Err()
 				}
 				reason := bodyReadFailure(ctx, bodyErr)
-				if resp.StatusCode == http.StatusTooManyRequests {
-					limitErr := s.rateLimitResponse(providerName, runtimeProviderName, candidate, resp.Header, nil, !countTokens)
+				quotaError := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusPaymentRequired
+				authError := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
+				clientError := resp.StatusCode >= 400 && resp.StatusCode < 500 && !quotaError && !authError
+				lastErr = responseBodyError(providerName, bodyErr)
+				if quotaError {
 					paidEvidence[evidenceKey] = "quota-exhausted"
-					lastErr = limitErr
-				} else {
-					lastErr = responseBodyError(providerName, bodyErr)
+					if resp.StatusCode == http.StatusTooManyRequests {
+						lastErr = s.rateLimitResponse(providerName, runtimeProviderName, candidate, resp.Header, nil, !countTokens)
+					} else if !countTokens {
+						quotaReason := providerFailureReason(resp.StatusCode, resp.Header, nil)
+						blockKey := s.providerFailureBlockKey(providerName, runtimeProviderName, candidate, resp.Header, quotaReason)
+						s.markProviderBlocked(blockKey, quotaReason, providerCooldownForReason(quotaReason, resp.Header, nil))
+					}
 				}
-				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				if authError {
 					authTokenCache.Delete(providerName)
 					if providerName == s.cfg.ClaudeUsage.Provider {
 						profile := s.claudeProfileForRequest(attemptRequest)
@@ -7875,10 +7883,38 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 						s.markProviderBlocked(runtimeProviderName, "auth_exhausted", time.Minute)
 					}
 				}
-				if !countTokens && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+				if providerName == s.cfg.ClaudeUsage.Provider {
+					if authError || clientError {
+						anthropicFailureClass = "auth_or_client"
+					} else if !quotaError && !countTokens {
+						if anthropicFailureClass != "auth_or_client" {
+							anthropicFailureClass = "service"
+						}
+						if resp.StatusCode >= 500 && !anthropicServiceSignalRecorded {
+							anthropicOutageConfirmed = s.observeClaudeServiceFailure()
+							anthropicServiceSignalRecorded = true
+						}
+						if resp.StatusCode >= 500 {
+							anthropicServiceOutage = candidate.AccountScope != "pinned"
+						}
+					}
+				}
+				if clientError {
+					// A missing rejection body does not authorize replay of a rejected payload.
+					resp.Header.Set("Content-Type", "application/json")
+					resp.Body = io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"invalid_request_error","message":"Upstream rejected the request; its error body could not be read."}}`))
+					return upstreamResponse{resp: resp, providerName: providerName, model: candidate, attempt: i, started: attemptStarted, trace: trace, failureReason: "client_invalid"}, nil
+				}
+				if s.cfg.Definition != nil && resp.StatusCode >= 500 && s.updateOutageEvidence(evidenceKey, trace.ID, resp.StatusCode) {
+					paidEvidence[evidenceKey] = "confirmed-provider-outage"
+				}
+				if !countTokens && !quotaError && !authError && accountAttempt.profile.Name == "" {
 					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), "provider_protocol_error")
 				}
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, i < len(attempts)-1, reason)
+				if accountAttempt.profile.Name != "" && !quotaError && !authError {
+					skipProfilesForUpstream = candidate.Upstream
+				}
 				continue
 			}
 		}
