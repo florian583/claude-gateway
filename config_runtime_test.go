@@ -26,6 +26,8 @@ func testProxy(t *testing.T, cfg config) *proxyServer {
 	}
 	t.Cleanup(func() {
 		_ = s.closeClaudeAccountPins()
+		s.events.close()
+		s.usageHistory.close()
 		s.metrics.close()
 		for _, tr := range s.transports {
 			tr.CloseIdleConnections()
