@@ -698,6 +698,7 @@ type proxyEvent struct {
 
 type eventLog struct {
 	mu         sync.Mutex
+	flushMu    sync.Mutex
 	path       string
 	pending    []proxyEvent
 	flushTimer *time.Timer
@@ -731,6 +732,8 @@ func (l *eventLog) flush() {
 	if l == nil || l.path == "" {
 		return
 	}
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
 	l.mu.Lock()
 	batch := append([]proxyEvent(nil), l.pending...)
 	l.pending = nil
@@ -764,10 +767,6 @@ func (l *eventLog) close() {
 		return
 	}
 	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
-		return
-	}
 	l.closed = true
 	if l.flushTimer != nil {
 		l.flushTimer.Stop()
@@ -803,6 +802,7 @@ func tailEvents(path string, limit int) []proxyEvent {
 // scope+window: a line lands at most every 15 minutes unless the value moved.
 type usageHistoryLog struct {
 	mu         sync.Mutex
+	flushMu    sync.Mutex
 	path       string
 	lastWrite  map[string]usageHistoryEntry
 	pending    []usageHistoryEntry
@@ -873,6 +873,8 @@ func (l *usageHistoryLog) flush() {
 	if l == nil || l.path == "" {
 		return
 	}
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
 	l.mu.Lock()
 	batch := append([]usageHistoryEntry(nil), l.pending...)
 	l.pending = nil
@@ -906,10 +908,6 @@ func (l *usageHistoryLog) close() {
 		return
 	}
 	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
-		return
-	}
 	l.closed = true
 	if l.flushTimer != nil {
 		l.flushTimer.Stop()
