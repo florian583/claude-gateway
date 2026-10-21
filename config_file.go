@@ -119,6 +119,7 @@ type chainStep struct {
 	Pool  string `json:"pool"`
 }
 type chainDefinition struct {
+	AccountScope         string      `json:"accountScope,omitempty"`
 	Steps                []chainStep `json:"steps"`
 	AllowPaidFallback    bool        `json:"allowPaidFallback"`
 	PaidFallbackOn       []string    `json:"paidFallbackOn"`
@@ -669,6 +670,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	compiled := map[string]modelConfig{}
 	for _, id := range sortedKeys(f.Chains) {
 		c := f.Chains[id]
+		if c.AccountScope != "" && c.AccountScope != "pinned" {
+			return config{}, fmt.Errorf("chain %s has invalid accountScope", id)
+		}
 		if !validID(id) || len(c.Steps) == 0 {
 			return config{}, fmt.Errorf("invalid/empty chain %s", id)
 		}
@@ -686,6 +690,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 			seenReasons[r] = true
 		}
 		var members []modelConfig
+		pinnedPool := ""
 		seen := map[string]bool{}
 		for stage, step := range c.Steps {
 			if (step.Model == "") == (step.Pool == "") {
@@ -715,6 +720,16 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 					tier += offset
 				}
 				m.Tier = &tier
+				if c.AccountScope == "pinned" && cfg.Providers[m.Provider].Variant == "claude-subscription" {
+					if len(members) > 0 && pinnedPool == "" {
+						return config{}, fmt.Errorf("pinned chain %s must start with Claude", id)
+					}
+					if pinnedPool != "" && pinnedPool != m.AccountPool {
+						return config{}, fmt.Errorf("pinned chain %s requires one Claude account pool", id)
+					}
+					pinnedPool = m.AccountPool
+				}
+				m.AccountScope = c.AccountScope
 				m.ConfiguredPool = step.Pool
 				m.AllowPaidFallback = c.AllowPaidFallback
 				m.PaidFallbackOn = c.PaidFallbackOn

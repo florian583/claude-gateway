@@ -77,6 +77,13 @@ func (s *proxyServer) expandConfiguredClaudeAttempts(r *http.Request, candidates
 			continue
 		}
 		profiles := s.profilesForCandidate(m, r)
+		if m.AccountScope == "pinned" {
+			p, ok := selectedClaudeProfile(r)
+			if !ok || !profileInClaudePool(p, profiles) {
+				continue
+			}
+			profiles = []claudeUsageProfile{p}
+		}
 		if p, ok := selectedClaudeProfile(r); ok && profileInClaudePool(p, profiles) {
 			profiles = s.orderClaudeFallbackProfiles(profiles, p)
 		}

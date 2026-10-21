@@ -114,6 +114,7 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
+	AccountScope         string         `json:"-"`
 	ModelID              string         `json:"-"`
 	AccountStickySeconds int            `json:"-"`
 	AccountPool          string         `json:"-"`
@@ -3153,6 +3154,9 @@ func (s *proxyServer) claudeModelQuotaBlockKey(runtimeProviderName string, candi
 	if providerName == "" || (runtimeProviderName != providerName && !strings.HasPrefix(runtimeProviderName, providerName+"@")) {
 		return ""
 	}
+	if candidate.AccountScope == "pinned" {
+		return runtimeProviderName + "#model:" + candidate.Upstream
+	}
 	if family := claudeQuotaFamily(candidate); family != "" {
 		return runtimeProviderName + "#" + family
 	}
@@ -5492,6 +5496,10 @@ func (s *proxyServer) selectClaudeProfile(ctx context.Context, r *http.Request, 
 	for _, profile := range profiles {
 		runtimeKey := s.cfg.ClaudeUsage.Provider + "@" + profile.Name
 		blocked, state := s.providerBlockForCandidate(runtimeKey, candidate)
+		if candidate.AccountScope == "pinned" {
+			blocked, state = s.providerBlocked(runtimeKey)
+			blocked = blocked && (state.Reason == "auth_unavailable" || state.Reason == "auth_exhausted" || isQuotaReason(state.Reason))
+		}
 		if blocked {
 			failures = append(failures, profile.Name+":"+firstNonEmpty(state.Reason, "blocked"))
 			continue
@@ -5515,6 +5523,14 @@ func (s *proxyServer) selectClaudeProfile(ctx context.Context, r *http.Request, 
 		available = append(available, availableClaudeAccount{profile: profile, snapshot: snapshot})
 	}
 	if len(available) > 0 {
+		if candidate.AccountScope == "pinned" && stickyProfile.Name != "" {
+			for _, account := range available {
+				if claudeProfileRegistryKey(account.profile) == claudeProfileRegistryKey(stickyProfile) {
+					available = []availableClaudeAccount{account}
+					break
+				}
+			}
+		}
 		chosen, release, stickyChanged := s.chooseClaudeAccount(available, stickyKey, stickyProfile, reserve, candidate.AccountStickySeconds)
 		s.logClaudeAccountSelection(requestListenerPort(r), chosen, reserve, stickyChanged)
 		return chosen.profile, chosen.snapshot, release, nil
@@ -7115,6 +7131,10 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			continue
 		}
 		runtimeProviderName := s.providerRuntimeKey(attemptRequest, providerName)
+		instabilityProviderName := runtimeProviderName
+		if candidate.AccountScope == "pinned" && s.claudeSubscriptionCandidate(candidate) {
+			instabilityProviderName = s.claudeModelQuotaBlockKey(runtimeProviderName, candidate)
+		}
 		evidenceKey := runtimeProviderName + "|" + candidate.Upstream
 		if s.cfg.Definition != nil && s.cfg.Providers[providerName].Billing != "metered" {
 			paidEvidence[evidenceKey] = ""
@@ -7262,6 +7282,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			failureReason := "transport"
 			if authFailure {
 				failureReason = "auth_unavailable"
+				if candidate.AccountScope == "pinned" {
+					s.markProviderBlocked(runtimeProviderName, "auth_unavailable", time.Minute)
+				}
 			}
 			if chainLimited {
 				failureReason = "chain_deadline"
@@ -7276,7 +7299,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
 				} else {
-					s.observeProviderInstability(runtimeProviderName, signal)
+					s.observeProviderInstability(instabilityProviderName, signal)
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
 			}
@@ -7292,7 +7315,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 						anthropicOutageConfirmed = s.observeClaudeServiceFailure()
 						anthropicServiceSignalRecorded = true
 					}
-					anthropicServiceOutage = shouldShortCircuitClaudeTransport(anthropicTransportFailures, anthropicOutageConfirmed)
+					anthropicServiceOutage = candidate.AccountScope != "pinned" && shouldShortCircuitClaudeTransport(anthropicTransportFailures, anthropicOutageConfirmed)
 				}
 			}
 			if networkDecision.StopFallback {
@@ -7365,7 +7388,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
 				} else if !quotaError && !authError {
-					s.observeProviderInstability(runtimeProviderName, "stream_start")
+					s.observeProviderInstability(instabilityProviderName, "stream_start")
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
 				if providerName == s.cfg.ClaudeUsage.Provider {
@@ -7408,15 +7431,17 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		if !countTokens {
 			ttfb := time.Since(attemptStarted)
 			signal := ""
-			instabilityKey := runtimeProviderName
+			instabilityKey := instabilityProviderName
 			switch {
 			case resp.StatusCode == http.StatusTooManyRequests && !s.explicitAnthropicPrimary(selected):
 				signal = "http_rate_limit"
 			case resp.StatusCode >= http.StatusInternalServerError:
 				signal = "http_5xx"
 				if providerName == s.cfg.ClaudeUsage.Provider {
-					instabilityKey = providerName
-					anthropicServiceOutage = true
+					if candidate.AccountScope != "pinned" {
+						instabilityKey = providerName
+					}
+					anthropicServiceOutage = candidate.AccountScope != "pinned"
 					if anthropicFailureClass != "auth_or_client" {
 						anthropicFailureClass = "service"
 					}
@@ -7433,7 +7458,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				s.observeProviderInstability(instabilityKey, signal)
 			}
 			if resp.StatusCode == http.StatusTooManyRequests && !s.explicitAnthropicPrimary(selected) {
-				s.markProviderBlocked(runtimeProviderName, "quota_or_rate_limit", providerCooldown(resp.Header, nil))
+				s.markProviderBlocked(s.quotaBlockKeyForResponse(runtimeProviderName, candidate, resp.Header), "quota_or_rate_limit", providerCooldown(resp.Header, nil))
 			}
 		}
 		if !countTokens {
