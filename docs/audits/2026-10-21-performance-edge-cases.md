@@ -4,6 +4,10 @@ Audited source: `6a14806610e2947e34e24c6204328b4592b8e3a1`, the deployed gateway
 
 The main priorities are bounded body reads, correct failure reporting, and removing disk synchronization from the account-selection lock. A rewrite is not justified by the measured request-transformation cost alone.
 
+## Implementation follow-up
+
+All six findings now have fixes and regression coverage. The findings below describe the original audited revision, and its line numbers are historical. The four audit tests now assert the corrected behavior. Requests and buffered responses have byte and time limits. JSON read and parse failures reach fallback before client output. Account pins use one ordered asynchronous writer outside the selection lock, and both transient pins and metric persistence queues are bounded. See `docs/configuration.md` for defaults and durability limits.
+
 ## Observed traffic
 
 The sample starts at 12:35 UTC, after both deployments. The collector read at most 8 MiB from each of the active and most recent archived metric files. Counts are attempt/completion records, not distinct requests. Timings are milliseconds. Account-selection duration can repeat across the attempts of one request. These short, observational samples are not a controlled host comparison or a capacity test.
@@ -93,7 +97,7 @@ The full suite and race detector are the verification for those existing cases. 
 
 ## Verification and reproduction
 
-`proxy_audit_test.go` contains characterization tests. A PASS means the documented defect was reproduced, not that it was fixed. Invert or replace each assertion when implementing its fix; do not carry these assertions forward as desired behavior.
+At the original audit commit, `proxy_audit_test.go` contained characterization tests whose PASS reproduced the defects. The implementation follow-up inverted those assertions into regression tests.
 
 Commands, run from the isolated audit worktree:
 

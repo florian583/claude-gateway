@@ -218,3 +218,21 @@ Background checks cannot restore a revoked refresh token or a removed Keychain e
 ### Private network listeners
 
 Listeners require loopback addresses by default. Set `allowNonLoopbackListen: true` only when the host firewall controls access to the gateway. This explicit opt-in permits literal non-loopback listener addresses, including wildcard addresses. It does not add authentication to the gateway.
+
+## Body limits and persistence
+
+The optional top-level `bodyLimits` object bounds request uploads and buffered upstream bodies. Zero selects the default. Negative values are rejected.
+
+| Field | Default | Maximum |
+| --- | ---: | ---: |
+| `requestMaxBytes` | 67108864 (64 MiB) | 536870912 |
+| `jsonMaxBytes` | 33554432 (32 MiB) | 536870912 |
+| `requestReadTimeoutMS` | 120000 | 600000 |
+| `jsonReadTimeoutMS` | 120000 | 600000 |
+| `errorReadTimeoutMS` | 5000 | 600000 |
+
+Error bodies have a fixed 1 MiB ceiling. Upstream body deadlines also respect the remaining fallback-chain budget. SSE streams retain their separate idle protection. Oversized requests return 413; stalled uploads return 408. Truncated, malformed or oversized buffered JSON fails before downstream headers are sent, so the existing fallback policy can handle it without replaying client-visible output. Limits apply per request, not to total process memory.
+
+Account pin persistence uses a single coalescing writer. It writes atomic snapshots outside the account-selection lock and drains during graceful shutdown. A process crash can lose changes since the last successful snapshot. Failed writes receive three attempts, then wait for a changed pin or shutdown. The transient pin cache retains at most 10000 entries; valid durable pins can be restored after cache eviction.
+
+Metric persistence retains at most the smaller of `maxSamples` and 10000 records, including the active write batch. Each batch contains at most 256 records. When storage cannot keep up, new persistence records are dropped while the in-memory rings and rollups continue to update. `/status` exposes the cumulative `metricsPersistenceDropped` counter. Failed writes retry after one second. Shutdown drains the queue, or counts the remaining records as dropped if storage still fails.
