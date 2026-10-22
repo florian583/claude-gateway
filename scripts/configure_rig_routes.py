@@ -11,7 +11,7 @@ def prepare(config):
         raise ValueError("Conflicting rig listener")
     result["rigListen"] = "127.0.0.1:48105"
     models = result["models"]
-    targets = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5"]
+    targets = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
     for model in targets:
         if model not in models or not models[model].get("accountPool"):
             raise ValueError(f"Missing pool-backed model: {model}")
@@ -25,13 +25,16 @@ def prepare(config):
     if model_key in models and models[model_key] != definition:
         raise ValueError("Conflicting dated Haiku rig definition")
     models[model_key] = definition
-    for alias_model, model in [(m, m) for m in targets] + [(dated, model_key)]:
+    for alias_model, model in [(m, m) for m in targets] + [(dated, model_key), ("claude-opus-5", "claude-opus-5-5")]:
         alias = "rig-exact-" + alias_model
         chain = {"steps": [{"model": model}], "allowPaidFallback": False,
                  "requireTools": True, "requestTimeoutMs": 60000,
                  "firstContentTimeoutMs": 30000}
         if alias in result["chains"] and result["chains"][alias] != chain:
-            raise ValueError(f"Conflicting rig chain: {alias}")
+            previous = copy.deepcopy(chain)
+            previous["steps"] = [{"model": "claude-opus-5"}]
+            if alias_model != "claude-opus-5" or result["chains"][alias] != previous:
+                raise ValueError(f"Conflicting rig chain: {alias}")
         if alias in result["aliases"] and result["aliases"][alias] != alias:
             raise ValueError(f"Conflicting rig alias: {alias}")
         result["chains"][alias] = chain

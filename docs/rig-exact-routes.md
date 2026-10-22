@@ -18,7 +18,9 @@ The rig listener is loopback-only and disabled unless `rigListen` and `rigModels
 configured together. Administrative endpoints are not exposed on that listener.
 
 Send normal model IDs: `claude-haiku-4-5`, `claude-haiku-4-5-20251001`,
-`claude-haiku-5-5`, `claude-sonnet-5-5`, and `claude-opus-5`. The explicit `rigModels`
+`claude-haiku-5-5`, `claude-sonnet-5-5`, and `claude-opus-5-5`.
+The legacy `claude-opus-5` name is an explicit compatibility mapping to Opus 5.5;
+record the upstream-model response header when labeling evidence. The explicit `rigModels`
 map selects private rig aliases. Unknown IDs fail instead of entering a worker chain.
 The normal endpoint rejects these private aliases, preventing accidental use of rig
 policy by Claude Hybrid. The listener is enabled only with explicit configuration.
