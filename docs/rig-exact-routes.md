@@ -58,3 +58,37 @@ Do not restart a shared proxy during a replay. Coordinate activation of the bina
 configuration, and application environment. First verify `/routes` has one exact upstream
 and no model fallbacks for each rig alias; then run a small labeled canary before a full
 replay. An unavailable account is an infrastructure failure, not a model-quality result.
+
+## Subscription request compatibility
+
+Only rig requests routed to a `claude-subscription` provider receive the Claude
+client wire profile. Native Claude envelopes pass through. API-key providers and
+normal Claude Hybrid requests retain their existing behavior.
+
+The adapter follows the OAuth compatibility rules in VibeProxy's CLIProxyAPI
+backend: the beta query, client headers, billing and identity envelope, stable
+session metadata, and model-aware caller instruction placement. Modern rig models
+carry caller instructions in system turns after the leading user turns. Dated
+Haiku uses system reminders in the first user message. Text and cache markers
+survive the move. Non-text system blocks fail locally rather than disappearing.
+
+Forced tools remove incompatible thinking and effort controls. Adapted requests
+remove temperature and top_p; active thinking also removes top_k and omits the
+thinking display. Tool schemas, output formats, max_tokens, stream mode, exact
+model routing, and rig deadlines remain caller-owned. No upstream model fallback
+is injected. This adapter is a compatibility profile, not a verbatim implementation
+of every VibeProxy feature.
+
+Caching stays enabled. Existing breakpoints own placement. Requests without a
+breakpoint receive one at the last text block. Missing TTLs use one hour, or five
+minutes after an existing five-minute breakpoint. Explicit TTLs remain intact.
+More than four breakpoints or a one-hour breakpoint after a five-minute breakpoint
+fails locally. The matching extended-cache beta accompanies adapted requests.
+Stable request metadata avoids introducing a fresh cache identity on every retry.
+
+Reference implementation audited at CLIProxyAPI revision
+`07b5a7a1ca267c5d9b743e38dff4ed8ff1da0c91`, under
+`internal/runtime/executor/claude_executor_{cloaking,request,execute}.go`.
+VibeProxy's blanket cache stripping is deliberately excluded. Verify cache creation
+and cache-read usage on repeated requests after each wire-profile update. A short
+successful answer alone does not prove cache reuse or structured-tool compatibility.

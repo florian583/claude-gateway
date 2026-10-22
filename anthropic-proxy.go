@@ -8502,6 +8502,16 @@ func (s *proxyServer) normalizeRequest(r *http.Request) ([]byte, map[string]any,
 		}
 	}
 	mutated := normalizeHistoricalToolIDs(payload)
+	if rig, _ := r.Context().Value(rigEndpointContextKey{}).(bool); rig && s.cfg.Providers[selected.Provider].Variant == "claude-subscription" {
+		adapted, adaptErr := adaptRigClaudeRequest(payload, r.Header)
+		if adaptErr != nil {
+			return nil, nil, selected, fmt.Errorf("%w: %v", errUnknownModel, adaptErr)
+		}
+		mutated = mutated || adapted
+		query := r.URL.Query()
+		query.Set("beta", "true")
+		r.URL.RawQuery = query.Encode()
+	}
 	if len(s.cfg.Normalize.UnsupportedContentTypes) > 0 {
 		if messages, ok := payload["messages"].([]any); ok {
 			payload["messages"] = s.normalizeMessages(messages)
