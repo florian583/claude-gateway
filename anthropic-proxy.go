@@ -115,23 +115,25 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
-	AccountScope         string         `json:"-"`
-	SoftConcurrency      int            `json:"-"`
-	ModelID              string         `json:"-"`
-	AccountStickySeconds int            `json:"-"`
-	AccountPool          string         `json:"-"`
-	ConfiguredPool       string         `json:"-"`
-	SupportsTools        bool           `json:"-"`
-	ModelOverrides       map[string]any `json:"-"`
-	AllowPaidFallback    bool           `json:"-"`
-	PaidFallbackOn       []string       `json:"-"`
-	Provider             string         `json:"provider"`
-	Upstream             string         `json:"upstream"`
-	ResponseAlias        string         `json:"responseAlias"`
-	ContextWindow        int            `json:"contextWindow"`
-	Tier                 *int           `json:"tier,omitempty"`
-	SupportsImages       *bool          `json:"supportsImages,omitempty"`
-	SupportsDocuments    *bool          `json:"supportsDocuments,omitempty"`
+	RequestTimeoutMS      int            `json:"-"`
+	FirstContentTimeoutMS int            `json:"-"`
+	AccountScope          string         `json:"-"`
+	SoftConcurrency       int            `json:"-"`
+	ModelID               string         `json:"-"`
+	AccountStickySeconds  int            `json:"-"`
+	AccountPool           string         `json:"-"`
+	ConfiguredPool        string         `json:"-"`
+	SupportsTools         bool           `json:"-"`
+	ModelOverrides        map[string]any `json:"-"`
+	AllowPaidFallback     bool           `json:"-"`
+	PaidFallbackOn        []string       `json:"-"`
+	Provider              string         `json:"provider"`
+	Upstream              string         `json:"upstream"`
+	ResponseAlias         string         `json:"responseAlias"`
+	ContextWindow         int            `json:"contextWindow"`
+	Tier                  *int           `json:"tier,omitempty"`
+	SupportsImages        *bool          `json:"supportsImages,omitempty"`
+	SupportsDocuments     *bool          `json:"supportsDocuments,omitempty"`
 	// UnsupportedContentTypes lists message content-block `type` values this
 	// route cannot serve (e.g. non-Anthropic providers reject `document`,
 	// `tool_reference`, server-side tool blocks). Requests containing one are
@@ -262,7 +264,8 @@ func primeSSEBodyWithPrelude(body io.ReadCloser, timeout, preludeIdle time.Durat
 	return primeSSEBodyObserved(body, timeout, preludeIdle, first, nil)
 }
 
-func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string)) (io.ReadCloser, error) {
+func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string), usefulOnly ...bool) (io.ReadCloser, error) {
+	strict := len(usefulOnly) > 0 && usefulOnly[0]
 	observed := false
 	sawStopReason := false
 	reader := bufio.NewReader(body)
@@ -317,14 +320,22 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 					}
 				}
 				metadata := false
-				if preludeIdle > 0 {
+				if preludeIdle > 0 || strict {
 					var preludeErr error
-					metadata, preludeErr = classifyPrelude(data, &sawStopReason)
+					if strict {
+						metadata, preludeErr = classifyUsefulPrelude(data)
+					} else {
+						metadata, preludeErr = classifyPrelude(data, &sawStopReason)
+					}
 					if preludeErr != nil {
 						return nil, preludeErr
 					}
 				}
 				if metadata {
+					if strict {
+						hasData, event, dataLines = false, "", nil
+						continue
+					}
 					stopTimer()
 					if timedOut.Load() {
 						return nil, errors.New("initial SSE prelude timed out")
@@ -6667,6 +6678,11 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if selectedModel.RequestTimeoutMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(selectedModel.RequestTimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
@@ -6677,6 +6693,11 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if r.Context().Err() != nil {
 			s.recordRequestTerminal(requestID, r, selectedModel, 499, "client_cancel", requestStarted)
+			return
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusGatewayTimeout, "route_timeout", requestStarted)
+			writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Model route exceeded its request deadline")
 			return
 		}
 		var compatibilityErr *requestCompatibilityError
@@ -6712,6 +6733,8 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	runtimeProviderName := s.providerRuntimeKeyForCandidate(r, providerName, selectedModel)
 
 	copyHeaders(w.Header(), resp.Header)
+	w.Header().Set("X-Proxy-Upstream-Model", selectedModel.Upstream)
+	w.Header().Set("X-Proxy-Upstream-Provider", providerName)
 	// Body is re-encoded by the filters below, so upstream framing no longer applies.
 	w.Header().Del("Content-Length")
 	w.Header().Del("Content-Encoding")
@@ -7756,6 +7779,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			if primeBudget > initialSSEEventTimeout {
 				primeBudget = initialSSEEventTimeout
 			}
+			if candidate.FirstContentTimeoutMS > 0 {
+				primeBudget = time.Duration(candidate.FirstContentTimeoutMS)*time.Millisecond - time.Since(attemptStarted)
+			}
 			var primedBody io.ReadCloser
 			var primeErr error
 			if primeBudget <= 0 {
@@ -7772,8 +7798,8 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}, func(kind string) {
 					execution.PrimedFrames++
 					execution.PrimeLastFrame = kind
-				})
-				if preludeIdle > 0 && !firstEventAt.IsZero() {
+				}, candidate.FirstContentTimeoutMS > 0)
+				if preludeIdle > 0 && candidate.FirstContentTimeoutMS == 0 && !firstEventAt.IsZero() {
 					// Thinking after a valid initial event belongs to the stream
 					// idle allowance, not another provider's header reserve.
 					preludeWait := time.Since(firstEventAt)
@@ -7854,7 +7880,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 		}
 		if resp.Body != nil {
-			if bodyErr := s.bufferUpstreamBody(ctx, resp, trace); bodyErr != nil {
+			if bodyErr := s.bufferUpstreamBody(ctx, resp, trace, responseContract{openAI: !countTokens && s.cfg.Providers[providerName].Format == "openai-chat", strict: !countTokens && candidate.FirstContentTimeoutMS > 0, toolChoice: payload["tool_choice"]}); bodyErr != nil {
 				execution.ResponseReadError = true
 				if ctx.Err() != nil {
 					s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, false, "client_cancel")
@@ -8269,6 +8295,9 @@ func (s *proxyServer) doUpstreamWithHeaderBudget(ctx context.Context, r *http.Re
 func (s *proxyServer) doUpstreamWithHeaderBudgetLimit(ctx context.Context, r *http.Request, body []byte, selectedModel modelConfig, maximum time.Duration) (*http.Response, error) {
 	providerName := firstNonEmpty(selectedModel.Provider, s.cfg.DefaultProvider)
 	budget := s.candidateResponseHeaderBudget(providerName, selectedModel, body)
+	if selectedModel.FirstContentTimeoutMS > 0 {
+		budget = minDuration(budget, time.Duration(selectedModel.FirstContentTimeoutMS)*time.Millisecond)
+	}
 	chainLimited := maximum > 0 && maximum < budget
 	if chainLimited {
 		budget = maximum
@@ -10792,7 +10821,7 @@ func translateOpenAIJSONResponse(body []byte, responseAlias string) []byte {
 func translateOpenAIJSONResponseChecked(body []byte, responseAlias string) ([]byte, bool) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return body, false
+		return openAIAdapterErrorBody("OpenAI adapter: malformed JSON response"), true
 	}
 	payload = unwrapOpenAIEnvelope(payload)
 	if errPayload, ok := payload["error"].(map[string]any); ok {
@@ -10802,13 +10831,13 @@ func translateOpenAIJSONResponseChecked(body []byte, responseAlias string) ([]by
 			"error": map[string]any{"type": "api_error", "message": firstNonEmpty(message, "upstream error")},
 		})
 		if err == nil {
-			return out, false
+			return out, true
 		}
 		return body, false
 	}
 	choices, _ := payload["choices"].([]any)
 	if len(choices) == 0 {
-		return body, false
+		return openAIAdapterErrorBody("OpenAI adapter: missing completion choices"), true
 	}
 	choice, _ := choices[0].(map[string]any)
 	message, _ := choice["message"].(map[string]any)
@@ -10840,6 +10869,9 @@ func translateOpenAIJSONResponseChecked(body []byte, responseAlias string) ([]by
 				"input": input,
 			})
 		}
+	}
+	if len(content) == 0 {
+		return openAIAdapterErrorBody("OpenAI adapter: completion contains no text or tool call"), true
 	}
 	usage := map[string]any{"input_tokens": 0, "output_tokens": 0}
 	if usagePayload, ok := payload["usage"].(map[string]any); ok {

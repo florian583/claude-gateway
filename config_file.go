@@ -151,14 +151,16 @@ type chainStep struct {
 	Pool  string `json:"pool"`
 }
 type chainDefinition struct {
-	AccountScope         string      `json:"accountScope,omitempty"`
-	SoftConcurrency      int         `json:"softConcurrency,omitempty"`
-	Steps                []chainStep `json:"steps"`
-	AllowPaidFallback    bool        `json:"allowPaidFallback"`
-	PaidFallbackOn       []string    `json:"paidFallbackOn"`
-	MinimumContextWindow int         `json:"minimumContextWindow"`
-	RequireTools         bool        `json:"requireTools"`
-	RequireImages        bool        `json:"requireImages"`
+	RequestTimeoutMS      int         `json:"requestTimeoutMs,omitempty"`
+	FirstContentTimeoutMS int         `json:"firstContentTimeoutMs,omitempty"`
+	AccountScope          string      `json:"accountScope,omitempty"`
+	SoftConcurrency       int         `json:"softConcurrency,omitempty"`
+	Steps                 []chainStep `json:"steps"`
+	AllowPaidFallback     bool        `json:"allowPaidFallback"`
+	PaidFallbackOn        []string    `json:"paidFallbackOn"`
+	MinimumContextWindow  int         `json:"minimumContextWindow"`
+	RequireTools          bool        `json:"requireTools"`
+	RequireImages         bool        `json:"requireImages"`
 }
 
 func configFilePath() (string, error) {
@@ -727,6 +729,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	compiled := map[string]modelConfig{}
 	for _, id := range sortedKeys(f.Chains) {
 		c := f.Chains[id]
+		if c.RequestTimeoutMS < 0 || c.RequestTimeoutMS > 600000 || c.FirstContentTimeoutMS < 0 || c.FirstContentTimeoutMS > 600000 || (c.RequestTimeoutMS > 0 && c.FirstContentTimeoutMS > c.RequestTimeoutMS) {
+			return config{}, fmt.Errorf("chain %s has invalid response deadlines", id)
+		}
 		if c.AccountScope != "" && c.AccountScope != "pinned" {
 			return config{}, fmt.Errorf("chain %s has invalid accountScope", id)
 		}
@@ -790,6 +795,8 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 					pinnedPool = m.AccountPool
 				}
 				m.AccountScope = c.AccountScope
+				m.RequestTimeoutMS = c.RequestTimeoutMS
+				m.FirstContentTimeoutMS = c.FirstContentTimeoutMS
 				m.ConfiguredPool = step.Pool
 				m.AllowPaidFallback = c.AllowPaidFallback
 				m.SoftConcurrency = c.SoftConcurrency

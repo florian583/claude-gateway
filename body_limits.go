@@ -92,7 +92,7 @@ func validResponseJSONObject(body []byte) bool {
 }
 
 // Buffer only before downstream commitment. Streams keep their idle watchdog.
-func (s *proxyServer) bufferUpstreamBody(ctx context.Context, resp *http.Response, trace requestTrace) error {
+func (s *proxyServer) bufferUpstreamBody(ctx context.Context, resp *http.Response, trace requestTrace, contracts ...responseContract) error {
 	isError := resp.StatusCode >= http.StatusBadRequest
 	isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 	if !isError && isSSE {
@@ -115,6 +115,11 @@ func (s *proxyServer) bufferUpstreamBody(ctx context.Context, resp *http.Respons
 	}
 	if !isError && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") && !validResponseJSONObject(body) {
 		return errInvalidResponseJSON
+	}
+	if !isError && len(contracts) > 0 {
+		if err := contracts[0].validate(body); err != nil {
+			return err
+		}
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return nil
@@ -151,4 +156,44 @@ func requestBodyFailure(err error) (int, string) {
 
 func responseBodyError(provider string, err error) error {
 	return fmt.Errorf("provider %s response body failed: %w", provider, err)
+}
+
+type responseContract struct {
+	openAI     bool
+	strict     bool
+	toolChoice any
+}
+
+func (c responseContract) validate(body []byte) error {
+	if c.openAI {
+		translated, invalid := translateOpenAIJSONResponseChecked(body, "validation")
+		if invalid {
+			return errors.New("upstream completion contains no usable response or has malformed tool arguments")
+		}
+		body = translated
+	}
+	if !c.strict {
+		return nil
+	}
+	var message struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+			Name string `json:"name"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(body, &message) != nil {
+		return errInvalidResponseJSON
+	}
+	choice, _ := c.toolChoice.(map[string]any)
+	requireTool := choice["type"] == "any" || choice["type"] == "tool"
+	for _, block := range message.Content {
+		if block.Type == "tool_use" && block.Name != "" && (choice["type"] != "tool" || choice["name"] == block.Name) {
+			return nil
+		}
+		if !requireTool && block.Type == "text" && block.Text != "" {
+			return nil
+		}
+	}
+	return errors.New("upstream response does not satisfy the requested content contract")
 }
