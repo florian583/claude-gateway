@@ -151,3 +151,93 @@ func TestOpenAIErrorEnvelopeIsProtocolFailure(t *testing.T) {
 		t.Fatal("accepted error as successful completion")
 	}
 }
+
+func TestRigEndpointIsolatesModelPolicy(t *testing.T) {
+	var upstreamModels []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		upstreamModels = append(upstreamModels, body["model"].(string))
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	f := testConfig(upstream.URL, "anthropic")
+	model := f.Models["model"]
+	model.Upstream = "exact-test-model"
+	f.Models["exact"] = model
+	f.Chains["rig"] = chainDefinition{Steps: []chainStep{{Model: "exact"}}, RequestTimeoutMS: 1000, FirstContentTimeoutMS: 500}
+	f.Aliases["rig-private"] = "rig"
+	f.RigModels = map[string]string{"test": "rig-private"}
+	f.RigListen = "127.0.0.1:48105"
+	cfg := compileFixture(t, f)
+	if cfg.Models["test"].RequestTimeoutMS != 0 {
+		t.Fatal("rig deadline leaked into normal route")
+	}
+	s, err := newProxyServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.metrics.close()
+	for _, tc := range []struct {
+		path, model string
+		status      int
+	}{
+		{"/v1/messages", "test", 200},
+		{"/rig/v1/messages", "test", 200},
+		{"/v1/messages", "rig-private", 400},
+		{"/rig/v1/messages", "rig-private", 400},
+		{"/rig/v1/messages", "unknown", 400},
+	} {
+		rec := httptest.NewRecorder()
+		handler := s.handler()
+		path := tc.path
+		if strings.HasPrefix(path, "/rig/") {
+			handler = s.rigHandler()
+			path = strings.TrimPrefix(path, "/rig")
+		}
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", path, strings.NewReader(`{"model":"`+tc.model+`","messages":[{"role":"user","content":"hello"}]}`)))
+		if rec.Code != tc.status {
+			t.Fatalf("%s %s: %d %s", tc.path, tc.model, rec.Code, rec.Body.String())
+		}
+		if tc.path == "/rig/v1/messages" && rec.Header().Get("X-Proxy-Usage") != "rig" {
+			t.Fatal("missing rig provenance")
+		}
+	}
+	if len(upstreamModels) != 2 || upstreamModels[0] != "test-model" || upstreamModels[1] != "exact-test-model" {
+		t.Fatalf("wrong upstream requests: %v", upstreamModels)
+	}
+}
+
+func TestRigEndpointDisabledWithoutConfiguration(t *testing.T) {
+	s, err := newProxyServer(compileFixture(t, testConfig("http://127.0.0.1:1", "anthropic")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.metrics.close()
+	rec := httptest.NewRecorder()
+	s.rigHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"test"}`)))
+	if rec.Code != 404 {
+		t.Fatalf("unconfigured rig endpoint: %d", rec.Code)
+	}
+}
+
+func TestRigListenerRejectsUnsafeConfiguration(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:48105", "127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:12345", ""} {
+		f := testConfig("http://127.0.0.1:1", "anthropic")
+		f.Listen = "127.0.0.1:12345"
+		chain := f.Chains["main"]
+		chain.RequestTimeoutMS = 1000
+		chain.FirstContentTimeoutMS = 500
+		f.Chains["main"] = chain
+		f.RigListen = address
+		f.RigModels = map[string]string{"test-model": "test"}
+		body, _ := json.Marshal(f)
+		if _, err := decodeFileConfig("config.json", body); err == nil {
+			t.Fatalf("accepted invalid rig listener %q", address)
+		}
+	}
+}

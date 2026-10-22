@@ -19,6 +19,8 @@ import (
 
 // fileConfig is the JSON schema; config contains compiled routing tables.
 type fileConfig struct {
+	RigListen              string                           `json:"rigListen,omitempty"`
+	RigModels              map[string]string                `json:"rigModels,omitempty"`
 	BodyLimits             bodyLimitsConfig                 `json:"bodyLimits,omitempty"`
 	AllowNonLoopbackListen bool                             `json:"allowNonLoopbackListen,omitempty"`
 	Version                int                              `json:"version"`
@@ -830,6 +832,23 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		}
 		cfg.Models[alias] = m
 	}
+	for requested, alias := range f.RigModels {
+		m, ok := cfg.Models[alias]
+		if !validID(requested) || !ok || len(m.Fallbacks) != 0 || m.RequestTimeoutMS <= 0 || m.FirstContentTimeoutMS <= 0 {
+			return config{}, fmt.Errorf("rig model %s requires a single-model route with response deadlines", requested)
+		}
+	}
+	if f.RigListen != "" {
+		host, port, err := net.SplitHostPort(f.RigListen)
+		n, parseErr := strconv.Atoi(port)
+		if err != nil || parseErr != nil || n < 1 || n > 65535 || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || seenListeners[f.RigListen] || len(f.RigModels) == 0 {
+			return config{}, errors.New("rigListen requires a unique loopback address, nonzero port, and rigModels")
+		}
+	} else if len(f.RigModels) > 0 {
+		return config{}, errors.New("rigModels requires a dedicated rigListen endpoint")
+	}
+	cfg.RigListen = f.RigListen
+	cfg.RigModels = f.RigModels
 	cfg.DefaultProvider = cfg.Models[sortedKeys(f.Aliases)[0]].Provider
 	cfg.AdaptiveRouting.Enabled = true
 	if f.AdaptiveRouting != nil {

@@ -7,6 +7,9 @@ from pathlib import Path
 
 def prepare(config):
     result = copy.deepcopy(config)
+    if result.get("rigListen", "127.0.0.1:48105") != "127.0.0.1:48105":
+        raise ValueError("Conflicting rig listener")
+    result["rigListen"] = "127.0.0.1:48105"
     models = result["models"]
     targets = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5"]
     for model in targets:
@@ -33,6 +36,12 @@ def prepare(config):
             raise ValueError(f"Conflicting rig alias: {alias}")
         result["chains"][alias] = chain
         result["aliases"][alias] = alias
+        rig_models = result.setdefault("rigModels", {})
+        names = [alias_model] + (["claude-haiku-4-5"] if alias_model == dated else [])
+        for name in names:
+            if name in rig_models and rig_models[name] != alias:
+                raise ValueError(f"Conflicting rig model: {name}")
+            rig_models[name] = alias
     return result
 
 

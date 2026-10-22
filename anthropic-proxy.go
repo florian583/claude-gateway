@@ -30,6 +30,8 @@ import (
 )
 
 type config struct {
+	RigListen       string                    `json:"-"`
+	RigModels       map[string]string         `json:"-"`
 	BodyLimits      bodyLimitsConfig          `json:"bodyLimits,omitempty"`
 	Definition      *fileConfig               `json:"-"`
 	SourcePath      string                    `json:"-"`
@@ -1161,10 +1163,18 @@ func serve(cfg config) error {
 	handler := server.handler()
 
 	servers := []*http.Server{}
-	for _, addr := range append([]string{cfg.Listen}, cfg.AlsoListen...) {
+	addresses := append([]string{cfg.Listen}, cfg.AlsoListen...)
+	if cfg.RigListen != "" {
+		addresses = append(addresses, cfg.RigListen)
+	}
+	for _, addr := range addresses {
+		listenerHandler := handler
+		if addr == cfg.RigListen {
+			listenerHandler = server.rigHandler()
+		}
 		servers = append(servers, &http.Server{
 			Addr:              addr,
-			Handler:           handler,
+			Handler:           listenerHandler,
 			ReadHeaderTimeout: 30 * time.Second,
 			// NOTE: never set WriteTimeout here — it would kill long-lived SSE streams.
 		})
@@ -1223,6 +1233,8 @@ func serve(cfg config) error {
 	return <-errCh
 }
 
+type rigEndpointContextKey struct{}
+
 func (s *proxyServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
@@ -1255,6 +1267,35 @@ func (s *proxyServer) handler() http.Handler {
 		s.proxy(w, r)
 	})
 	return mux
+}
+
+func (s *proxyServer) rigHandler() http.Handler {
+	handler := s.handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.cfg.RigModels) == 0 {
+			writeAPIError(w, http.StatusNotFound, "invalid_request_error", "rig endpoint is not configured")
+			return
+		}
+		w.Header().Set("X-Proxy-Usage", "rig")
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			s.health(w, r)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/routes" {
+			models := map[string]modelConfig{}
+			for requested, alias := range s.cfg.RigModels {
+				models[requested] = s.cfg.Models[alias]
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"usage": "rig", "models": models})
+			return
+		}
+		if r.Method != http.MethodPost || (r.URL.Path != "/v1/messages" && r.URL.Path != "/v1/messages/count_tokens") {
+			writeAPIError(w, http.StatusNotFound, "invalid_request_error", "unsupported rig endpoint")
+			return
+		}
+		handler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), rigEndpointContextKey{}, true)))
+	})
 }
 
 func normalizeRuntimeConfig(path string, body []byte, cfg config) (config, error) {
@@ -8433,7 +8474,22 @@ func (s *proxyServer) normalizeRequest(r *http.Request) ([]byte, map[string]any,
 		}
 	}
 	if model, ok := payload["model"].(string); ok {
-		if mapped, exists := s.cfg.Models[model]; exists {
+		lookup := model
+		rig, _ := r.Context().Value(rigEndpointContextKey{}).(bool)
+		if rig {
+			var ok bool
+			lookup, ok = s.cfg.RigModels[model]
+			if !ok {
+				return body, payload, modelConfig{Requested: model}, fmt.Errorf("%w: model %q is not configured for the rig endpoint", errUnknownModel, model)
+			}
+		} else {
+			for _, alias := range s.cfg.RigModels {
+				if alias == model {
+					return body, payload, modelConfig{Requested: model}, fmt.Errorf("%w: rig routes require the dedicated rig endpoint", errUnknownModel)
+				}
+			}
+		}
+		if mapped, exists := s.cfg.Models[lookup]; exists {
 			selected = mapped
 		} else if family, matched := s.cfg.matchFamily(model); matched {
 			selected = family
@@ -8441,6 +8497,9 @@ func (s *proxyServer) normalizeRequest(r *http.Request) ([]byte, map[string]any,
 			return body, payload, modelConfig{Requested: model}, fmt.Errorf("%w %q", errUnknownModel, model)
 		}
 		selected.Requested = model
+		if rig {
+			selected.ResponseAlias = model
+		}
 	}
 	mutated := normalizeHistoricalToolIDs(payload)
 	if len(s.cfg.Normalize.UnsupportedContentTypes) > 0 {

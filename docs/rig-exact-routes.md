@@ -10,21 +10,28 @@ bin/claude-proxy --config CANDIDATE_PATH validate-config
 
 The command creates a new private file. It does not overwrite the active configuration,
 contact providers, or restart a service. It preserves existing worker chains and aliases.
-Review the candidate before activation. After a coordinated proxy restart, use these
-aliases in the test application's exact-model mapping:
+Review the candidate before activation. After a coordinated proxy restart, set the
+rig's `LOCAL_LLM_BASE_URL` to `http://127.0.0.1:48105`. The dedicated listener accepts
+`/v1/messages` and `/v1/messages/count_tokens`, plus read-only `/health` and `/routes`.
+Its `/routes` response lists only rig models. The normal listener remains unchanged.
+The rig listener is loopback-only and disabled unless `rigListen` and `rigModels` are
+configured together. Administrative endpoints are not exposed on that listener.
 
-| Requested model | Proxy alias |
-|---|---|
-| claude-haiku-4-5 | rig-exact-claude-haiku-4-5-20251001 |
-| claude-haiku-5-5 | rig-exact-claude-haiku-5-5 |
-| claude-sonnet-5-5 | rig-exact-claude-sonnet-5-5 |
-| claude-opus-5 | rig-exact-claude-opus-5 |
+Send normal model IDs: `claude-haiku-4-5`, `claude-haiku-4-5-20251001`,
+`claude-haiku-5-5`, `claude-sonnet-5-5`, and `claude-opus-5`. The explicit `rigModels`
+map selects private rig aliases. Unknown IDs fail instead of entering a worker chain.
+The normal endpoint rejects these private aliases, preventing accidental use of rig
+policy by Claude Hybrid. The listener is enabled only with explicit configuration.
+Responses include `X-Proxy-Usage: rig`; response.model retains the requested model ID.
 
-Set tier defaults to the corresponding rig aliases as well. Each route has one model,
-uses its existing account pool, and permits no cross-model fallback. The dated Haiku
-route requests that actual upstream ID with a 200,000-token context declaration.
-Configuration validation does not prove account entitlement or model availability.
-An unsupported model must fail explicitly; do not substitute a different model.
+Each route has one model, uses its existing account pool, and permits no cross-model
+fallback. The dated Haiku route requests that actual upstream ID with a 200,000-token
+context declaration. Configuration validation does not prove account entitlement or
+model availability. An unsupported model must fail explicitly.
+
+The endpoint separates routing and timing policy. It still shares the proxy process,
+provider accounts, and subscription quotas with normal traffic. It is not a separate
+capacity reservation or an authentication boundary.
 
 These routes set `firstContentTimeoutMs: 30000` and `requestTimeoutMs: 60000`.
 The first-content budget includes upstream header time for each attempt. Metadata and
