@@ -125,17 +125,42 @@ def check_staged():
     return errors
 
 
+def github_pull_request_merge_author(headers, message):
+    """Recognize only GitHub's synthetic PR merge commit author metadata.
+
+    GitHub uses the PR author's profile display name on the generated merge
+    commit. The branch head and both parents remain independently audited.
+    """
+    lines = headers.splitlines()
+    parents = [line[7:] for line in lines if line.startswith("parent ")]
+    authors = [line[7:] for line in lines if line.startswith("author ")]
+    committers = [line[10:] for line in lines if line.startswith("committer ")]
+    first_line = message.splitlines()[0] if message.splitlines() else ""
+    if len(parents) != 2 or not all(re.fullmatch(r"[0-9a-f]{40}", parent) for parent in parents):
+        return False
+    if len(authors) != 1 or len(committers) != 1:
+        return False
+    author = IDENTITY.fullmatch(authors[0].strip())
+    committer = IDENTITY.fullmatch(committers[0].strip())
+    if not author or not NOREPLY.fullmatch(author.group(2)):
+        return False
+    if not committer or committer.groups()[:2] != ("GitHub", "noreply@github.com"):
+        return False
+    return re.fullmatch(r"Merge [0-9a-f]{40} into [0-9a-f]{40}", first_line) is not None
+
+
 def check_history():
     errors, seen = [], set()
     for commit in git("rev-list", "--all").decode().splitlines():
         raw = git("cat-file", "commit", commit)
         text = raw.decode()
         headers, message = text.split("\n\n", 1)
+        is_generated_pr_merge = github_pull_request_merge_author(headers, message)
         for role in ("author", "committer"):
             values = [line[len(role) + 1:] for line in headers.splitlines() if line.startswith(role + " ")]
             if len(values) != 1:
                 errors.append(f"{commit[:12]}: invalid {role} metadata")
-            else:
+            elif not (role == "author" and is_generated_pr_merge):
                 errors.extend(f"{commit[:12]}: {role}: {issue}" for issue in identity_issues(values[0]))
         errors.extend(f"{commit[:12]}:message:{line}: {kind}" for line, kind in content_issues(message.encode(), ""))
         for entry in git("ls-tree", "-rz", "--full-tree", commit).decode().split("\0"):
