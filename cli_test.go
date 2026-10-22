@@ -43,7 +43,7 @@ func TestAccountAndClientLaunchersUseSeparateEnvironments(t *testing.T) {
 	dir := t.TempDir()
 	executable := filepath.Join(dir, "fake-claude")
 	script := `#!/bin/sh
-printf 'dir=%s\nbase=%s\nauth=%s\nkey=%s\noauth=%s\nheaders=%s\nmodel=%s\nsonnet=%s\nvertex=%s\ncwd=%s\n' "$CLAUDE_CONFIG_DIR" "${ANTHROPIC_BASE_URL-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${ANTHROPIC_CUSTOM_HEADERS-unset}" "${ANTHROPIC_MODEL-unset}" "${ANTHROPIC_DEFAULT_SONNET_MODEL-unset}" "${CLAUDE_CODE_USE_VERTEX-unset}" "$PWD"
+printf 'dir=%s\nbase=%s\nauth=%s\nkey=%s\noauth=%s\nheaders=%s\nmodel=%s\nopus=%s\nsonnet=%s\nhaiku=%s\nvertex=%s\ncwd=%s\n' "$CLAUDE_CONFIG_DIR" "${ANTHROPIC_BASE_URL-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${ANTHROPIC_CUSTOM_HEADERS-unset}" "${ANTHROPIC_MODEL-unset}" "${ANTHROPIC_DEFAULT_OPUS_MODEL-unset}" "${ANTHROPIC_DEFAULT_SONNET_MODEL-unset}" "${ANTHROPIC_DEFAULT_HAIKU_MODEL-unset}" "${CLAUDE_CODE_USE_VERTEX-unset}" "$PWD"
 for arg in "$@"; do printf 'arg=%s\n' "$arg"; done
 `
 	if err := os.WriteFile(executable, []byte(script), 0700); err != nil {
@@ -54,7 +54,10 @@ for arg in "$@"; do printf 'arg=%s\n' "$arg"; done
 	}
 	f := testClaudeConfig(t)
 	f.Listen = "127.0.0.1:48114"
-	f.Client = clientDefinition{Command: []string{executable, "fixed"}, ConfigDir: filepath.Join(dir, "client"), Model: "test"}
+	f.Client = clientDefinition{Command: []string{executable, "fixed"}, ConfigDir: filepath.Join(dir, "client"), Model: "test", OpusModel: "opus", SonnetModel: "sonnet", HaikuModel: "haiku"}
+	f.Aliases["opus"] = "main"
+	f.Aliases["sonnet"] = "main"
+	f.Aliases["haiku"] = "main"
 	f.Aliases["test[1m]"] = "main"
 	p := f.Profiles["first"]
 	p.Command = []string{executable}
@@ -66,7 +69,7 @@ for arg in "$@"; do printf 'arg=%s\n' "$arg"; done
 	if err := runClient(context.Background(), cfg, []string{"--", "--model", "test[1m]", "--print", "hello with spaces"}, nil, &client, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"dir=" + f.Client.ConfigDir, "base=http://127.0.0.1:48114", "auth=claude-proxy", "key=unset", "oauth=unset", "headers=unset", "model=test[1m]", "sonnet=test[1m]", "vertex=unset", "arg=fixed", "arg=hello with spaces", "cwd=" + cwd} {
+	for _, want := range []string{"dir=" + f.Client.ConfigDir, "base=http://127.0.0.1:48114", "auth=claude-proxy", "key=unset", "oauth=unset", "headers=unset", "model=test[1m]", "opus=opus", "sonnet=sonnet", "haiku=haiku", "vertex=unset", "arg=fixed", "arg=hello with spaces", "cwd=" + cwd} {
 		if !strings.Contains(client.String(), want+"\n") {
 			t.Fatalf("client missing %q: %s", want, client.String())
 		}

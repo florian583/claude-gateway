@@ -32,6 +32,13 @@ Unknown keys, duplicate keys, trailing JSON, invalid references, unsupported pro
 
 `client.model` selects the initial configured alias. It can be omitted when passing `--model ALIAS` to `claude-proxy run`. Optional `opusModel`, `sonnetModel`, and `haikuModel` must also reference configured aliases; omitted values use the session model. These set Claude Code's corresponding `ANTHROPIC_DEFAULT_*_MODEL` environment variables.
 
+Use separate aliases for the Claude Code model families whenever the configured
+upstreams differ. For example, set `opusModel` to `opus`, `sonnetModel` to
+`sonnet`, and `haikuModel` to `haiku`. Models with no Claude Code family
+selector, such as an explicitly configured `fable` route, remain available via
+`claude-proxy run -- --model fable`. See `examples/claude-pool.json` for a
+four-model subscription configuration.
+
 `run` sets `ANTHROPIC_BASE_URL` to the configured listener and `ANTHROPIC_AUTH_TOKEN` to a non-secret local placeholder. It clears inherited upstream credentials and preserves the working directory. This is independent of the account selected by the routing pool.
 
 ## Profiles and account pools

@@ -2,7 +2,14 @@
   "version": 1,
   "listen": "127.0.0.1:48114",
   "stateDir": "./state",
-  "client": {"command": ["claude"], "configDir": "./client", "model": "worker"},
+  "client": {
+    "command": ["claude"],
+    "configDir": "./client",
+    "model": "sonnet",
+    "opusModel": "opus",
+    "sonnetModel": "sonnet",
+    "haikuModel": "haiku"
+  },
   "profiles": {
     "work": {"displayName": "Work", "command": ["claude"], "configDir": "./profiles/work"},
     "backup": {"displayName": "Backup", "command": ["claude"], "configDir": "./profiles/backup", "sevenDayThresholdPct": 95}
@@ -19,8 +26,21 @@
     }
   },
   "models": {
-    "worker": {"provider": "claude", "upstream": "REPLACE_WITH_YOUR_MODEL_ID", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true}
+    "fable": {"provider": "claude", "upstream": "claude-fable-5-1", "responseAlias": "claude-fable-5-1", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true},
+    "opus": {"provider": "claude", "upstream": "claude-opus-5", "responseAlias": "claude-opus-5", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true},
+    "sonnet": {"provider": "claude", "upstream": "claude-sonnet-5", "responseAlias": "claude-sonnet-5", "contextWindow": 1000000, "supportsTools": true, "supportsImages": true},
+    "haiku": {"provider": "claude", "upstream": "claude-haiku-4-5-20251001", "responseAlias": "claude-haiku-4-5-20251001", "contextWindow": 200000, "supportsTools": true, "supportsImages": true}
   },
-  "chains": {"worker": {"steps": [{"model": "worker"}], "requireTools": true}},
-  "aliases": {"worker": "worker", "worker[1m]": "worker"}
+  "chains": {
+    "fable": {"steps": [{"model": "fable"}], "requireTools": true, "minimumContextWindow": 1000000},
+    "opus": {"steps": [{"model": "opus"}], "requireTools": true, "minimumContextWindow": 1000000},
+    "sonnet": {"steps": [{"model": "sonnet"}], "requireTools": true, "minimumContextWindow": 1000000},
+    "haiku": {"steps": [{"model": "haiku"}], "requireTools": true}
+  },
+  "aliases": {
+    "fable": "fable", "fable[1m]": "fable",
+    "opus": "opus", "opus[1m]": "opus",
+    "sonnet": "sonnet", "sonnet[1m]": "sonnet",
+    "haiku": "haiku"
+  }
 }
