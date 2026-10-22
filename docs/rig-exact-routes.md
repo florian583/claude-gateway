@@ -92,3 +92,10 @@ Reference implementation audited at CLIProxyAPI revision
 VibeProxy's blanket cache stripping is deliberately excluded. Verify cache creation
 and cache-read usage on repeated requests after each wire-profile update. A short
 successful answer alone does not prove cache reuse or structured-tool compatibility.
+
+A 2026-10-22 live canary returned an upstream 400 for forced `tool_choice: tool`
+on Opus 5.5 and Sonnet 5.5, with the response stating that `tool` and `any` are
+not supported for those models. Haiku 5.5 accepted the forced choice. All three
+models streamed successfully, and Opus and Sonnet returned tool calls with
+`tool_choice: auto`. The rig preserves the requested choice and upstream error;
+it does not weaken the constraint or switch models.
