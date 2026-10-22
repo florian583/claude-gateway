@@ -30,6 +30,8 @@ import (
 )
 
 type config struct {
+	RigListen       string                    `json:"-"`
+	RigModels       map[string]string         `json:"-"`
 	BodyLimits      bodyLimitsConfig          `json:"bodyLimits,omitempty"`
 	Definition      *fileConfig               `json:"-"`
 	SourcePath      string                    `json:"-"`
@@ -115,23 +117,25 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
-	AccountScope         string         `json:"-"`
-	SoftConcurrency      int            `json:"-"`
-	ModelID              string         `json:"-"`
-	AccountStickySeconds int            `json:"-"`
-	AccountPool          string         `json:"-"`
-	ConfiguredPool       string         `json:"-"`
-	SupportsTools        bool           `json:"-"`
-	ModelOverrides       map[string]any `json:"-"`
-	AllowPaidFallback    bool           `json:"-"`
-	PaidFallbackOn       []string       `json:"-"`
-	Provider             string         `json:"provider"`
-	Upstream             string         `json:"upstream"`
-	ResponseAlias        string         `json:"responseAlias"`
-	ContextWindow        int            `json:"contextWindow"`
-	Tier                 *int           `json:"tier,omitempty"`
-	SupportsImages       *bool          `json:"supportsImages,omitempty"`
-	SupportsDocuments    *bool          `json:"supportsDocuments,omitempty"`
+	RequestTimeoutMS      int            `json:"-"`
+	FirstContentTimeoutMS int            `json:"-"`
+	AccountScope          string         `json:"-"`
+	SoftConcurrency       int            `json:"-"`
+	ModelID               string         `json:"-"`
+	AccountStickySeconds  int            `json:"-"`
+	AccountPool           string         `json:"-"`
+	ConfiguredPool        string         `json:"-"`
+	SupportsTools         bool           `json:"-"`
+	ModelOverrides        map[string]any `json:"-"`
+	AllowPaidFallback     bool           `json:"-"`
+	PaidFallbackOn        []string       `json:"-"`
+	Provider              string         `json:"provider"`
+	Upstream              string         `json:"upstream"`
+	ResponseAlias         string         `json:"responseAlias"`
+	ContextWindow         int            `json:"contextWindow"`
+	Tier                  *int           `json:"tier,omitempty"`
+	SupportsImages        *bool          `json:"supportsImages,omitempty"`
+	SupportsDocuments     *bool          `json:"supportsDocuments,omitempty"`
 	// UnsupportedContentTypes lists message content-block `type` values this
 	// route cannot serve (e.g. non-Anthropic providers reject `document`,
 	// `tool_reference`, server-side tool blocks). Requests containing one are
@@ -262,7 +266,8 @@ func primeSSEBodyWithPrelude(body io.ReadCloser, timeout, preludeIdle time.Durat
 	return primeSSEBodyObserved(body, timeout, preludeIdle, first, nil)
 }
 
-func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string)) (io.ReadCloser, error) {
+func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string), usefulOnly ...bool) (io.ReadCloser, error) {
+	strict := len(usefulOnly) > 0 && usefulOnly[0]
 	observed := false
 	sawStopReason := false
 	reader := bufio.NewReader(body)
@@ -317,14 +322,22 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 					}
 				}
 				metadata := false
-				if preludeIdle > 0 {
+				if preludeIdle > 0 || strict {
 					var preludeErr error
-					metadata, preludeErr = classifyPrelude(data, &sawStopReason)
+					if strict {
+						metadata, preludeErr = classifyUsefulPrelude(data)
+					} else {
+						metadata, preludeErr = classifyPrelude(data, &sawStopReason)
+					}
 					if preludeErr != nil {
 						return nil, preludeErr
 					}
 				}
 				if metadata {
+					if strict {
+						hasData, event, dataLines = false, "", nil
+						continue
+					}
 					stopTimer()
 					if timedOut.Load() {
 						return nil, errors.New("initial SSE prelude timed out")
@@ -1150,10 +1163,18 @@ func serve(cfg config) error {
 	handler := server.handler()
 
 	servers := []*http.Server{}
-	for _, addr := range append([]string{cfg.Listen}, cfg.AlsoListen...) {
+	addresses := append([]string{cfg.Listen}, cfg.AlsoListen...)
+	if cfg.RigListen != "" {
+		addresses = append(addresses, cfg.RigListen)
+	}
+	for _, addr := range addresses {
+		listenerHandler := handler
+		if addr == cfg.RigListen {
+			listenerHandler = server.rigHandler()
+		}
 		servers = append(servers, &http.Server{
 			Addr:              addr,
-			Handler:           handler,
+			Handler:           listenerHandler,
 			ReadHeaderTimeout: 30 * time.Second,
 			// NOTE: never set WriteTimeout here — it would kill long-lived SSE streams.
 		})
@@ -1212,6 +1233,8 @@ func serve(cfg config) error {
 	return <-errCh
 }
 
+type rigEndpointContextKey struct{}
+
 func (s *proxyServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
@@ -1244,6 +1267,35 @@ func (s *proxyServer) handler() http.Handler {
 		s.proxy(w, r)
 	})
 	return mux
+}
+
+func (s *proxyServer) rigHandler() http.Handler {
+	handler := s.handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.cfg.RigModels) == 0 {
+			writeAPIError(w, http.StatusNotFound, "invalid_request_error", "rig endpoint is not configured")
+			return
+		}
+		w.Header().Set("X-Proxy-Usage", "rig")
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			s.health(w, r)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/routes" {
+			models := map[string]modelConfig{}
+			for requested, alias := range s.cfg.RigModels {
+				models[requested] = s.cfg.Models[alias]
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"usage": "rig", "models": models})
+			return
+		}
+		if r.Method != http.MethodPost || (r.URL.Path != "/v1/messages" && r.URL.Path != "/v1/messages/count_tokens") {
+			writeAPIError(w, http.StatusNotFound, "invalid_request_error", "unsupported rig endpoint")
+			return
+		}
+		handler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), rigEndpointContextKey{}, true)))
+	})
 }
 
 func normalizeRuntimeConfig(path string, body []byte, cfg config) (config, error) {
@@ -6667,6 +6719,11 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if selectedModel.RequestTimeoutMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(selectedModel.RequestTimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
@@ -6677,6 +6734,11 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if r.Context().Err() != nil {
 			s.recordRequestTerminal(requestID, r, selectedModel, 499, "client_cancel", requestStarted)
+			return
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusGatewayTimeout, "route_timeout", requestStarted)
+			writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Model route exceeded its request deadline")
 			return
 		}
 		var compatibilityErr *requestCompatibilityError
@@ -6712,6 +6774,8 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	runtimeProviderName := s.providerRuntimeKeyForCandidate(r, providerName, selectedModel)
 
 	copyHeaders(w.Header(), resp.Header)
+	w.Header().Set("X-Proxy-Upstream-Model", selectedModel.Upstream)
+	w.Header().Set("X-Proxy-Upstream-Provider", providerName)
 	// Body is re-encoded by the filters below, so upstream framing no longer applies.
 	w.Header().Del("Content-Length")
 	w.Header().Del("Content-Encoding")
@@ -7756,6 +7820,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			if primeBudget > initialSSEEventTimeout {
 				primeBudget = initialSSEEventTimeout
 			}
+			if candidate.FirstContentTimeoutMS > 0 {
+				primeBudget = time.Duration(candidate.FirstContentTimeoutMS)*time.Millisecond - time.Since(attemptStarted)
+			}
 			var primedBody io.ReadCloser
 			var primeErr error
 			if primeBudget <= 0 {
@@ -7772,8 +7839,8 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				}, func(kind string) {
 					execution.PrimedFrames++
 					execution.PrimeLastFrame = kind
-				})
-				if preludeIdle > 0 && !firstEventAt.IsZero() {
+				}, candidate.FirstContentTimeoutMS > 0)
+				if preludeIdle > 0 && candidate.FirstContentTimeoutMS == 0 && !firstEventAt.IsZero() {
 					// Thinking after a valid initial event belongs to the stream
 					// idle allowance, not another provider's header reserve.
 					preludeWait := time.Since(firstEventAt)
@@ -7854,7 +7921,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 		}
 		if resp.Body != nil {
-			if bodyErr := s.bufferUpstreamBody(ctx, resp, trace); bodyErr != nil {
+			if bodyErr := s.bufferUpstreamBody(ctx, resp, trace, responseContract{openAI: !countTokens && s.cfg.Providers[providerName].Format == "openai-chat", strict: !countTokens && candidate.FirstContentTimeoutMS > 0, toolChoice: payload["tool_choice"]}); bodyErr != nil {
 				execution.ResponseReadError = true
 				if ctx.Err() != nil {
 					s.recordAttempt(trace, selected, candidate, i, attemptStarted, resp.StatusCode, false, "client_cancel")
@@ -8269,6 +8336,9 @@ func (s *proxyServer) doUpstreamWithHeaderBudget(ctx context.Context, r *http.Re
 func (s *proxyServer) doUpstreamWithHeaderBudgetLimit(ctx context.Context, r *http.Request, body []byte, selectedModel modelConfig, maximum time.Duration) (*http.Response, error) {
 	providerName := firstNonEmpty(selectedModel.Provider, s.cfg.DefaultProvider)
 	budget := s.candidateResponseHeaderBudget(providerName, selectedModel, body)
+	if selectedModel.FirstContentTimeoutMS > 0 {
+		budget = minDuration(budget, time.Duration(selectedModel.FirstContentTimeoutMS)*time.Millisecond)
+	}
 	chainLimited := maximum > 0 && maximum < budget
 	if chainLimited {
 		budget = maximum
@@ -8404,7 +8474,22 @@ func (s *proxyServer) normalizeRequest(r *http.Request) ([]byte, map[string]any,
 		}
 	}
 	if model, ok := payload["model"].(string); ok {
-		if mapped, exists := s.cfg.Models[model]; exists {
+		lookup := model
+		rig, _ := r.Context().Value(rigEndpointContextKey{}).(bool)
+		if rig {
+			var ok bool
+			lookup, ok = s.cfg.RigModels[model]
+			if !ok {
+				return body, payload, modelConfig{Requested: model}, fmt.Errorf("%w: model %q is not configured for the rig endpoint", errUnknownModel, model)
+			}
+		} else {
+			for _, alias := range s.cfg.RigModels {
+				if alias == model {
+					return body, payload, modelConfig{Requested: model}, fmt.Errorf("%w: rig routes require the dedicated rig endpoint", errUnknownModel)
+				}
+			}
+		}
+		if mapped, exists := s.cfg.Models[lookup]; exists {
 			selected = mapped
 		} else if family, matched := s.cfg.matchFamily(model); matched {
 			selected = family
@@ -8412,8 +8497,21 @@ func (s *proxyServer) normalizeRequest(r *http.Request) ([]byte, map[string]any,
 			return body, payload, modelConfig{Requested: model}, fmt.Errorf("%w %q", errUnknownModel, model)
 		}
 		selected.Requested = model
+		if rig {
+			selected.ResponseAlias = model
+		}
 	}
 	mutated := normalizeHistoricalToolIDs(payload)
+	if rig, _ := r.Context().Value(rigEndpointContextKey{}).(bool); rig && s.cfg.Providers[selected.Provider].Variant == "claude-subscription" {
+		adapted, adaptErr := adaptRigClaudeRequest(payload, r.Header)
+		if adaptErr != nil {
+			return nil, nil, selected, fmt.Errorf("%w: %v", errUnknownModel, adaptErr)
+		}
+		mutated = mutated || adapted
+		query := r.URL.Query()
+		query.Set("beta", "true")
+		r.URL.RawQuery = query.Encode()
+	}
 	if len(s.cfg.Normalize.UnsupportedContentTypes) > 0 {
 		if messages, ok := payload["messages"].([]any); ok {
 			payload["messages"] = s.normalizeMessages(messages)
@@ -10792,7 +10890,7 @@ func translateOpenAIJSONResponse(body []byte, responseAlias string) []byte {
 func translateOpenAIJSONResponseChecked(body []byte, responseAlias string) ([]byte, bool) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return body, false
+		return openAIAdapterErrorBody("OpenAI adapter: malformed JSON response"), true
 	}
 	payload = unwrapOpenAIEnvelope(payload)
 	if errPayload, ok := payload["error"].(map[string]any); ok {
@@ -10802,13 +10900,13 @@ func translateOpenAIJSONResponseChecked(body []byte, responseAlias string) ([]by
 			"error": map[string]any{"type": "api_error", "message": firstNonEmpty(message, "upstream error")},
 		})
 		if err == nil {
-			return out, false
+			return out, true
 		}
 		return body, false
 	}
 	choices, _ := payload["choices"].([]any)
 	if len(choices) == 0 {
-		return body, false
+		return openAIAdapterErrorBody("OpenAI adapter: missing completion choices"), true
 	}
 	choice, _ := choices[0].(map[string]any)
 	message, _ := choice["message"].(map[string]any)
@@ -10840,6 +10938,9 @@ func translateOpenAIJSONResponseChecked(body []byte, responseAlias string) ([]by
 				"input": input,
 			})
 		}
+	}
+	if len(content) == 0 {
+		return openAIAdapterErrorBody("OpenAI adapter: completion contains no text or tool call"), true
 	}
 	usage := map[string]any{"input_tokens": 0, "output_tokens": 0}
 	if usagePayload, ok := payload["usage"].(map[string]any); ok {

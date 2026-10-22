@@ -84,6 +84,42 @@ class PrivacyCheckTests(unittest.TestCase):
             message.write_text("Change\n\nCo-authored-by: Person <person@" + "mail.com>\n")
             self.assertNotEqual(self.run_guard(path, "--message", str(message)).returncode, 0)
 
+    def test_github_generated_pull_request_merge_author(self):
+        with self.repo() as path:
+            (path / "notes.md").write_text("Generic fixture")
+            self.run_git(path, "add", ".")
+            self.run_git(path, "commit", "-m", "Initial source")
+            parent = self.run_git(path, "rev-parse", "HEAD").stdout.strip()
+            tree = self.run_git(path, "rev-parse", "HEAD^{tree}").stdout.strip()
+            env = self.env()
+
+            def commit_tree(*args, generated=False):
+                commit_env = env.copy()
+                if generated:
+                    commit_env.update(
+                        GIT_AUTHOR_NAME="Florian Vidal",
+                        GIT_AUTHOR_EMAIL="123+dev@users.noreply.github.com",
+                        GIT_COMMITTER_NAME="GitHub",
+                        GIT_COMMITTER_EMAIL="noreply@github.com",
+                    )
+                return subprocess.run(
+                    ["git", "commit-tree", *args], cwd=path, env=commit_env,
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip()
+
+            first = commit_tree(tree, "-p", parent, "-m", "First parent")
+            second = commit_tree(tree, "-p", parent, "-m", "Second parent")
+            merge = commit_tree(
+                tree, "-p", first, "-p", second, "-m",
+                f"Merge {first} into {second}", generated=True,
+            )
+            raw = self.run_git(path, "cat-file", "commit", merge).stdout
+            headers, message = raw.split("\n\n", 1)
+            self.assertTrue(guard.github_pull_request_merge_author(headers, message), raw)
+            self.run_git(path, "update-ref", "refs/heads/generated-pr-merge", merge)
+            result = self.run_guard(path, "--history")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_clean_history(self):
         with self.repo() as path:
             (path / "notes.md").write_text("Generic fixture")

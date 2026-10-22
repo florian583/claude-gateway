@@ -123,3 +123,62 @@ func metadataOnlySSE(data string) bool {
 	}
 	return true
 }
+
+// Strict routes buffer reasoning and metadata before committing any output.
+// The caller bounds both the buffered bytes and the absolute wait.
+func classifyUsefulPrelude(data string) (bool, error) {
+	if data == "[DONE]" {
+		return false, errors.New("stream ended without text or tool call")
+	}
+	var p map[string]any
+	if json.Unmarshal([]byte(data), &p) != nil {
+		return false, errors.New("malformed stream prelude")
+	}
+	p = unwrapOpenAIEnvelope(p)
+	switch p["type"] {
+	case "message_stop", "message_delta":
+		return false, errors.New("stream ended without text or tool call")
+	case "ping", "message_start", "content_block_stop":
+		return true, nil
+	case "content_block_start":
+		b, _ := p["content_block"].(map[string]any)
+		if b["type"] == "tool_use" {
+			return false, nil
+		}
+		if b["type"] == "thinking" {
+			return true, nil
+		}
+		if b["type"] == "text" {
+			text, _ := b["text"].(string)
+			return text == "", nil
+		}
+	case "content_block_delta":
+		d, _ := p["delta"].(map[string]any)
+		switch d["type"] {
+		case "thinking_delta", "signature_delta":
+			return true, nil
+		case "text_delta":
+			text, _ := d["text"].(string)
+			return text == "", nil
+		case "input_json_delta":
+			return false, nil
+		}
+	}
+	if choices, ok := p["choices"].([]any); ok {
+		for _, raw := range choices {
+			c, _ := raw.(map[string]any)
+			d, _ := c["delta"].(map[string]any)
+			if text, _ := d["content"].(string); text != "" {
+				return false, nil
+			}
+			if calls, _ := d["tool_calls"].([]any); len(calls) > 0 {
+				return false, nil
+			}
+			if c["finish_reason"] != nil {
+				return false, errors.New("stream ended without text or tool call")
+			}
+		}
+		return true, nil
+	}
+	return false, errors.New("unsupported stream prelude")
+}
