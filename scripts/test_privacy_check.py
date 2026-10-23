@@ -84,6 +84,16 @@ class PrivacyCheckTests(unittest.TestCase):
             message.write_text("Change\n\nCo-authored-by: Person <person@" + "mail.com>\n")
             self.assertNotEqual(self.run_guard(path, "--message", str(message)).returncode, 0)
 
+    def test_published_github_merge_identity_requires_matching_handle(self):
+        headers = ("parent " + "a" * 40 + "\nparent " + "b" * 40 +
+                   "\nauthor Public Name <123+dev@users.noreply.github.com> 1 +0000" +
+                   "\ncommitter GitHub <noreply@github.com> 1 +0000")
+        message = "Merge pull request #3 from dev/fix/example"
+        self.assertTrue(guard.github_pull_request_merge_author(headers, message))
+        self.assertFalse(guard.github_pull_request_merge_author(headers, message.replace('dev/', 'other/')))
+        self.assertFalse(guard.github_pull_request_merge_author(headers.replace('noreply@github.com', 'dev@users.noreply.github.com'), message))
+        self.assertFalse(guard.github_pull_request_merge_author(headers.replace('123+dev@users.noreply.github.com', 'person@example.invalid'), message))
+
     def test_github_generated_pull_request_merge_author(self):
         with self.repo() as path:
             (path / "notes.md").write_text("Generic fixture")

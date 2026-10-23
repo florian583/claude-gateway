@@ -6741,6 +6741,14 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Model route exceeded its request deadline")
 			return
 		}
+		if rig, _ := r.Context().Value(rigEndpointContextKey{}).(bool); rig {
+			var headerTimeout *responseHeaderTimeoutError
+			if errors.As(err, &headerTimeout) {
+				s.recordRequestTerminal(requestID, r, selectedModel, http.StatusGatewayTimeout, "response_header_timeout", requestStarted)
+				writeAPIError(w, http.StatusGatewayTimeout, "api_error", "Upstream response headers exceeded their deadline")
+				return
+			}
+		}
 		var compatibilityErr *requestCompatibilityError
 		if errors.As(err, &compatibilityErr) {
 			s.recordRequestTerminal(requestID, r, selectedModel, http.StatusBadRequest, "route_incompatible", requestStarted)
@@ -7466,6 +7474,8 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	// (WiFi flap, DNS, conn reset), never account-specific. Iterating other
 	// accounts on a blip only re-pins the lease to whoever answers.
 	skipProfilesForUpstream := ""
+	emptyRigRetries := 0
+	rigRequest, _ := r.Context().Value(rigEndpointContextKey{}).(bool)
 	for i, accountAttempt := range attempts {
 		if accountAttempt.profile.Name != "" && skipProfilesForUpstream != "" && accountAttempt.model.Upstream == skipProfilesForUpstream {
 			continue
@@ -7855,6 +7865,12 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					return upstreamResponse{}, ctx.Err()
 				}
 				failureReason := "stream_start"
+				var empty *emptyPreludeError
+				if errors.As(primeErr, &empty) {
+					execution.PreludeStopReason = empty.StopReason
+					execution.PreludeOutputTokens = empty.OutputTokens
+					failureReason = "empty_response"
+				}
 				var providerError *initialSSEError
 				kind := ""
 				if errors.As(primeErr, &providerError) {
@@ -7878,12 +7894,12 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					failureReason = "auth_exhausted"
 				}
 				networkDecision := networkFailureDecision{}
-				if !quotaError && !authError {
+				if !quotaError && !authError && empty == nil {
 					networkDecision = s.observeNetworkTransportFailure(runtimeProviderName, failureReason, primeErr)
 				}
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
-				} else if !quotaError && !authError && accountAttempt.profile.Name == "" {
+				} else if !quotaError && !authError && empty == nil && accountAttempt.profile.Name == "" {
 					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), "stream_start")
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
@@ -7893,7 +7909,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 						s.markProviderBlocked(runtimeProviderName, "auth_exhausted", time.Minute)
 						clearClaudeProfileOAuthToken(accountAttempt.profile)
 						s.triggerClaudeOAuthRefresh(accountAttempt.profile)
-					} else if !quotaError && !networkDecision.SuppressProviderPenalty && anthropicFailureClass != "auth_or_client" {
+					} else if !quotaError && empty == nil && !networkDecision.SuppressProviderPenalty && anthropicFailureClass != "auth_or_client" {
 						anthropicFailureClass = "service"
 						if !networkDecision.SuppressProviderPenalty && !anthropicServiceSignalRecorded {
 							anthropicOutageConfirmed = s.observeClaudeServiceFailure()
@@ -7911,7 +7927,11 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					return upstreamResponse{}, &retryableNetworkError{message: "local network unavailable; retry shortly"}
 				}
 				if accountAttempt.profile.Name != "" && !quotaError && !authError {
-					skipProfilesForUpstream = candidate.Upstream
+					if retryEmptyRigPrelude(rigRequest, primeErr, emptyRigRetries) {
+						emptyRigRetries++
+					} else {
+						skipProfilesForUpstream = candidate.Upstream
+					}
 				}
 				continue
 			}

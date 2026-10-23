@@ -146,7 +146,11 @@ def github_pull_request_merge_author(headers, message):
         return False
     if not committer or committer.groups()[:2] != ("GitHub", "noreply@github.com"):
         return False
-    return re.fullmatch(r"Merge [0-9a-f]{40} into [0-9a-f]{40}", first_line) is not None
+    if re.fullmatch(r"Merge [0-9a-f]{40} into [0-9a-f]{40}", first_line):
+        return True
+    published = re.fullmatch(r"Merge pull request #[1-9][0-9]* from ([A-Za-z0-9-]+)/[^\s]+", first_line)
+    account = NOREPLY.fullmatch(author.group(2))
+    return published is not None and published.group(1).lower() == account.group(1).lower()
 
 
 def check_history():

@@ -124,11 +124,32 @@ func metadataOnlySSE(data string) bool {
 	return true
 }
 
+type emptyPreludeError struct {
+	StopReason   string
+	OutputTokens int
+}
+
+func (e *emptyPreludeError) Error() string { return "stream ended without text or tool call" }
+
+func safePreludeStopReason(value any) string {
+	switch value {
+	case "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal", "stop", "length", "tool_calls":
+		return value.(string)
+	default:
+		return "unknown"
+	}
+}
+
+func retryEmptyRigPrelude(rig bool, err error, retries int) bool {
+	var empty *emptyPreludeError
+	return rig && retries == 0 && errors.As(err, &empty) && empty.StopReason == "end_turn"
+}
+
 // Strict routes buffer reasoning and metadata before committing any output.
 // The caller bounds both the buffered bytes and the absolute wait.
 func classifyUsefulPrelude(data string) (bool, error) {
 	if data == "[DONE]" {
-		return false, errors.New("stream ended without text or tool call")
+		return false, &emptyPreludeError{StopReason: "unknown"}
 	}
 	var p map[string]any
 	if json.Unmarshal([]byte(data), &p) != nil {
@@ -136,8 +157,19 @@ func classifyUsefulPrelude(data string) (bool, error) {
 	}
 	p = unwrapOpenAIEnvelope(p)
 	switch p["type"] {
-	case "message_stop", "message_delta":
-		return false, errors.New("stream ended without text or tool call")
+	case "message_stop":
+		return false, &emptyPreludeError{StopReason: "unknown"}
+	case "message_delta":
+		delta, _ := p["delta"].(map[string]any)
+		if delta["stop_reason"] == nil {
+			return true, nil
+		}
+		usage, _ := p["usage"].(map[string]any)
+		output, _ := usage["output_tokens"].(float64)
+		if output < 0 || output > 1000000000 {
+			output = 0
+		}
+		return false, &emptyPreludeError{StopReason: safePreludeStopReason(delta["stop_reason"]), OutputTokens: int(output)}
 	case "ping", "message_start", "content_block_stop":
 		return true, nil
 	case "content_block_start":
@@ -175,7 +207,7 @@ func classifyUsefulPrelude(data string) (bool, error) {
 				return false, nil
 			}
 			if c["finish_reason"] != nil {
-				return false, errors.New("stream ended without text or tool call")
+				return false, &emptyPreludeError{StopReason: "unknown"}
 			}
 		}
 		return true, nil

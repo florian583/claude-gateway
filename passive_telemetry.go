@@ -52,6 +52,8 @@ type attemptOutcome struct {
 }
 
 type attemptExecution struct {
+	PreludeStopReason   string            `json:"preludeStopReason,omitempty"`
+	PreludeOutputTokens int               `json:"preludeOutputTokens,omitempty"`
 	PrimedFrames        int               `json:"primedFrames,omitempty"`
 	PrimeLastFrame      string            `json:"primeLastFrame,omitempty"`
 	PreludeMS           int64             `json:"preludeMs,omitempty"`
