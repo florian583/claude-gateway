@@ -4,3 +4,4 @@
 16:26Z | test written and seen red | two-step rig Opus chains rejected by the current single-model validator | cca3382
 16:27Z | step 2 complete | approved Opus-to-Sonnet rig chain advances after Opus empty failures; metrics retain requested and served models | cca3382
 16:29Z | step 3 complete | stub tests cover empty pass-through, Opus retry then Sonnet, normal byte preservation, Hybrid isolation, and served-model metrics | 4456192
+16:31Z | step 4 complete | 17 touched-file tests and 12 subtests pass; vet, privacy, and build pass; binary sha1 1c4473840f160a7ecd24f782152b389a0a5ade3c | 0a91eb5
