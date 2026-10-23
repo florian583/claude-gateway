@@ -307,3 +307,59 @@ func TestRigEmptyEndTurnRetriesSameModelBeforeOutput(t *testing.T) {
 		})
 	}
 }
+
+func TestRigEmptyEndTurnAfterToolResultPassesThrough(t *testing.T) {
+	const emptyResponse = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, emptyResponse)
+	}))
+	defer upstream.Close()
+
+	f := testClaudeConfig(t)
+	opus := f.Models["model"]
+	opus.Upstream = "claude-opus-5-5"
+	f.Models["opus"] = opus
+	const chainName = "rig-exact-claude-opus-5-5"
+	f.Chains[chainName] = chainDefinition{
+		Steps:                 []chainStep{{Model: "opus"}},
+		RequestTimeoutMS:      1000,
+		FirstContentTimeoutMS: 500,
+	}
+	f.Aliases[chainName] = chainName
+	f.RigModels = map[string]string{"claude-opus-5-5": chainName}
+	f.RigListen = "127.0.0.1:48105"
+	cfg := compileFixture(t, f)
+	provider := cfg.Providers["endpoint"]
+	provider.BaseURL = upstream.URL
+	cfg.Providers["endpoint"] = provider
+	seedTestCredentials(t, cfg)
+	s := testProxy(t, cfg)
+
+	request := `{"model":"claude-opus-5-5","stream":true,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_test","name":"report","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_test","content":"reported"}]}]}`
+	out := httptest.NewRecorder()
+	s.rigHandler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || out.Body.String() != emptyResponse {
+		t.Fatalf("status=%d calls=%d body=%q", out.Code, calls, out.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d, want one", calls)
+	}
+	if got := out.Header().Get("X-Proxy-Upstream-Model"); got != "claude-opus-5-5" {
+		t.Fatalf("served-model header=%q", got)
+	}
+	samples := s.metrics.read(10)
+	if len(samples) != 1 {
+		t.Fatalf("metrics samples=%d, want one completion", len(samples))
+	}
+	sample := samples[0]
+	if sample.RecordKind != "completion" || !sample.Success || sample.FailureReason != "" ||
+		sample.RequestedModel != "claude-opus-5-5" || sample.Upstream != "claude-opus-5-5" ||
+		sample.Execution == nil || !sample.Execution.EmptyCompletion || sample.Execution.PreludeStopReason != "end_turn" {
+		t.Fatalf("unexpected empty-completion metric: %+v", sample)
+	}
+}

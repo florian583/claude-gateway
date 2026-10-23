@@ -152,14 +152,15 @@ type modelConfig struct {
 }
 
 type upstreamResponse struct {
-	resp          *http.Response
-	providerName  string
-	model         modelConfig
-	attempt       int
-	started       time.Time
-	trace         requestTrace
-	unstable      bool
-	failureReason string
+	resp            *http.Response
+	providerName    string
+	model           modelConfig
+	attempt         int
+	started         time.Time
+	trace           requestTrace
+	unstable        bool
+	failureReason   string
+	emptyCompletion bool
 }
 
 type requestTrace struct {
@@ -268,13 +269,21 @@ func primeSSEBodyWithPrelude(body io.ReadCloser, timeout, preludeIdle time.Durat
 
 func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string), usefulOnly ...bool) (io.ReadCloser, error) {
 	strict := len(usefulOnly) > 0 && usefulOnly[0]
+	return primeSSEBodyObservedWithPolicy(body, timeout, preludeIdle, firstEvent, onFrame, strict, false, nil)
+}
+
+func primeSSEBodyObservedWithPolicy(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string), strict, allowEmptyEndTurn bool, onEmptyCompletion func(*emptyPreludeError)) (io.ReadCloser, error) {
 	observed := false
 	sawStopReason := false
+	var terminalEmpty *emptyPreludeError
 	reader := bufio.NewReader(body)
 	var prefix bytes.Buffer
 	hasData := false
 	var event string
 	var dataLines []string
+	var frameLines []string
+	sawMessageStart := false
+	sawTerminal := false
 
 	var timedOut atomic.Bool
 	var timer *time.Timer
@@ -298,6 +307,9 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 		if len(line) > 0 {
 			_, _ = prefix.WriteString(line)
 			trimmed := strings.TrimRight(line, "\r\n")
+			if allowEmptyEndTurn && trimmed != "" {
+				frameLines = append(frameLines, line)
+			}
 			switch {
 			case strings.HasPrefix(trimmed, "event:"):
 				event = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
@@ -315,6 +327,20 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 				if err := validateInitialSSE(event, data); err != nil {
 					return nil, err
 				}
+				frameKind := primeFrameKind(data)
+				if allowEmptyEndTurn {
+					validatedKind, validationErr := validateAnthropicSSEEvent(frameLines, sawMessageStart, sawTerminal)
+					if validationErr != nil {
+						return nil, validationErr
+					}
+					frameKind = validatedKind
+					switch frameKind {
+					case "message_start":
+						sawMessageStart = true
+					case "message_stop", "error":
+						sawTerminal = true
+					}
+				}
 				if !observed {
 					observed = true
 					if firstEvent != nil {
@@ -322,6 +348,26 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 					}
 				}
 				metadata := false
+				if terminalEmpty != nil {
+					switch frameKind {
+					case "ping":
+						metadata = true
+					case "message_stop":
+						if onEmptyCompletion != nil {
+							onEmptyCompletion(terminalEmpty)
+						}
+						return &readerReadCloser{
+							Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader),
+							Closer: body,
+						}, nil
+					default:
+						return nil, terminalEmpty
+					}
+					if metadata {
+						hasData, event, dataLines, frameLines = false, "", nil, nil
+						continue
+					}
+				}
 				if preludeIdle > 0 || strict {
 					var preludeErr error
 					if strict {
@@ -330,12 +376,19 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 						metadata, preludeErr = classifyPrelude(data, &sawStopReason)
 					}
 					if preludeErr != nil {
-						return nil, preludeErr
+						var empty *emptyPreludeError
+						if allowEmptyEndTurn && errors.As(preludeErr, &empty) && empty.StopReason == "end_turn" {
+							terminalEmpty = empty
+							metadata = true
+						} else {
+							return nil, preludeErr
+						}
 					}
 				}
 				if metadata {
 					if strict {
 						hasData, event, dataLines = false, "", nil
+						frameLines = nil
 						continue
 					}
 					stopTimer()
@@ -348,18 +401,23 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 						_ = body.Close()
 						close(timerDone)
 					})
-					hasData, event, dataLines = false, "", nil
+					hasData, event, dataLines, frameLines = false, "", nil, nil
 					continue
 				}
 				return &readerReadCloser{
 					Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader),
 					Closer: body,
 				}, nil
+			case trimmed == "":
+				frameLines = nil
 			}
 		}
 		if err != nil {
 			if timedOut.Load() {
 				return nil, fmt.Errorf("initial SSE event timed out after %s", timeout)
+			}
+			if terminalEmpty != nil {
+				return nil, terminalEmpty
 			}
 			return nil, fmt.Errorf("initial SSE event unavailable: %w", err)
 		}
@@ -6790,6 +6848,11 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	stats := &streamStats{}
+	if upstream.emptyCompletion && upstream.trace.Execution != nil {
+		stats.Events.Store(int64(upstream.trace.Execution.PrimedFrames))
+		stats.OutputTokens.Store(int64(upstream.trace.Execution.PreludeOutputTokens))
+		stats.noteEvent()
+	}
 	var responseBody io.ReadCloser
 	providerCfg := s.cfg.Providers[providerName]
 	openAIChat := providerCfg.Format == "openai-chat" && resp.StatusCode == http.StatusOK
@@ -6802,14 +6865,18 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 		if idleTimeout := streamIdleTimeout(providerCfg); idleTimeout > 0 {
 			source = &idleTimeoutReadCloser{source: resp.Body, timeout: idleTimeout}
 		}
-		if openAIChat {
-			source = newOpenAIStreamReadCloserWithStats(source, responseAlias, stats)
-		}
 		inputTokenHint := 0
 		if providerCfg.Variant == "vercel-gateway" || s.cfg.Definition == nil && strings.HasPrefix(providerName, "vercel") {
 			inputTokenHint = estimateInputTokens(body)
 		}
-		responseBody = newSSEFilterReadCloser(source, dropTypes, inputTokenHint, responseAlias, s.streamEventStallTimeout(), stats)
+		if upstream.emptyCompletion {
+			responseBody = source
+		} else {
+			if openAIChat {
+				source = newOpenAIStreamReadCloserWithStats(source, responseAlias, stats)
+			}
+			responseBody = newSSEFilterReadCloser(source, dropTypes, inputTokenHint, responseAlias, s.streamEventStallTimeout(), stats)
+		}
 	case strings.Contains(contentType, "application/json"):
 		var source io.ReadCloser = resp.Body
 		if openAIChat {
@@ -7476,6 +7543,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	skipProfilesForUpstream := ""
 	emptyRigRetries := 0
 	rigRequest, _ := r.Context().Value(rigEndpointContextKey{}).(bool)
+	allowEmptyEndTurn := rigRequest && lastUserTurnHasToolResult(payload)
 	for i, accountAttempt := range attempts {
 		if accountAttempt.profile.Name != "" && skipProfilesForUpstream != "" && accountAttempt.model.Upstream == skipProfilesForUpstream {
 			continue
@@ -7820,6 +7888,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			releaseCircuitProbe(circuitProbe)
 			releaseAttemptAccount()
 		}
+		emptyCompletion := false
 		if !countTokens && resp.Body != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
 			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			attemptBudget := s.candidateResponseHeaderBudget(providerName, candidate, attemptBody)
@@ -7843,13 +7912,18 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					preludeIdle = streamIdleTimeout(s.cfg.Providers[providerName])
 				}
 				var firstEventAt time.Time
-				primedBody, primeErr = primeSSEBodyObserved(resp.Body, primeBudget, preludeIdle, func() {
+				primedBody, primeErr = primeSSEBodyObservedWithPolicy(resp.Body, primeBudget, preludeIdle, func() {
 					firstEventAt = time.Now()
 					trace.FirstEventMS = time.Since(attemptStarted).Milliseconds()
 				}, func(kind string) {
 					execution.PrimedFrames++
 					execution.PrimeLastFrame = kind
-				}, candidate.FirstContentTimeoutMS > 0)
+				}, candidate.FirstContentTimeoutMS > 0, allowEmptyEndTurn, func(empty *emptyPreludeError) {
+					emptyCompletion = true
+					execution.EmptyCompletion = true
+					execution.PreludeStopReason = empty.StopReason
+					execution.PreludeOutputTokens = empty.OutputTokens
+				})
 				if preludeIdle > 0 && candidate.FirstContentTimeoutMS == 0 && !firstEventAt.IsZero() {
 					// Thinking after a valid initial event belongs to the stream
 					// idle allowance, not another provider's header reserve.
@@ -8201,7 +8275,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				log.Printf("Claude account failover request=%s listener=%q from=%q to=%q reason=account_local_exhaustion", trace.ID, requestListenerPort(r), accountAttempt.fromProfile, profile.Name)
 			}
 		}
-		return upstreamResponse{resp: resp, providerName: providerName, model: candidate, attempt: i, started: attemptStarted, trace: trace, unstable: unstable, failureReason: responseFailureReason}, nil
+		return upstreamResponse{resp: resp, providerName: providerName, model: candidate, attempt: i, started: attemptStarted, trace: trace, unstable: unstable, failureReason: responseFailureReason, emptyCompletion: emptyCompletion}, nil
 	}
 	if lastErr != nil {
 		return upstreamResponse{}, lastErr

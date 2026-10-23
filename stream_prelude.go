@@ -145,6 +145,28 @@ func retryEmptyRigPrelude(rig bool, err error, retries int) bool {
 	return rig && retries == 0 && errors.As(err, &empty) && empty.StopReason == "end_turn"
 }
 
+func lastUserTurnHasToolResult(payload map[string]any) bool {
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return false
+	}
+	last, ok := messages[len(messages)-1].(map[string]any)
+	if !ok || last["role"] != "user" {
+		return false
+	}
+	blocks, ok := last["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if ok && block["type"] == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
 // Strict routes buffer reasoning and metadata before committing any output.
 // The caller bounds both the buffered bytes and the absolute wait.
 func classifyUsefulPrelude(data string) (bool, error) {
