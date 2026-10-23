@@ -241,3 +241,69 @@ func TestRigListenerRejectsUnsafeConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestStrictPreludeMetadataAndEmptyDiagnostics(t *testing.T) {
+	metadata, err := classifyUsefulPrelude(`{"type":"message_delta","delta":{},"usage":{"output_tokens":3}}`)
+	if !metadata || err != nil {
+		t.Fatalf("metadata rejected: %v", err)
+	}
+	_, err = classifyUsefulPrelude(`{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":120}}`)
+	empty, ok := err.(*emptyPreludeError)
+	if !ok || empty.StopReason != "max_tokens" || empty.OutputTokens != 120 {
+		t.Fatalf("missing diagnostics: %#v", err)
+	}
+	for _, tc := range []struct {
+		rig     bool
+		reason  string
+		retries int
+		want    bool
+	}{
+		{true, "end_turn", 0, true}, {false, "end_turn", 0, false}, {true, "end_turn", 1, false},
+		{true, "max_tokens", 0, false}, {true, "refusal", 0, false}, {true, "unknown", 0, false},
+	} {
+		if got := retryEmptyRigPrelude(tc.rig, &emptyPreludeError{StopReason: tc.reason}, tc.retries); got != tc.want {
+			t.Fatalf("retry %+v = %v", tc, got)
+		}
+	}
+}
+
+func TestRigEmptyEndTurnRetriesSameModelBeforeOutput(t *testing.T) {
+	for _, reason := range []string{"end_turn", "max_tokens"} {
+		t.Run(reason, func(t *testing.T) {
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				if calls == 1 {
+					io.WriteString(w, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\""+reason+"\"},\"usage\":{\"output_tokens\":12}}\n\n")
+					return
+				}
+				io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-test-model\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+				io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+			}))
+			defer upstream.Close()
+			f := testClaudeConfig(t)
+			f.Chains["main"] = chainDefinition{Steps: []chainStep{{Model: "model"}}, RequestTimeoutMS: 1000, FirstContentTimeoutMS: 500}
+			cfg := compileFixture(t, f)
+			p := cfg.Providers["endpoint"]
+			p.BaseURL = upstream.URL
+			cfg.Providers["endpoint"] = p
+			seedTestCredentials(t, cfg)
+			s := testProxy(t, cfg)
+			r := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"test","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+			// Exercise the selected strict route while preserving the public model fixture.
+			r = r.WithContext(context.WithValue(r.Context(), rigEndpointContextKey{}, true))
+			cfg.RigModels = map[string]string{"test": "test"}
+			s.cfg.RigModels = cfg.RigModels
+			out := httptest.NewRecorder()
+			s.handler().ServeHTTP(out, r)
+			if reason == "end_turn" {
+				if calls != 2 || out.Code != 200 || !strings.Contains(out.Body.String(), `"text":"ok"`) {
+					t.Fatalf("calls=%d status=%d body=%s", calls, out.Code, out.Body.String())
+				}
+			} else if calls != 1 || out.Code != 502 {
+				t.Fatalf("calls=%d status=%d", calls, out.Code)
+			}
+		})
+	}
+}

@@ -99,3 +99,14 @@ not supported for those models. Haiku 5.5 accepted the forced choice. All three
 models streamed successfully, and Opus and Sonnet returned tool calls with
 `tool_choice: auto`. The rig preserves the requested choice and upstream error;
 it does not weaken the constraint or switch models.
+
+## Empty stream recovery
+
+Rig streams distinguish metadata-only `message_delta` frames from terminal
+frames. A terminal frame without text or a tool call records an allow-listed
+stop reason and bounded output-token count, without recording prompt or reasoning
+text. A normal empty `end_turn` may try one further eligible account for the same
+model before any output is committed, inside the existing whole-request deadline.
+Token exhaustion, refusals, unknown endings, and ordinary Hybrid streams do not
+use this retry. No new account is created and no model fallback is introduced.
+Rig response-header timeouts return504 before headers instead of generic502.
