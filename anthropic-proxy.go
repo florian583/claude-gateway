@@ -7894,12 +7894,12 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					failureReason = "auth_exhausted"
 				}
 				networkDecision := networkFailureDecision{}
-				if !quotaError && !authError {
+				if !quotaError && !authError && empty == nil {
 					networkDecision = s.observeNetworkTransportFailure(runtimeProviderName, failureReason, primeErr)
 				}
 				if networkDecision.SuppressProviderPenalty {
 					failureReason = "local_network"
-				} else if !quotaError && !authError && accountAttempt.profile.Name == "" {
+				} else if !quotaError && !authError && empty == nil && accountAttempt.profile.Name == "" {
 					s.observeProviderInstability(routeHealthKey(runtimeProviderName, candidate), "stream_start")
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
@@ -7909,7 +7909,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 						s.markProviderBlocked(runtimeProviderName, "auth_exhausted", time.Minute)
 						clearClaudeProfileOAuthToken(accountAttempt.profile)
 						s.triggerClaudeOAuthRefresh(accountAttempt.profile)
-					} else if !quotaError && !networkDecision.SuppressProviderPenalty && anthropicFailureClass != "auth_or_client" {
+					} else if !quotaError && empty == nil && !networkDecision.SuppressProviderPenalty && anthropicFailureClass != "auth_or_client" {
 						anthropicFailureClass = "service"
 						if !networkDecision.SuppressProviderPenalty && !anthropicServiceSignalRecorded {
 							anthropicOutageConfirmed = s.observeClaudeServiceFailure()
