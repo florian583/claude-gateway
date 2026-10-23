@@ -446,6 +446,67 @@ func TestRigOpusChainFallsBackToSonnetAfterEmptyEndTurn(t *testing.T) {
 	}
 }
 
+func rigNormalTextSSE(model string) string {
+	return "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"synthetic\",\"model\":\"" + model + "\",\"role\":\"assistant\",\"type\":\"message\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}},\"type\":\"message_start\"}\n\n" +
+		"event: content_block_start\ndata: {\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}\n\n" +
+		"event: content_block_delta\ndata: {\"delta\":{\"text\":\"ok\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\n" +
+		"event: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"type\":\"message_delta\"}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+func rigEmptyEndTurnSSE(model string) string {
+	return "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"synthetic\",\"model\":\"" + model + "\",\"role\":\"assistant\",\"type\":\"message\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}},\"type\":\"message_start\"}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\"}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+func TestRigNormalStreamKeepsBytes(t *testing.T) {
+	response := rigNormalTextSSE("claude-opus-5-5")
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, response)
+	}))
+	defer upstream.Close()
+	s := testRigOpusProxy(t, upstream.URL, "claude-opus-5-5", true)
+
+	request := `{"model":"claude-opus-5-5","stream":true,"messages":[{"role":"user","content":"hello"}]}`
+	out := httptest.NewRecorder()
+	s.rigHandler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || out.Body.String() != response || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%q", out.Code, calls, out.Body.String())
+	}
+}
+
+func TestHybridStreamHandlingStaysUnchanged(t *testing.T) {
+	response := rigEmptyEndTurnSSE("test")
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, response)
+	}))
+	defer upstream.Close()
+	s := testRigOpusProxy(t, upstream.URL, "claude-opus-5-5", true)
+
+	request := `{"model":"test","stream":true,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_test","name":"report","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_test","content":"reported"}]}]}`
+	out := httptest.NewRecorder()
+	s.handler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || out.Body.String() != response || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%q", out.Code, calls, out.Body.String())
+	}
+	if out.Header().Get("X-Proxy-Usage") == "rig" {
+		t.Fatal("normal listener request acquired rig provenance")
+	}
+	samples := s.metrics.read(10)
+	if len(samples) != 1 || samples[0].RecordKind != "completion" || !samples[0].Success ||
+		samples[0].Execution == nil || samples[0].Execution.EmptyCompletion {
+		t.Fatalf("normal listener changed empty-completion metrics: %+v", samples)
+	}
+}
+
 func TestApprovedRigOpusSonnetFallbackIsScoped(t *testing.T) {
 	providers := map[string]providerConfig{
 		"subscription": {Variant: "claude-subscription", Billing: "subscription"},
