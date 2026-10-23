@@ -179,6 +179,7 @@ type requestTrace struct {
 	TaskTier           string
 	TaskShadow         bool
 	TaskSample         string
+	RequestedModel     string
 	CandidateCount     int
 	ChainStarted       time.Time
 	ChainBudget        time.Duration
@@ -2532,7 +2533,7 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		Attempt:        attempt,
 		CandidateCount: trace.CandidateCount,
 		ChainElapsedMS: traceElapsedMS(trace),
-		RequestedModel: candidate.Requested,
+		RequestedModel: firstNonEmpty(trace.RequestedModel, candidate.Requested),
 		Provider:       firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider),
 		ClaudeProfile:  candidate.ClaudeProfile,
 		Upstream:       candidate.Upstream,
@@ -7517,6 +7518,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		TaskTier:       hint.Tier,
 		TaskShadow:     hint.Decided && s.classifierShadow(),
 		TaskSample:     hint.Sample,
+		RequestedModel: selected.Requested,
 		CandidateCount: len(attempts),
 		ChainStarted:   time.Now(),
 		ChainBudget:    fallbackChainHeaderBudget(body),

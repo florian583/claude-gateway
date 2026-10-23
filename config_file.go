@@ -165,6 +165,19 @@ type chainDefinition struct {
 	RequireImages         bool        `json:"requireImages"`
 }
 
+func approvedRigOpusSonnetFallback(requested, alias string, route modelConfig, providers map[string]providerConfig) bool {
+	if (requested != "claude-opus-5" && requested != "claude-opus-5-5") || alias != "rig-exact-"+requested ||
+		route.Upstream != "claude-opus-5-5" || len(route.Fallbacks) != 1 {
+		return false
+	}
+	fallback := route.Fallbacks[0]
+	if fallback.Upstream != "claude-sonnet-5-5" || len(fallback.Fallbacks) != 0 || route.AllowPaidFallback || fallback.AllowPaidFallback || route.Provider == "" || fallback.Provider != route.Provider {
+		return false
+	}
+	provider, ok := providers[route.Provider]
+	return ok && provider.Variant == "claude-subscription" && provider.Billing == "subscription"
+}
+
 func configFilePath() (string, error) {
 	p := os.Getenv("CLAUDE_PROXY_CONFIG")
 	if p == "" {
@@ -834,8 +847,8 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 	}
 	for requested, alias := range f.RigModels {
 		m, ok := cfg.Models[alias]
-		if !validID(requested) || !ok || len(m.Fallbacks) != 0 || m.RequestTimeoutMS <= 0 || m.FirstContentTimeoutMS <= 0 {
-			return config{}, fmt.Errorf("rig model %s requires a single-model route with response deadlines", requested)
+		if !validID(requested) || !ok || (len(m.Fallbacks) != 0 && !approvedRigOpusSonnetFallback(requested, alias, m, cfg.Providers)) || m.RequestTimeoutMS <= 0 || m.FirstContentTimeoutMS <= 0 {
+			return config{}, fmt.Errorf("rig model %s requires a single-model route or the approved Opus-to-Sonnet fallback with response deadlines", requested)
 		}
 	}
 	if f.RigListen != "" {
