@@ -119,6 +119,9 @@ func TestPaidBudgetBodyAccountsCachedInputAndUnknownResponses(t *testing.T) {
 	}{
 		{"json", `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":100,"cache_read_input_tokens":1000,"cache_creation_input_tokens":50,"output_tokens":20}}`, false, 200, 700},
 		{"sse", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":1000,\"cache_creation_input_tokens\":50,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\ndata: {\"type\":\"message_stop\"}\n\n", true, 200, 700},
+		{"reported-cost", `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":20},"provider_metadata":{"gateway":{"cost":"0.0007"}}}`, false, 200, 700},
+		{"sse-reported-cost", "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"provider_metadata\":{\"gateway\":{\"cost\":\"0.0007\"}}}\n\ndata: {\"type\":\"message_stop\"}\n", true, 200, 700},
+		{"start-cost-is-not-final", "data: {\"type\":\"message_start\",\"provider_metadata\":{\"gateway\":{\"cost\":\"0\"}}}\n\ndata: {\"type\":\"message_stop\"}\n", true, 200, 1000000},
 		{"interrupted", "data: {\"type\":\"message_start\"}\n", true, 200, 1000000},
 		{"rejected", `{"error":{"type":"rate_limit_error"}}`, false, 429, 0},
 	} {

@@ -273,9 +273,9 @@ The budget applies to requests through this gateway, not other clients using the
 same provider account.
 
 The gateway reserves the model's full input context plus `max_tokens` before
-sending each request. Concurrent reservations count toward the limit. Complete
-reported usage replaces the reservation; missing cache counts retain the input
-bound. Interrupted requests and incomplete usage retain the full bound. Such
+sending each request. Concurrent reservations count toward the limit. A completed response with gateway cost metadata uses its reported charge.
+Otherwise, complete reported usage replaces the reservation; missing cache
+counts retain the input bound. Interrupted requests and incomplete usage retain the full bound. Such
 uncertain charges survive restarts for at least 24 hours plus the one-hour
 maximum paid-attempt lifetime. Completed requests expire 24 hours after completion.
 Subscription providers do not spend this budget.

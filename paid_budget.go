@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -297,6 +298,7 @@ type paidBudgetBody struct {
 	buffer                []byte
 	dropping              bool
 	usage                 usageTelemetry
+	reportedMicroUSD      *int64
 	cancel                context.CancelFunc
 }
 
@@ -306,6 +308,19 @@ func (b *paidBudgetBody) observe(raw []byte) {
 		return
 	}
 	b.usage.observeAnthropic(value)
+	delta, _ := value["delta"].(map[string]any)
+	terminal := value["type"] == "message_stop" || (value["type"] == "message_delta" && delta["stop_reason"] != nil) || (!b.sse && value["stop_reason"] != nil)
+	if terminal {
+		metadata, _ := value["provider_metadata"].(map[string]any)
+		gateway, _ := metadata["gateway"].(map[string]any)
+		if text, ok := gateway["cost"].(string); ok {
+			cost, err := strconv.ParseFloat(text, 64)
+			if err == nil && !math.IsNaN(cost) && !math.IsInf(cost, 0) && cost >= 0 && cost*1e6 <= float64(b.bound) {
+				micro := int64(math.Ceil(cost * 1e6))
+				b.reportedMicroUSD = &micro
+			}
+		}
+	}
 	if value["type"] == "message_stop" || (!b.sse && value["stop_reason"] != nil) {
 		b.complete = true
 	}
@@ -375,6 +390,9 @@ func (b *paidBudgetBody) Close() error {
 			cost = actual
 			at = time.Now()
 		}
+	}
+	if b.status >= 200 && b.status < 300 && b.complete && b.reportedMicroUSD != nil {
+		cost, at = *b.reportedMicroUSD, time.Now()
 	}
 	if settleErr := settlePaidBudget(b.path, b.id, cost, at); settleErr != nil && err == nil {
 		return settleErr
