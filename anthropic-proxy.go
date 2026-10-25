@@ -81,6 +81,7 @@ type routeChain struct {
 }
 
 type providerConfig struct {
+	Rolling24hBudgetUSD      float64           `json:"-"`
 	Variant                  string            `json:"-"`
 	Billing                  string            `json:"-"`
 	Pricing                  pricingDefinition `json:"-"`
@@ -117,25 +118,26 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
-	RequestTimeoutMS      int            `json:"-"`
-	FirstContentTimeoutMS int            `json:"-"`
-	AccountScope          string         `json:"-"`
-	SoftConcurrency       int            `json:"-"`
-	ModelID               string         `json:"-"`
-	AccountStickySeconds  int            `json:"-"`
-	AccountPool           string         `json:"-"`
-	ConfiguredPool        string         `json:"-"`
-	SupportsTools         bool           `json:"-"`
-	ModelOverrides        map[string]any `json:"-"`
-	AllowPaidFallback     bool           `json:"-"`
-	PaidFallbackOn        []string       `json:"-"`
-	Provider              string         `json:"provider"`
-	Upstream              string         `json:"upstream"`
-	ResponseAlias         string         `json:"responseAlias"`
-	ContextWindow         int            `json:"contextWindow"`
-	Tier                  *int           `json:"tier,omitempty"`
-	SupportsImages        *bool          `json:"supportsImages,omitempty"`
-	SupportsDocuments     *bool          `json:"supportsDocuments,omitempty"`
+	Pricing               pricingDefinition `json:"-"`
+	RequestTimeoutMS      int               `json:"-"`
+	FirstContentTimeoutMS int               `json:"-"`
+	AccountScope          string            `json:"-"`
+	SoftConcurrency       int               `json:"-"`
+	ModelID               string            `json:"-"`
+	AccountStickySeconds  int               `json:"-"`
+	AccountPool           string            `json:"-"`
+	ConfiguredPool        string            `json:"-"`
+	SupportsTools         bool              `json:"-"`
+	ModelOverrides        map[string]any    `json:"-"`
+	AllowPaidFallback     bool              `json:"-"`
+	PaidFallbackOn        []string          `json:"-"`
+	Provider              string            `json:"provider"`
+	Upstream              string            `json:"upstream"`
+	ResponseAlias         string            `json:"responseAlias"`
+	ContextWindow         int               `json:"contextWindow"`
+	Tier                  *int              `json:"tier,omitempty"`
+	SupportsImages        *bool             `json:"supportsImages,omitempty"`
+	SupportsDocuments     *bool             `json:"supportsDocuments,omitempty"`
 	// UnsupportedContentTypes lists message content-block `type` values this
 	// route cannot serve (e.g. non-Anthropic providers reject `document`,
 	// `tool_reference`, server-side tool blocks). Requests containing one are
@@ -1939,6 +1941,9 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 	}
 
 	refreshDir := filepath.Dir(cfg.Metrics.Path)
+	if err := recoverPaidBudgets(cfg, time.Now()); err != nil {
+		return nil, err
+	}
 	sharedTransports := make([]*http.Transport, 0, len(transports))
 	for _, transport := range transports {
 		sharedTransports = append(sharedTransports, transport)
@@ -2424,7 +2429,7 @@ func summarizeMetrics(samples []metricsSample, limit int) metricsResponse {
 func metricPolicySkip(failureReason string) bool {
 	switch failureReason {
 	case "provider_wide_outage", "browser_usage_exhausted", "paid_fallback_suppressed", "provider_limited",
-		"circuit_open", "ollama_reserved_for_deepseek", "chain_budget_reserved", "chain_budget_exhausted":
+		"circuit_open", "ollama_reserved_for_deepseek", "chain_budget_reserved", "chain_budget_exhausted", "paid_budget_exhausted", "paid_budget_unavailable":
 		return true
 	}
 	return strings.HasPrefix(failureReason, "claude_")
@@ -2573,7 +2578,11 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		applyTokenUsage(&sample, stats)
 		sample.TokensPerSecond = observedTokensPerSecond(sample.OutputTokens, streamDuration)
 	}
-	if pricing := s.cfg.Providers[sample.Provider].Pricing; pricing != (pricingDefinition{}) {
+	pricing := s.cfg.Providers[sample.Provider].Pricing
+	if candidate.Pricing != (pricingDefinition{}) {
+		pricing = candidate.Pricing
+	}
+	if pricing != (pricingDefinition{}) {
 		sample.CostUsdEstimate = float64(sample.InputTokens+sample.InputTokenEstimate)*pricing.InputPerMillionTokens/1e6 +
 			float64(sample.OutputTokens)*pricing.OutputPerMillionTokens/1e6 +
 			float64(sample.CacheReadTokens)*pricing.CacheReadPerMillionTokens/1e6
@@ -4259,7 +4268,7 @@ func (s *proxyServer) status(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"pid": os.Getpid(), "sourceHash": buildSourceHash,
 		"configHash": s.cfg.SourceHash, "activeRequests": s.activeRequests.Load(), "draining": s.draining.Load(),
-		"upstreamConcurrency": s.passiveConcurrency.snapshot(), "metricsPersistenceDropped": s.metrics.persistenceDropped()})
+		"upstreamConcurrency": s.passiveConcurrency.snapshot(), "metricsPersistenceDropped": s.metrics.persistenceDropped(), "paidBudgets": s.paidBudgetStatus()})
 }
 
 // quota exposes only quota metadata on the loopback proxy; credentials remain
@@ -7801,6 +7810,12 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			releaseQuota()
 			releaseRoute()
 			releaseCircuitProbe(circuitProbe)
+			var budgetErr *upstreamRateLimitError
+			if errors.As(err, &budgetErr) && (budgetErr.reason == "paid_budget_exhausted" || budgetErr.reason == "paid_budget_unavailable") {
+				s.recordAttempt(trace, selected, candidate, i, attemptStarted, 0, false, budgetErr.reason)
+				lastErr = err
+				continue
+			}
 			if ctx.Err() != nil {
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, 0, false, "client_cancel")
 				return upstreamResponse{}, ctx.Err()
@@ -8174,6 +8189,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 			routeIncompatible := readErr == nil && providerSpecificRequestIncompatibility(resp.StatusCode, errorBody)
 			if routeIncompatible {
+				paidEvidence[evidenceKey] = "route-unavailable"
 				if !countTokens {
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
@@ -8430,6 +8446,10 @@ func (s *proxyServer) doUpstreamWithHeaderBudget(ctx context.Context, r *http.Re
 }
 
 func (s *proxyServer) doUpstreamWithHeaderBudgetLimit(ctx context.Context, r *http.Request, body []byte, selectedModel modelConfig, maximum time.Duration) (*http.Response, error) {
+	return s.withPaidBudget(ctx, r, body, selectedModel, maximum)
+}
+
+func (s *proxyServer) doUpstreamWithHeaderBudgetLimitUnbudgeted(ctx context.Context, r *http.Request, body []byte, selectedModel modelConfig, maximum time.Duration) (*http.Response, error) {
 	providerName := firstNonEmpty(selectedModel.Provider, s.cfg.DefaultProvider)
 	budget := s.candidateResponseHeaderBudget(providerName, selectedModel, body)
 	if selectedModel.FirstContentTimeoutMS > 0 {
@@ -8647,6 +8667,7 @@ func (s *proxyServer) buildAttemptBody(body []byte, payload map[string]any, cand
 	openAIChat := provider.Format == "openai-chat" && !countTokens
 	fold := provider.FoldSystemIntoMessages && !countTokens
 	sanitizeSonnet := providerName == s.cfg.ClaudeUsage.Provider && strings.Contains(strings.ToLower(candidate.Upstream), "claude-sonnet-5")
+	adaptToolHistory := gatewayToolHistoryProvider(provider.Variant)
 	overrides := provider.RequestOverrides
 	if len(candidate.ModelOverrides) > 0 {
 		overrides = make(map[string]any, len(provider.RequestOverrides)+len(candidate.ModelOverrides))
@@ -8660,7 +8681,7 @@ func (s *proxyServer) buildAttemptBody(body []byte, payload map[string]any, cand
 	if countTokens {
 		overrides = nil
 	}
-	if openAIChat || fold || len(overrides) > 0 || sanitizeThinking || sanitizeSonnet {
+	if openAIChat || fold || len(overrides) > 0 || sanitizeThinking || sanitizeSonnet || adaptToolHistory {
 		var fresh map[string]any
 		if err := json.Unmarshal(body, &fresh); err != nil {
 			return body, nil
@@ -8673,6 +8694,11 @@ func (s *proxyServer) buildAttemptBody(body []byte, payload map[string]any, cand
 		}
 		if sanitizeSonnet {
 			delete(fresh, "temperature")
+		}
+		if adaptToolHistory {
+			if err := adaptGatewayToolHistory(fresh); err != nil {
+				return nil, err
+			}
 		}
 		if openAIChat {
 			return anthropicToOpenAIRequest(fresh, overrides)

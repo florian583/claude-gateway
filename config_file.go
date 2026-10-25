@@ -102,6 +102,7 @@ type pricingDefinition struct {
 	CacheReadPerMillionTokens float64 `json:"cacheReadPerMillionTokens,omitempty"`
 }
 type providerDefinition struct {
+	Rolling24hBudgetUSD      float64           `json:"rolling24hBudgetUSD,omitempty"`
 	DisplayName              string            `json:"displayName"`
 	Protocol                 string            `json:"protocol"`
 	Variant                  string            `json:"variant"`
@@ -120,13 +121,14 @@ type providerDefinition struct {
 	CircuitBreaker           *bool             `json:"circuitBreaker,omitempty"`
 }
 type modelDefinition struct {
-	Provider       string `json:"provider"`
-	Upstream       string `json:"upstream"`
-	ResponseAlias  string `json:"responseAlias,omitempty"`
-	AccountPool    string `json:"accountPool"`
-	ContextWindow  int    `json:"contextWindow"`
-	SupportsImages bool   `json:"supportsImages"`
-	SupportsTools  bool   `json:"supportsTools"`
+	Pricing        pricingDefinition `json:"pricing,omitempty"`
+	Provider       string            `json:"provider"`
+	Upstream       string            `json:"upstream"`
+	ResponseAlias  string            `json:"responseAlias,omitempty"`
+	AccountPool    string            `json:"accountPool"`
+	ContextWindow  int               `json:"contextWindow"`
+	SupportsImages bool              `json:"supportsImages"`
+	SupportsTools  bool              `json:"supportsTools"`
 	// SupportsDocuments defaults to capable (nil): only providers known to
 	// reject `document` content blocks set it explicitly false.
 	SupportsDocuments *bool `json:"supportsDocuments,omitempty"`
@@ -507,6 +509,9 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if p.Pricing.InputPerMillionTokens < 0 || p.Pricing.OutputPerMillionTokens < 0 || p.Pricing.CacheReadPerMillionTokens < 0 {
 			return config{}, fmt.Errorf("provider %s pricing must be nonnegative", id)
 		}
+		if err := validatePaidBudget(p); err != nil {
+			return config{}, fmt.Errorf("provider %s: %w", id, err)
+		}
 		for k, v := range p.Headers {
 			if strings.ContainsAny(k+v, "\r\n") || strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, "api-key") || strings.EqualFold(k, "proxy-authorization") || strings.EqualFold(k, "cookie") || strings.EqualFold(k, "host") {
 				return config{}, fmt.Errorf("provider %s: use auth references, not credential/host headers", id)
@@ -515,7 +520,7 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if e := validateOverrides(p.RequestOverrides); e != nil {
 			return config{}, e
 		}
-		q := providerConfig{BaseURL: p.BaseURL, Headers: p.Headers, RequestOverrides: p.RequestOverrides, Variant: p.Variant, Billing: p.Billing, Pricing: p.Pricing, DisplayName: p.DisplayName, Usage: p.Usage, ResponseHeaderTimeoutMS: p.ResponseHeaderTimeoutMS, StreamIdleTimeoutMS: p.StreamIdleTimeoutMS}
+		q := providerConfig{Rolling24hBudgetUSD: p.Rolling24hBudgetUSD, BaseURL: p.BaseURL, Headers: p.Headers, RequestOverrides: p.RequestOverrides, Variant: p.Variant, Billing: p.Billing, Pricing: p.Pricing, DisplayName: p.DisplayName, Usage: p.Usage, ResponseHeaderTimeoutMS: p.ResponseHeaderTimeoutMS, StreamIdleTimeoutMS: p.StreamIdleTimeoutMS}
 		for _, contentType := range p.DropResponseContentTypes {
 			if contentType != "thinking" && contentType != "redacted_thinking" {
 				return config{}, errors.New("dropResponseContentTypes supports only thinking and redacted_thinking")
@@ -715,8 +720,16 @@ func decodeFileConfig(path string, body []byte) (config, error) {
 		if m.Provider == cfg.OllamaUsage.Provider && !containsString(cfg.OllamaUsage.EligibleUpstreams, m.Upstream) {
 			cfg.OllamaUsage.EligibleUpstreams = append(cfg.OllamaUsage.EligibleUpstreams, m.Upstream)
 		}
+		if m.Pricing != (pricingDefinition{}) {
+			check := p
+			check.Pricing = m.Pricing
+			check.Rolling24hBudgetUSD = 1
+			if err := validatePaidBudget(check); err != nil {
+				return config{}, fmt.Errorf("model %s: %w", id, err)
+			}
+		}
 		images := m.SupportsImages
-		normalizedModels[id] = modelConfig{ModelID: id, Provider: m.Provider, Upstream: m.Upstream, ResponseAlias: m.ResponseAlias, AccountPool: m.AccountPool, AccountStickySeconds: f.AccountPools[m.AccountPool].StickySeconds, ContextWindow: m.ContextWindow, SupportsImages: &images, SupportsDocuments: m.SupportsDocuments, UnsupportedContentTypes: m.UnsupportedContentTypes, SupportsTools: m.SupportsTools, TaskClass: m.TaskClass, ModelOverrides: m.RequestOverrides}
+		normalizedModels[id] = modelConfig{Pricing: m.Pricing, ModelID: id, Provider: m.Provider, Upstream: m.Upstream, ResponseAlias: m.ResponseAlias, AccountPool: m.AccountPool, AccountStickySeconds: f.AccountPools[m.AccountPool].StickySeconds, ContextWindow: m.ContextWindow, SupportsImages: &images, SupportsDocuments: m.SupportsDocuments, UnsupportedContentTypes: m.UnsupportedContentTypes, SupportsTools: m.SupportsTools, TaskClass: m.TaskClass, ModelOverrides: m.RequestOverrides}
 		f.Models[id] = m
 	}
 	for _, id := range sortedKeys(f.ModelPools) {
