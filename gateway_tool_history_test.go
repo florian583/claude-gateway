@@ -69,8 +69,8 @@ func TestPaidFallbackAfterTokenPassQuotaAndBudget(t *testing.T) {
 	var primaryCalls, paidCalls atomic.Int64
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		primaryCalls.Add(1)
-		w.WriteHeader(429)
-		w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"quota exhausted"}}`))
+		w.WriteHeader(403)
+		w.Write([]byte(`{"error":{"type":"no_providers_available","message":"Your Vercel Token Pass credits are used up until your next billing cycle.","param":{"name":"RestrictedModelsError"}}}`))
 	}))
 	defer primary.Close()
 	paid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +79,7 @@ func TestPaidFallbackAfterTokenPassQuotaAndBudget(t *testing.T) {
 		w.Write([]byte(`{"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}`))
 	}))
 	defer paid.Close()
-	cfg := config{Metrics: metricsConfig{Path: t.TempDir() + "/metrics.jsonl"}, Definition: &fileConfig{}, Providers: map[string]providerConfig{"pass": {BaseURL: primary.URL, Billing: "subscription"}, "paid": {BaseURL: paid.URL, Billing: "metered", Rolling24hBudgetUSD: 25, Pricing: pricingDefinition{InputPerMillionTokens: 2, OutputPerMillionTokens: 10}}}}
+	cfg := config{Metrics: metricsConfig{Path: t.TempDir() + "/metrics.jsonl"}, Definition: &fileConfig{}, Providers: map[string]providerConfig{"pass": {BaseURL: primary.URL, Billing: "subscription", Variant: "vercel-gateway"}, "paid": {BaseURL: paid.URL, Billing: "metered", Rolling24hBudgetUSD: 25, Pricing: pricingDefinition{InputPerMillionTokens: 2, OutputPerMillionTokens: 10}}}}
 	s, err := newProxyServer(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -110,5 +110,17 @@ func TestPaidFallbackAfterTokenPassQuotaAndBudget(t *testing.T) {
 	}
 	if cost != 30 {
 		t.Fatalf("cost after decoded response %d", cost)
+	}
+}
+
+func TestTokenPassRestrictionDoesNotInventQuotaEvidence(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"type":"no_providers_available","message":"This model is not included in Token Pass.","param":{"name":"RestrictedModelsError"}}}`,
+		`{"error":{"type":"authentication_error","message":"Invalid credentials"}}`,
+		`{"error":{"type":"invalid_request_error","message":"Unsupported field credit"}}`,
+	} {
+		if tokenPassCreditsExhausted([]byte(body)) {
+			t.Fatal("non-quota refusal authorized spending")
+		}
 	}
 }

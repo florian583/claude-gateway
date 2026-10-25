@@ -8210,6 +8210,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				if resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests {
 					failureReason = providerFailureReason(resp.StatusCode, resp.Header, errorBody)
 				}
+				if !countTokens && s.cfg.Providers[providerName].Variant == "vercel-gateway" && tokenPassCreditsExhausted(errorBody) {
+					paidEvidence[evidenceKey] = "quota-exhausted"
+				}
 				if (isQuotaReason(failureReason) || failureReason == temporaryRateLimitReason) && resp.StatusCode != http.StatusTooManyRequests {
 					blockKey := s.providerFailureBlockKey(providerName, runtimeProviderName, candidate, resp.Header, failureReason)
 					s.markProviderBlocked(blockKey, failureReason, providerCooldownForReason(failureReason, resp.Header, errorBody))
@@ -11127,4 +11130,23 @@ func unwrapOpenAIEnvelope(payload map[string]any) map[string]any {
 		return data
 	}
 	return payload
+}
+
+// Token Pass exhaustion is a billing refusal even though the gateway uses 403.
+// Other restricted-model and authentication refusals do not authorize paid use.
+func tokenPassCreditsExhausted(body []byte) bool {
+	var envelope struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Param   struct {
+				Name string `json:"name"`
+			} `json:"param"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	return envelope.Error.Type == "no_providers_available" && envelope.Error.Param.Name == "RestrictedModelsError" &&
+		strings.HasPrefix(strings.ToLower(envelope.Error.Message), "your vercel token pass credits are used up")
 }
