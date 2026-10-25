@@ -307,3 +307,243 @@ func TestRigEmptyEndTurnRetriesSameModelBeforeOutput(t *testing.T) {
 		})
 	}
 }
+
+func TestRigEmptyEndTurnAfterToolResultPassesThrough(t *testing.T) {
+	const emptyResponse = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, emptyResponse)
+	}))
+	defer upstream.Close()
+
+	s := testRigOpusProxy(t, upstream.URL, "claude-opus-5-5", true)
+
+	request := `{"model":"claude-opus-5-5","stream":true,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_test","name":"report","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_test","content":"reported"}]}]}`
+	out := httptest.NewRecorder()
+	s.rigHandler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || out.Body.String() != emptyResponse {
+		t.Fatalf("status=%d calls=%d body=%q", out.Code, calls, out.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d, want one", calls)
+	}
+	if got := out.Header().Get("X-Proxy-Upstream-Model"); got != "claude-opus-5-5" {
+		t.Fatalf("served-model header=%q", got)
+	}
+	samples := s.metrics.read(10)
+	if len(samples) != 1 {
+		t.Fatalf("metrics samples=%d, want one completion", len(samples))
+	}
+	sample := samples[0]
+	if sample.RecordKind != "completion" || !sample.Success || sample.FailureReason != "" ||
+		sample.RequestedModel != "claude-opus-5-5" || sample.Upstream != "claude-opus-5-5" ||
+		sample.Execution == nil || !sample.Execution.EmptyCompletion || sample.Execution.PreludeStopReason != "end_turn" {
+		t.Fatalf("unexpected empty-completion metric: %+v", sample)
+	}
+}
+
+func testRigOpusProxy(t *testing.T, endpoint, requested string, withSonnetFallback bool) *proxyServer {
+	t.Helper()
+	f := testClaudeConfig(t)
+	opus := f.Models["model"]
+	opus.Upstream = "claude-opus-5-5"
+	f.Models["opus"] = opus
+	steps := []chainStep{{Model: "opus"}}
+	if withSonnetFallback {
+		sonnet := f.Models["model"]
+		sonnet.Upstream = "claude-sonnet-5-5"
+		f.Models["sonnet"] = sonnet
+		steps = append(steps, chainStep{Model: "sonnet"})
+	}
+	chainName := "rig-exact-" + requested
+	f.Chains[chainName] = chainDefinition{
+		Steps:                 steps,
+		RequestTimeoutMS:      1000,
+		FirstContentTimeoutMS: 500,
+	}
+	f.Aliases[chainName] = chainName
+	f.RigModels = map[string]string{requested: chainName}
+	f.RigListen = "127.0.0.1:48105"
+	cfg := compileFixture(t, f)
+	provider := cfg.Providers["endpoint"]
+	provider.BaseURL = endpoint
+	cfg.Providers["endpoint"] = provider
+	seedTestCredentials(t, cfg)
+	return testProxy(t, cfg)
+}
+
+func TestRigOpusChainFallsBackToSonnetAfterEmptyEndTurn(t *testing.T) {
+	const emptyResponse = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	const normalResponse = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5-5\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
+		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	var models []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		models = append(models, request.Model)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if request.Model == "claude-opus-5-5" {
+			_, _ = io.WriteString(w, emptyResponse)
+			return
+		}
+		_, _ = io.WriteString(w, normalResponse)
+	}))
+	defer upstream.Close()
+	s := testRigOpusProxy(t, upstream.URL, "claude-opus-5", true)
+
+	request := `{"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"hello"}]}`
+	out := httptest.NewRecorder()
+	s.rigHandler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || !strings.Contains(out.Body.String(), `"text":"ok"`) {
+		t.Fatalf("status=%d body=%q", out.Code, out.Body.String())
+	}
+	if len(models) != 3 || models[0] != "claude-opus-5-5" || models[1] != "claude-opus-5-5" || models[2] != "claude-sonnet-5-5" {
+		t.Fatalf("upstream models=%v, want Opus retry then Sonnet", models)
+	}
+	if got := out.Header().Get("X-Proxy-Upstream-Model"); got != "claude-sonnet-5-5" {
+		t.Fatalf("served-model header=%q", got)
+	}
+
+	samples := s.metrics.read(10)
+	var completion *metricsSample
+	var emptyFailures int
+	requestID := ""
+	for index := range samples {
+		sample := &samples[index]
+		if requestID == "" {
+			requestID = sample.RequestID
+		}
+		if sample.RequestID != requestID {
+			t.Fatalf("metrics split request across IDs: %q and %q", requestID, sample.RequestID)
+		}
+		if sample.RecordKind == "completion" {
+			completion = sample
+		}
+		if sample.RecordKind == "attempt" && sample.FailureReason == "empty_response" {
+			if sample.RequestedModel != "claude-opus-5" || sample.Upstream != "claude-opus-5-5" || !sample.FallbackTrigger {
+				t.Fatalf("unexpected Opus fallback-attempt metric: %+v", sample)
+			}
+			emptyFailures++
+		}
+	}
+	if completion == nil || !completion.Success || !completion.IsFallback ||
+		completion.RequestedModel != "claude-opus-5" || completion.Upstream != "claude-sonnet-5-5" || emptyFailures != 2 {
+		t.Fatalf("completion=%+v empty failures=%d samples=%+v", completion, emptyFailures, samples)
+	}
+}
+
+func rigNormalTextSSE(model string) string {
+	return "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"synthetic\",\"model\":\"" + model + "\",\"role\":\"assistant\",\"type\":\"message\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}},\"type\":\"message_start\"}\n\n" +
+		"event: content_block_start\ndata: {\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}\n\n" +
+		"event: content_block_delta\ndata: {\"delta\":{\"text\":\"ok\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\n" +
+		"event: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"type\":\"message_delta\"}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+func rigEmptyEndTurnSSE(model string) string {
+	return "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"synthetic\",\"model\":\"" + model + "\",\"role\":\"assistant\",\"type\":\"message\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}},\"type\":\"message_start\"}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\"}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+func TestRigNormalStreamKeepsBytes(t *testing.T) {
+	response := rigNormalTextSSE("claude-opus-5-5")
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, response)
+	}))
+	defer upstream.Close()
+	s := testRigOpusProxy(t, upstream.URL, "claude-opus-5-5", true)
+
+	request := `{"model":"claude-opus-5-5","stream":true,"messages":[{"role":"user","content":"hello"}]}`
+	out := httptest.NewRecorder()
+	s.rigHandler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || out.Body.String() != response || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%q", out.Code, calls, out.Body.String())
+	}
+}
+
+func TestHybridStreamHandlingStaysUnchanged(t *testing.T) {
+	response := rigEmptyEndTurnSSE("test")
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, response)
+	}))
+	defer upstream.Close()
+	s := testRigOpusProxy(t, upstream.URL, "claude-opus-5-5", true)
+
+	request := `{"model":"test","stream":true,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_test","name":"report","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_test","content":"reported"}]}]}`
+	out := httptest.NewRecorder()
+	s.handler().ServeHTTP(out, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(request)))
+	if out.Code != http.StatusOK || out.Body.String() != response || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%q", out.Code, calls, out.Body.String())
+	}
+	if out.Header().Get("X-Proxy-Usage") == "rig" {
+		t.Fatal("normal listener request acquired rig provenance")
+	}
+	samples := s.metrics.read(10)
+	if len(samples) != 1 || samples[0].RecordKind != "completion" || !samples[0].Success ||
+		samples[0].Execution == nil || samples[0].Execution.EmptyCompletion {
+		t.Fatalf("normal listener changed empty-completion metrics: %+v", samples)
+	}
+}
+
+func TestApprovedRigOpusSonnetFallbackIsScoped(t *testing.T) {
+	providers := map[string]providerConfig{
+		"subscription": {Variant: "claude-subscription", Billing: "subscription"},
+		"other":        {Variant: "other", Billing: "subscription"},
+	}
+	route := modelConfig{
+		Provider: "subscription",
+		Upstream: "claude-opus-5-5",
+		Fallbacks: []modelConfig{{
+			Provider: "subscription",
+			Upstream: "claude-sonnet-5-5",
+		}},
+	}
+	for _, requested := range []string{"claude-opus-5", "claude-opus-5-5"} {
+		if !approvedRigOpusSonnetFallback(requested, "rig-exact-"+requested, route, providers) {
+			t.Fatalf("rejected approved route for %s", requested)
+		}
+	}
+	cases := []struct {
+		name      string
+		requested string
+		alias     string
+		route     modelConfig
+	}{
+		{"other requested model", "test-model", "rig-exact-test-model", route},
+		{"other chain alias", "claude-opus-5", "other-opus-chain", route},
+		{"other primary model", "claude-opus-5", "rig-exact-claude-opus-5", modelConfig{Provider: "subscription", Upstream: "test-model", Fallbacks: route.Fallbacks}},
+		{"other fallback model", "claude-opus-5", "rig-exact-claude-opus-5", modelConfig{Provider: "subscription", Upstream: route.Upstream, Fallbacks: []modelConfig{{Provider: "subscription", Upstream: "test-model"}}}},
+		{"other provider", "claude-opus-5", "rig-exact-claude-opus-5", modelConfig{Provider: "other", Upstream: route.Upstream, Fallbacks: []modelConfig{{Provider: "other", Upstream: "claude-sonnet-5-5"}}}},
+		{"paid fallback enabled", "claude-opus-5", "rig-exact-claude-opus-5", modelConfig{Provider: "subscription", Upstream: route.Upstream, AllowPaidFallback: true, Fallbacks: route.Fallbacks}},
+		{"multiple fallback models", "claude-opus-5", "rig-exact-claude-opus-5", modelConfig{Provider: "subscription", Upstream: route.Upstream, Fallbacks: append(route.Fallbacks, modelConfig{Provider: "subscription", Upstream: "test-alternate"})}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if approvedRigOpusSonnetFallback(tc.requested, tc.alias, tc.route, providers) {
+				t.Fatalf("approved unsupported route: %s", tc.name)
+			}
+		})
+	}
+}

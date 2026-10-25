@@ -81,6 +81,7 @@ type routeChain struct {
 }
 
 type providerConfig struct {
+	Rolling24hBudgetUSD      float64           `json:"-"`
 	Variant                  string            `json:"-"`
 	Billing                  string            `json:"-"`
 	Pricing                  pricingDefinition `json:"-"`
@@ -117,25 +118,26 @@ type providerConfig struct {
 }
 
 type modelConfig struct {
-	RequestTimeoutMS      int            `json:"-"`
-	FirstContentTimeoutMS int            `json:"-"`
-	AccountScope          string         `json:"-"`
-	SoftConcurrency       int            `json:"-"`
-	ModelID               string         `json:"-"`
-	AccountStickySeconds  int            `json:"-"`
-	AccountPool           string         `json:"-"`
-	ConfiguredPool        string         `json:"-"`
-	SupportsTools         bool           `json:"-"`
-	ModelOverrides        map[string]any `json:"-"`
-	AllowPaidFallback     bool           `json:"-"`
-	PaidFallbackOn        []string       `json:"-"`
-	Provider              string         `json:"provider"`
-	Upstream              string         `json:"upstream"`
-	ResponseAlias         string         `json:"responseAlias"`
-	ContextWindow         int            `json:"contextWindow"`
-	Tier                  *int           `json:"tier,omitempty"`
-	SupportsImages        *bool          `json:"supportsImages,omitempty"`
-	SupportsDocuments     *bool          `json:"supportsDocuments,omitempty"`
+	Pricing               pricingDefinition `json:"-"`
+	RequestTimeoutMS      int               `json:"-"`
+	FirstContentTimeoutMS int               `json:"-"`
+	AccountScope          string            `json:"-"`
+	SoftConcurrency       int               `json:"-"`
+	ModelID               string            `json:"-"`
+	AccountStickySeconds  int               `json:"-"`
+	AccountPool           string            `json:"-"`
+	ConfiguredPool        string            `json:"-"`
+	SupportsTools         bool              `json:"-"`
+	ModelOverrides        map[string]any    `json:"-"`
+	AllowPaidFallback     bool              `json:"-"`
+	PaidFallbackOn        []string          `json:"-"`
+	Provider              string            `json:"provider"`
+	Upstream              string            `json:"upstream"`
+	ResponseAlias         string            `json:"responseAlias"`
+	ContextWindow         int               `json:"contextWindow"`
+	Tier                  *int              `json:"tier,omitempty"`
+	SupportsImages        *bool             `json:"supportsImages,omitempty"`
+	SupportsDocuments     *bool             `json:"supportsDocuments,omitempty"`
 	// UnsupportedContentTypes lists message content-block `type` values this
 	// route cannot serve (e.g. non-Anthropic providers reject `document`,
 	// `tool_reference`, server-side tool blocks). Requests containing one are
@@ -152,14 +154,15 @@ type modelConfig struct {
 }
 
 type upstreamResponse struct {
-	resp          *http.Response
-	providerName  string
-	model         modelConfig
-	attempt       int
-	started       time.Time
-	trace         requestTrace
-	unstable      bool
-	failureReason string
+	resp            *http.Response
+	providerName    string
+	model           modelConfig
+	attempt         int
+	started         time.Time
+	trace           requestTrace
+	unstable        bool
+	failureReason   string
+	emptyCompletion bool
 }
 
 type requestTrace struct {
@@ -178,6 +181,7 @@ type requestTrace struct {
 	TaskTier           string
 	TaskShadow         bool
 	TaskSample         string
+	RequestedModel     string
 	CandidateCount     int
 	ChainStarted       time.Time
 	ChainBudget        time.Duration
@@ -268,13 +272,21 @@ func primeSSEBodyWithPrelude(body io.ReadCloser, timeout, preludeIdle time.Durat
 
 func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string), usefulOnly ...bool) (io.ReadCloser, error) {
 	strict := len(usefulOnly) > 0 && usefulOnly[0]
+	return primeSSEBodyObservedWithPolicy(body, timeout, preludeIdle, firstEvent, onFrame, strict, false, nil)
+}
+
+func primeSSEBodyObservedWithPolicy(body io.ReadCloser, timeout, preludeIdle time.Duration, firstEvent func(), onFrame func(string), strict, allowEmptyEndTurn bool, onEmptyCompletion func(*emptyPreludeError)) (io.ReadCloser, error) {
 	observed := false
 	sawStopReason := false
+	var terminalEmpty *emptyPreludeError
 	reader := bufio.NewReader(body)
 	var prefix bytes.Buffer
 	hasData := false
 	var event string
 	var dataLines []string
+	var frameLines []string
+	sawMessageStart := false
+	sawTerminal := false
 
 	var timedOut atomic.Bool
 	var timer *time.Timer
@@ -298,6 +310,9 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 		if len(line) > 0 {
 			_, _ = prefix.WriteString(line)
 			trimmed := strings.TrimRight(line, "\r\n")
+			if allowEmptyEndTurn && trimmed != "" {
+				frameLines = append(frameLines, line)
+			}
 			switch {
 			case strings.HasPrefix(trimmed, "event:"):
 				event = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
@@ -315,6 +330,20 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 				if err := validateInitialSSE(event, data); err != nil {
 					return nil, err
 				}
+				frameKind := primeFrameKind(data)
+				if allowEmptyEndTurn {
+					validatedKind, validationErr := validateAnthropicSSEEvent(frameLines, sawMessageStart, sawTerminal)
+					if validationErr != nil {
+						return nil, validationErr
+					}
+					frameKind = validatedKind
+					switch frameKind {
+					case "message_start":
+						sawMessageStart = true
+					case "message_stop", "error":
+						sawTerminal = true
+					}
+				}
 				if !observed {
 					observed = true
 					if firstEvent != nil {
@@ -322,6 +351,26 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 					}
 				}
 				metadata := false
+				if terminalEmpty != nil {
+					switch frameKind {
+					case "ping":
+						metadata = true
+					case "message_stop":
+						if onEmptyCompletion != nil {
+							onEmptyCompletion(terminalEmpty)
+						}
+						return &readerReadCloser{
+							Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader),
+							Closer: body,
+						}, nil
+					default:
+						return nil, terminalEmpty
+					}
+					if metadata {
+						hasData, event, dataLines, frameLines = false, "", nil, nil
+						continue
+					}
+				}
 				if preludeIdle > 0 || strict {
 					var preludeErr error
 					if strict {
@@ -330,12 +379,19 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 						metadata, preludeErr = classifyPrelude(data, &sawStopReason)
 					}
 					if preludeErr != nil {
-						return nil, preludeErr
+						var empty *emptyPreludeError
+						if allowEmptyEndTurn && errors.As(preludeErr, &empty) && empty.StopReason == "end_turn" {
+							terminalEmpty = empty
+							metadata = true
+						} else {
+							return nil, preludeErr
+						}
 					}
 				}
 				if metadata {
 					if strict {
 						hasData, event, dataLines = false, "", nil
+						frameLines = nil
 						continue
 					}
 					stopTimer()
@@ -348,18 +404,23 @@ func primeSSEBodyObserved(body io.ReadCloser, timeout, preludeIdle time.Duration
 						_ = body.Close()
 						close(timerDone)
 					})
-					hasData, event, dataLines = false, "", nil
+					hasData, event, dataLines, frameLines = false, "", nil, nil
 					continue
 				}
 				return &readerReadCloser{
 					Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader),
 					Closer: body,
 				}, nil
+			case trimmed == "":
+				frameLines = nil
 			}
 		}
 		if err != nil {
 			if timedOut.Load() {
 				return nil, fmt.Errorf("initial SSE event timed out after %s", timeout)
+			}
+			if terminalEmpty != nil {
+				return nil, terminalEmpty
 			}
 			return nil, fmt.Errorf("initial SSE event unavailable: %w", err)
 		}
@@ -1880,6 +1941,9 @@ func newProxyServer(cfg config) (*proxyServer, error) {
 	}
 
 	refreshDir := filepath.Dir(cfg.Metrics.Path)
+	if err := recoverPaidBudgets(cfg, time.Now()); err != nil {
+		return nil, err
+	}
 	sharedTransports := make([]*http.Transport, 0, len(transports))
 	for _, transport := range transports {
 		sharedTransports = append(sharedTransports, transport)
@@ -2365,7 +2429,7 @@ func summarizeMetrics(samples []metricsSample, limit int) metricsResponse {
 func metricPolicySkip(failureReason string) bool {
 	switch failureReason {
 	case "provider_wide_outage", "browser_usage_exhausted", "paid_fallback_suppressed", "provider_limited",
-		"circuit_open", "ollama_reserved_for_deepseek", "chain_budget_reserved", "chain_budget_exhausted":
+		"circuit_open", "ollama_reserved_for_deepseek", "chain_budget_reserved", "chain_budget_exhausted", "paid_budget_exhausted", "paid_budget_unavailable":
 		return true
 	}
 	return strings.HasPrefix(failureReason, "claude_")
@@ -2474,7 +2538,7 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		Attempt:        attempt,
 		CandidateCount: trace.CandidateCount,
 		ChainElapsedMS: traceElapsedMS(trace),
-		RequestedModel: candidate.Requested,
+		RequestedModel: firstNonEmpty(trace.RequestedModel, candidate.Requested),
 		Provider:       firstNonEmpty(candidate.Provider, s.cfg.DefaultProvider),
 		ClaudeProfile:  candidate.ClaudeProfile,
 		Upstream:       candidate.Upstream,
@@ -2514,7 +2578,11 @@ func (s *proxyServer) recordCompletionKind(trace requestTrace, candidate modelCo
 		applyTokenUsage(&sample, stats)
 		sample.TokensPerSecond = observedTokensPerSecond(sample.OutputTokens, streamDuration)
 	}
-	if pricing := s.cfg.Providers[sample.Provider].Pricing; pricing != (pricingDefinition{}) {
+	pricing := s.cfg.Providers[sample.Provider].Pricing
+	if candidate.Pricing != (pricingDefinition{}) {
+		pricing = candidate.Pricing
+	}
+	if pricing != (pricingDefinition{}) {
 		sample.CostUsdEstimate = float64(sample.InputTokens+sample.InputTokenEstimate)*pricing.InputPerMillionTokens/1e6 +
 			float64(sample.OutputTokens)*pricing.OutputPerMillionTokens/1e6 +
 			float64(sample.CacheReadTokens)*pricing.CacheReadPerMillionTokens/1e6
@@ -4200,7 +4268,7 @@ func (s *proxyServer) status(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"pid": os.Getpid(), "sourceHash": buildSourceHash,
 		"configHash": s.cfg.SourceHash, "activeRequests": s.activeRequests.Load(), "draining": s.draining.Load(),
-		"upstreamConcurrency": s.passiveConcurrency.snapshot(), "metricsPersistenceDropped": s.metrics.persistenceDropped()})
+		"upstreamConcurrency": s.passiveConcurrency.snapshot(), "metricsPersistenceDropped": s.metrics.persistenceDropped(), "paidBudgets": s.paidBudgetStatus()})
 }
 
 // quota exposes only quota metadata on the loopback proxy; credentials remain
@@ -6790,6 +6858,11 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	stats := &streamStats{}
+	if upstream.emptyCompletion && upstream.trace.Execution != nil {
+		stats.Events.Store(int64(upstream.trace.Execution.PrimedFrames))
+		stats.OutputTokens.Store(int64(upstream.trace.Execution.PreludeOutputTokens))
+		stats.noteEvent()
+	}
 	var responseBody io.ReadCloser
 	providerCfg := s.cfg.Providers[providerName]
 	openAIChat := providerCfg.Format == "openai-chat" && resp.StatusCode == http.StatusOK
@@ -6802,14 +6875,18 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 		if idleTimeout := streamIdleTimeout(providerCfg); idleTimeout > 0 {
 			source = &idleTimeoutReadCloser{source: resp.Body, timeout: idleTimeout}
 		}
-		if openAIChat {
-			source = newOpenAIStreamReadCloserWithStats(source, responseAlias, stats)
-		}
 		inputTokenHint := 0
 		if providerCfg.Variant == "vercel-gateway" || s.cfg.Definition == nil && strings.HasPrefix(providerName, "vercel") {
 			inputTokenHint = estimateInputTokens(body)
 		}
-		responseBody = newSSEFilterReadCloser(source, dropTypes, inputTokenHint, responseAlias, s.streamEventStallTimeout(), stats)
+		if upstream.emptyCompletion {
+			responseBody = source
+		} else {
+			if openAIChat {
+				source = newOpenAIStreamReadCloserWithStats(source, responseAlias, stats)
+			}
+			responseBody = newSSEFilterReadCloser(source, dropTypes, inputTokenHint, responseAlias, s.streamEventStallTimeout(), stats)
+		}
 	case strings.Contains(contentType, "application/json"):
 		var source io.ReadCloser = resp.Body
 		if openAIChat {
@@ -7450,6 +7527,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		TaskTier:       hint.Tier,
 		TaskShadow:     hint.Decided && s.classifierShadow(),
 		TaskSample:     hint.Sample,
+		RequestedModel: selected.Requested,
 		CandidateCount: len(attempts),
 		ChainStarted:   time.Now(),
 		ChainBudget:    fallbackChainHeaderBudget(body),
@@ -7476,6 +7554,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	skipProfilesForUpstream := ""
 	emptyRigRetries := 0
 	rigRequest, _ := r.Context().Value(rigEndpointContextKey{}).(bool)
+	allowEmptyEndTurn := rigRequest && lastUserTurnHasToolResult(payload)
 	for i, accountAttempt := range attempts {
 		if accountAttempt.profile.Name != "" && skipProfilesForUpstream != "" && accountAttempt.model.Upstream == skipProfilesForUpstream {
 			continue
@@ -7731,6 +7810,12 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			releaseQuota()
 			releaseRoute()
 			releaseCircuitProbe(circuitProbe)
+			var budgetErr *upstreamRateLimitError
+			if errors.As(err, &budgetErr) && (budgetErr.reason == "paid_budget_exhausted" || budgetErr.reason == "paid_budget_unavailable") {
+				s.recordAttempt(trace, selected, candidate, i, attemptStarted, 0, false, budgetErr.reason)
+				lastErr = err
+				continue
+			}
 			if ctx.Err() != nil {
 				s.recordAttempt(trace, selected, candidate, i, attemptStarted, 0, false, "client_cancel")
 				return upstreamResponse{}, ctx.Err()
@@ -7820,6 +7905,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			releaseCircuitProbe(circuitProbe)
 			releaseAttemptAccount()
 		}
+		emptyCompletion := false
 		if !countTokens && resp.Body != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
 			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			attemptBudget := s.candidateResponseHeaderBudget(providerName, candidate, attemptBody)
@@ -7843,13 +7929,18 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 					preludeIdle = streamIdleTimeout(s.cfg.Providers[providerName])
 				}
 				var firstEventAt time.Time
-				primedBody, primeErr = primeSSEBodyObserved(resp.Body, primeBudget, preludeIdle, func() {
+				primedBody, primeErr = primeSSEBodyObservedWithPolicy(resp.Body, primeBudget, preludeIdle, func() {
 					firstEventAt = time.Now()
 					trace.FirstEventMS = time.Since(attemptStarted).Milliseconds()
 				}, func(kind string) {
 					execution.PrimedFrames++
 					execution.PrimeLastFrame = kind
-				}, candidate.FirstContentTimeoutMS > 0)
+				}, candidate.FirstContentTimeoutMS > 0, allowEmptyEndTurn, func(empty *emptyPreludeError) {
+					emptyCompletion = true
+					execution.EmptyCompletion = true
+					execution.PreludeStopReason = empty.StopReason
+					execution.PreludeOutputTokens = empty.OutputTokens
+				})
 				if preludeIdle > 0 && candidate.FirstContentTimeoutMS == 0 && !firstEventAt.IsZero() {
 					// Thinking after a valid initial event belongs to the stream
 					// idle allowance, not another provider's header reserve.
@@ -8098,6 +8189,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 			routeIncompatible := readErr == nil && providerSpecificRequestIncompatibility(resp.StatusCode, errorBody)
 			if routeIncompatible {
+				paidEvidence[evidenceKey] = "route-unavailable"
 				if !countTokens {
 					s.tripCircuit(runtimeProviderName, candidate)
 				}
@@ -8117,6 +8209,9 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				failureReason := classifyFallbackBody(errorBody)
 				if resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests {
 					failureReason = providerFailureReason(resp.StatusCode, resp.Header, errorBody)
+				}
+				if !countTokens && s.cfg.Providers[providerName].Variant == "vercel-gateway" && tokenPassCreditsExhausted(errorBody) {
+					paidEvidence[evidenceKey] = "quota-exhausted"
 				}
 				if (isQuotaReason(failureReason) || failureReason == temporaryRateLimitReason) && resp.StatusCode != http.StatusTooManyRequests {
 					blockKey := s.providerFailureBlockKey(providerName, runtimeProviderName, candidate, resp.Header, failureReason)
@@ -8201,7 +8296,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 				log.Printf("Claude account failover request=%s listener=%q from=%q to=%q reason=account_local_exhaustion", trace.ID, requestListenerPort(r), accountAttempt.fromProfile, profile.Name)
 			}
 		}
-		return upstreamResponse{resp: resp, providerName: providerName, model: candidate, attempt: i, started: attemptStarted, trace: trace, unstable: unstable, failureReason: responseFailureReason}, nil
+		return upstreamResponse{resp: resp, providerName: providerName, model: candidate, attempt: i, started: attemptStarted, trace: trace, unstable: unstable, failureReason: responseFailureReason, emptyCompletion: emptyCompletion}, nil
 	}
 	if lastErr != nil {
 		return upstreamResponse{}, lastErr
@@ -8354,6 +8449,10 @@ func (s *proxyServer) doUpstreamWithHeaderBudget(ctx context.Context, r *http.Re
 }
 
 func (s *proxyServer) doUpstreamWithHeaderBudgetLimit(ctx context.Context, r *http.Request, body []byte, selectedModel modelConfig, maximum time.Duration) (*http.Response, error) {
+	return s.withPaidBudget(ctx, r, body, selectedModel, maximum)
+}
+
+func (s *proxyServer) doUpstreamWithHeaderBudgetLimitUnbudgeted(ctx context.Context, r *http.Request, body []byte, selectedModel modelConfig, maximum time.Duration) (*http.Response, error) {
 	providerName := firstNonEmpty(selectedModel.Provider, s.cfg.DefaultProvider)
 	budget := s.candidateResponseHeaderBudget(providerName, selectedModel, body)
 	if selectedModel.FirstContentTimeoutMS > 0 {
@@ -8571,6 +8670,7 @@ func (s *proxyServer) buildAttemptBody(body []byte, payload map[string]any, cand
 	openAIChat := provider.Format == "openai-chat" && !countTokens
 	fold := provider.FoldSystemIntoMessages && !countTokens
 	sanitizeSonnet := providerName == s.cfg.ClaudeUsage.Provider && strings.Contains(strings.ToLower(candidate.Upstream), "claude-sonnet-5")
+	adaptToolHistory := gatewayToolHistoryProvider(provider.Variant)
 	overrides := provider.RequestOverrides
 	if len(candidate.ModelOverrides) > 0 {
 		overrides = make(map[string]any, len(provider.RequestOverrides)+len(candidate.ModelOverrides))
@@ -8584,7 +8684,7 @@ func (s *proxyServer) buildAttemptBody(body []byte, payload map[string]any, cand
 	if countTokens {
 		overrides = nil
 	}
-	if openAIChat || fold || len(overrides) > 0 || sanitizeThinking || sanitizeSonnet {
+	if openAIChat || fold || len(overrides) > 0 || sanitizeThinking || sanitizeSonnet || adaptToolHistory {
 		var fresh map[string]any
 		if err := json.Unmarshal(body, &fresh); err != nil {
 			return body, nil
@@ -8597,6 +8697,11 @@ func (s *proxyServer) buildAttemptBody(body []byte, payload map[string]any, cand
 		}
 		if sanitizeSonnet {
 			delete(fresh, "temperature")
+		}
+		if adaptToolHistory {
+			if err := adaptGatewayToolHistory(fresh); err != nil {
+				return nil, err
+			}
 		}
 		if openAIChat {
 			return anthropicToOpenAIRequest(fresh, overrides)
@@ -11025,4 +11130,23 @@ func unwrapOpenAIEnvelope(payload map[string]any) map[string]any {
 		return data
 	}
 	return payload
+}
+
+// Token Pass exhaustion is a billing refusal even though the gateway uses 403.
+// Other restricted-model and authentication refusals do not authorize paid use.
+func tokenPassCreditsExhausted(body []byte) bool {
+	var envelope struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Param   struct {
+				Name string `json:"name"`
+			} `json:"param"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	return envelope.Error.Type == "no_providers_available" && envelope.Error.Param.Name == "RestrictedModelsError" &&
+		strings.HasPrefix(strings.ToLower(envelope.Error.Message), "your vercel token pass credits are used up")
 }

@@ -52,6 +52,7 @@ type attemptOutcome struct {
 }
 
 type attemptExecution struct {
+	EmptyCompletion     bool              `json:"emptyCompletion,omitempty"`
 	PreludeStopReason   string            `json:"preludeStopReason,omitempty"`
 	PreludeOutputTokens int               `json:"preludeOutputTokens,omitempty"`
 	PrimedFrames        int               `json:"primedFrames,omitempty"`

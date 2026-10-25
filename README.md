@@ -260,3 +260,33 @@ Keep configuration, credentials, snapshots, and runtime logs outside Git. Bind o
 Use credentials in accordance with [provider terms](https://code.claude.com/docs/en/legal-and-compliance). Claude subscription credentials have restrictions on third-party integrations; use supported API credentials where required. A redistribution license has not yet been selected.
 
 See [configuration](docs/configuration.md), [architecture](docs/architecture.md), [testing](docs/testing.md), [contributing safely](CONTRIBUTING.md), and the [local migration checklist](docs/local-migration.md). Claude Code's [gateway guide](https://code.claude.com/docs/en/llm-gateway) documents the underlying client environment variables.
+
+### Rolling paid-provider limit
+
+An Anthropic-protocol metered provider can set `rolling24hBudgetUSD`, for
+example `25`, with explicit `pricing.inputPerMillionTokens`,
+`pricing.outputPerMillionTokens`, and optional `pricing.cacheReadPerMillionTokens`.
+Prices must cover the configured model, including cache writes at the ordinary
+input rate. A model can override `pricing` while keeping the same provider
+budget shared across models. Pin provider routing when rates differ by backend.
+The budget applies to requests through this gateway, not other clients using the
+same provider account.
+
+The gateway reserves the model's full input context plus `max_tokens` before
+sending each request. Concurrent reservations count toward the limit. A completed response with gateway cost metadata uses its reported charge.
+Otherwise, complete reported usage replaces the reservation; missing cache
+counts retain the input bound. Interrupted requests and incomplete usage retain the full bound. Such
+uncertain charges survive restarts for at least 24 hours plus the one-hour
+maximum paid-attempt lifetime. Completed requests expire 24 hours after completion.
+Subscription providers do not spend this budget.
+
+`paid-budget.json` and its stable lock live in `stateDir`. Missing or corrupt
+initialized state denies paid requests. Do not delete these files to free funds.
+`GET /status` exposes the limit, accounted charges, current reservations and
+remaining funds. The limit is conservative and can refuse a request while some
+funds remain, when its maximum cost would exceed that remainder.
+
+Configured third-party provider attempts also translate Claude's dynamic tool-definition history into
+ordinary text and callable tool definitions. Existing current definitions take
+precedence. Cache markers and tool/result IDs remain attached to the same
+history. Native Anthropic attempts keep their original protocol.
