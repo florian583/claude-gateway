@@ -224,7 +224,13 @@ Usage collection defaults to `passive`. Routing still handles real quota errors 
 
 Fable-specific limits do not disable other Claude models. An old Fable limit can be revalidated by one real inference per account per hour when fresh global quota headers allow requests. This handles allowance changes after an upgrade without background inference or duplicate requests. A complete successful Fable response clears the old limit; failures retain it. The menu labels partial restrictions `FABLE LIMIT`, with the model reset time in its tooltip.
 
-Claude Code manages login credentials. The proxy rereads rotated credentials and can use an explicitly configured `refreshCommand` for unattended refresh. A successful helper must actually rotate credentials; no hidden inference probe is used.
+Claude Code manages login credentials. The proxy rereads rotated credentials and can use an explicitly configured `refreshCommand` for unattended refresh. The bundled `scripts/refresh-claude-oauth.sh` invokes a bounded one-turn Haiku request through the official CLI to trigger renewal. This can consume subscription usage. It does not exchange OAuth tokens or write credentials itself.
+
+The credential monitor checks unused profiles too. It sets `CLAUDE_OAUTH_REFRESH_REASON=scheduled` on the configured helper; this overrides the bundled helper's legacy `--auth-error` flag. Scheduled checks retain still-valid credentials after a model failure. Auth-error recovery requires rotation or a successful authenticated result. A scheduled check of local expiry cannot clear a rejected-token block.
+
+The helper recovers a surviving refresh token even when the access token is absent. Missing credentials require login; an inaccessible Keychain and malformed credential data have separate error codes. Failed attempts have a ten-minute cooldown, including expired credentials. A changed expiry bypasses the previous cooldown. Helpers use a per-profile local lock and reread credentials after the CLI completes. This lock does not coordinate independent interactive CLI processes or another host; do not copy rotating credentials between hosts.
+
+Refresh receipts retain at most 64 attempts per profile. They contain token-presence flags, expiry, Keychain exit status, CLI version and exit status, duration, and allow-listed structured error categories. Raw credentials, prompts, responses, and stderr are never retained. Unavailable error categories remain `unknown`. Receipts live outside the checkout under the configured OAuth refresh state directory.
 
 Set per-profile or pool thresholds to preserve quota. Proactive reserves need fresh usage data; unknown usage is never presented as a full balance.
 

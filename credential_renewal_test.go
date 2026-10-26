@@ -13,6 +13,8 @@ func TestCredentialRefreshOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name                      string
 		rotate, expired, verified bool
+		scheduled                 bool
+		rejected                  bool
 		exit                      int
 		wantOK                    bool
 	}{
@@ -22,6 +24,11 @@ func TestCredentialRefreshOutcome(t *testing.T) {
 		{name: "expired token with proof", expired: true, verified: true},
 		{name: "rotated expired token", rotate: true, expired: true},
 		{name: "failed helper with proof", verified: true, exit: 1},
+		{name: "scheduled still valid", scheduled: true, wantOK: true},
+		{name: "scheduled failed helper", scheduled: true, exit: 1},
+		{name: "scheduled expired", scheduled: true, expired: true},
+		{name: "rotation explicitly rejected", rotate: true, rejected: true, exit: 1},
+		{name: "scheduled explicitly rejected", scheduled: true, rejected: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -43,9 +50,12 @@ func TestCredentialRefreshOutcome(t *testing.T) {
 			if tc.verified {
 				proof = `{"version":1,"authVerified":true}`
 			}
+			if tc.rejected {
+				proof = `{"version":1,"authRejected":true}`
+			}
 			for name, script := range map[string]string{
 				"security": fmt.Sprintf("#!/bin/sh\n/bin/cat %q\n", state),
-				"refresh":  fmt.Sprintf("#!/bin/sh\nprintf '%%s' '%s' > %q\nprintf '%%s' '%s'\nexit %d\n", after, state, proof, tc.exit),
+				"refresh":  fmt.Sprintf("#!/bin/sh\n[ \"$CLAUDE_OAUTH_REFRESH_REASON\" = %q ] || exit 64\nprintf '%%s' '%s' > %q\nprintf '%%s' '%s'\nexit %d\n", map[bool]string{true: "scheduled", false: "auth_error"}[tc.scheduled], after, state, proof, tc.exit),
 			} {
 				if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0700); err != nil {
 					t.Fatal(err)
@@ -60,7 +70,12 @@ func TestCredentialRefreshOutcome(t *testing.T) {
 			profile := cfg.ClaudeUsage.AccountProfiles["first"]
 			t.Cleanup(func() { claudeOAuthCredentials.Delete(profile.CredentialsService) })
 			s := testProxy(t, cfg)
-			err := s.refreshProfileCredentials(context.Background(), profile)
+			ctx := context.Background()
+			if tc.scheduled {
+				ctx = context.WithValue(ctx, claudeRefreshReasonKey{}, claudeRefreshScheduled)
+			}
+			t.Setenv("CLAUDE_OAUTH_REFRESH_REASON", "inherited-invalid")
+			err := s.refreshProfileCredentials(ctx, profile)
 			if (err == nil) != tc.wantOK {
 				t.Fatalf("wantOK=%t err=%v", tc.wantOK, err)
 			}
@@ -69,6 +84,7 @@ func TestCredentialRefreshOutcome(t *testing.T) {
 }
 
 func TestDormantProfileCredentialMonitor(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	f := testClaudeConfig(t)
 	for name, p := range f.Profiles {
 		p.RefreshCommand = []string{"/synthetic/refresh"}
@@ -88,7 +104,13 @@ func TestDormantProfileCredentialMonitor(t *testing.T) {
 		t.Cleanup(func() { claudeOAuthCredentials.Delete(p.CredentialsService) })
 	}
 	refreshed := make(chan string, 3)
-	s.claudeRefreshRunner = func(ctx context.Context, p claudeUsageProfile) error { refreshed <- p.Name; return nil }
+	s.claudeRefreshRunner = func(ctx context.Context, p claudeUsageProfile) error {
+		if ctx.Value(claudeRefreshReasonKey{}) != claudeRefreshScheduled {
+			t.Error("dormant monitor used auth-error recovery")
+		}
+		refreshed <- p.Name
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -134,5 +156,42 @@ func TestCredentialRefreshCancelledQueue(t *testing.T) {
 	cancel()
 	if err := s.refreshProfileCredentials(ctx, s.cfg.ClaudeUsage.AccountProfiles["first"]); err != context.Canceled {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestScheduledRefreshDoesNotClearRejectedCredential(t *testing.T) {
+	s := testProxy(t, compileFixture(t, testClaudeConfig(t)))
+	profile := s.cfg.ClaudeUsage.AccountProfiles["first"]
+	key := s.cfg.ClaudeUsage.Provider + "@" + profile.Name
+	s.markProviderBlocked(key, "auth_quarantined", time.Hour)
+	done := make(chan struct{})
+	s.claudeRefreshRunner = func(ctx context.Context, _ claudeUsageProfile) error {
+		defer close(done)
+		if ctx.Value(claudeRefreshReasonKey{}) != claudeRefreshScheduled {
+			t.Error("scheduled refresh lost its reason")
+		}
+		return nil
+	}
+	s.triggerClaudeOAuthRefreshWithReason(profile, claudeRefreshScheduled)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh did not run")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.claudeRefreshMu.Lock()
+		active := len(s.claudeRefreshInFlight)
+		s.claudeRefreshMu.Unlock()
+		if active == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresh did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if blocked, state := s.providerBlocked(key); !blocked || state.Reason != "auth_quarantined" {
+		t.Fatalf("scheduled local check cleared rejection: blocked=%t state=%+v", blocked, state)
 	}
 }
