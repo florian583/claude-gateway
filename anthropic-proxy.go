@@ -4834,6 +4834,10 @@ func (s *proxyServer) monitorClaudeOAuthRefresh(ctx context.Context) {
 }
 
 func (s *proxyServer) triggerClaudeOAuthRefresh(profile claudeUsageProfile) {
+	s.triggerClaudeOAuthRefreshWithReason(profile, claudeRefreshAuthError)
+}
+
+func (s *proxyServer) triggerClaudeOAuthRefreshWithReason(profile claudeUsageProfile, reason claudeRefreshReason) {
 	if (profile.CachePath == "" && s.cfg.Definition == nil) || profile.CredentialsService == "" || s.claudeRefreshRunner == nil {
 		return
 	}
@@ -4860,12 +4864,13 @@ func (s *proxyServer) triggerClaudeOAuthRefresh(profile claudeUsageProfile) {
 			s.claudeRefreshMu.Unlock()
 		}()
 		started := time.Now()
-		timeout := 2 * time.Minute
+		timeout := 3 * time.Minute
 		if s.cfg.Definition != nil {
 			timeout *= time.Duration(len(s.cfg.Definition.Profiles) + 1)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
+		ctx = context.WithValue(ctx, claudeRefreshReasonKey{}, reason)
 		if err := s.claudeRefreshRunner(ctx, profile); err != nil {
 			if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				s.noteClaudeCredentialRefreshResult(profile, false, started)
@@ -4884,7 +4889,10 @@ func (s *proxyServer) triggerClaudeOAuthRefresh(profile claudeUsageProfile) {
 				return
 			}
 		}
-		s.noteClaudeCredentialRefreshResult(profile, true, started)
+		// Local expiry alone cannot clear a block caused by a rejected token.
+		if reason != claudeRefreshScheduled {
+			s.noteClaudeCredentialRefreshResult(profile, true, started)
+		}
 		log.Printf("Claude OAuth refresh helper profile=%q completed", profile.Name)
 	}()
 }
@@ -5017,6 +5025,9 @@ func (s *proxyServer) claudeCredentialRefreshHealth() claudeCredentialRefreshHea
 	allowedErrors := map[string]bool{
 		"keychain_read_failed": true, "invalid_expires_at": true, "claude_cli_failed": true,
 		"expiry_not_extended": true, "claude_cli_failed_credential_valid": true,
+		"keychain_item_missing": true, "credential_invalid_json": true,
+		"login_required": true, "cli_timeout": true,
+		"authentication_rejected": true,
 	}
 	for _, configured := range configuredClaudeCredentialProfiles(s.cfg.ClaudeUsage) {
 		entry, ok := stored.Profiles[configured.Name]

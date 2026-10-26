@@ -373,6 +373,15 @@ func (s *proxyServer) configuredClaudeUsageStatus() map[string]any {
 	return map[string]any{"enabled": s.cfg.ClaudeUsage.Provider != "", "provider": s.cfg.ClaudeUsage.Provider, "profiles": profiles}
 }
 
+type claudeRefreshReason uint8
+
+const (
+	claudeRefreshAuthError claudeRefreshReason = iota
+	claudeRefreshScheduled
+)
+
+type claudeRefreshReasonKey struct{}
+
 func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile claudeUsageProfile) error {
 	if s.cfg.Definition == nil {
 		return errors.New("no configured refresh command")
@@ -393,13 +402,26 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 		return ctx.Err()
 	}
 	defer func() { <-gate }()
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	before, _ := resolveClaudeProfileOAuthToken(ctx, profile, true)
 	cmd, e := makeProfileCommand(ctx, p, p.RefreshCommand, nil)
 	if e != nil {
 		return e
 	}
+	reason, _ := ctx.Value(claudeRefreshReasonKey{}).(claudeRefreshReason)
+	env := cmd.Env[:0]
+	for _, entry := range cmd.Env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != "CLAUDE_OAUTH_REFRESH_REASON" {
+			env = append(env, entry)
+		}
+	}
+	value := "auth_error"
+	if reason == claudeRefreshScheduled {
+		value = "scheduled"
+	}
+	cmd.Env = append(env, "CLAUDE_OAUTH_REFRESH_REASON="+value)
 	var output limitedBuffer
 	output.limit = 4096
 	cmd.Stdout = &output
@@ -412,12 +434,17 @@ func (s *proxyServer) refreshProfileCredentials(ctx context.Context, profile cla
 	if e != nil {
 		return e
 	}
-	if after == before {
-		var receipt struct {
-			Version      int  `json:"version"`
-			AuthVerified bool `json:"authVerified"`
-		}
-		if runErr != nil || json.Unmarshal(output.Bytes(), &receipt) != nil || receipt.Version != 1 || !receipt.AuthVerified {
+	var receipt struct {
+		Version      int  `json:"version"`
+		AuthVerified bool `json:"authVerified"`
+		AuthRejected bool `json:"authRejected"`
+	}
+	_ = json.Unmarshal(output.Bytes(), &receipt)
+	if receipt.Version == 1 && receipt.AuthRejected {
+		return errors.New("refresh command reported authentication rejected")
+	}
+	if after == before && !(reason == claudeRefreshScheduled && runErr == nil) {
+		if runErr != nil || receipt.Version != 1 || !receipt.AuthVerified {
 			return errors.New("refresh command did not rotate credential or verify authentication")
 		}
 	}
@@ -450,7 +477,7 @@ func (s *proxyServer) monitorProfileCredentials(ctx context.Context) {
 			}
 			raw, ok := claudeOAuthCredentials.Load(profile.CredentialsService)
 			if e != nil || !ok || !raw.(cachedClaudeOAuthCredential).expiresAt.After(time.Now().Add(2*time.Minute)) {
-				s.triggerClaudeOAuthRefresh(profile)
+				s.triggerClaudeOAuthRefreshWithReason(profile, claudeRefreshScheduled)
 			}
 		}
 	}
