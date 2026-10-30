@@ -17,7 +17,7 @@ func TestHaikuOmitsUnusedAdvisorOnly(t *testing.T) {
 	}{
 		{"haiku", "claude-haiku-5-5", nil, false},
 		{"other-model", "claude-opus-5-5", nil, false},
-		{"advisor-history", "claude-haiku-5-5", []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "server_tool_use", "name": "advisor", "id": "srv_1"}}}}, true},
+		{"advisor-history", "claude-haiku-5-5", []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "server_tool_use", "name": "advisor", "id": "srv_1"}}}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			original := map[string]any{"model": tc.model, "messages": tc.history, "tools": []any{map[string]any{"type": "advisor_20260301", "name": "advisor"}, map[string]any{"name": "Read", "input_schema": map[string]any{"type": "object"}}}}

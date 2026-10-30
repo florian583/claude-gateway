@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 )
 
 // Claude's dynamic tool registry is meaningful history, but third-party Messages
@@ -42,22 +41,21 @@ func adaptGatewayToolHistory(payload map[string]any) error {
 				}
 				definition, _ := wrapper["definition"].(map[string]any)
 				name, _ := definition["name"].(string)
-				if name == "" || definition["input_schema"] == nil {
-					return nil, errors.New("dynamic tool history has no usable definition")
-				}
-				copy := map[string]any{}
-				for _, key := range []string{"name", "description", "input_schema", "cache_control"} {
-					if value, ok := definition[key]; ok {
-						copy[key] = value
+				if name != "" && definition["input_schema"] != nil {
+					copy := map[string]any{}
+					for _, key := range []string{"name", "description", "input_schema", "cache_control"} {
+						if value, ok := definition[key]; ok {
+							copy[key] = value
+						}
 					}
-				}
-				if i, exists := positions[name]; exists {
-					if !current[name] {
-						tools[i] = copy
+					if i, exists := positions[name]; exists {
+						if !current[name] {
+							tools[i] = copy
+						}
+					} else {
+						positions[name] = len(tools)
+						tools = append(tools, copy)
 					}
-				} else {
-					positions[name] = len(tools)
-					tools = append(tools, copy)
 				}
 				fallthrough
 			case "server_tool_use", "advisor_tool_result":

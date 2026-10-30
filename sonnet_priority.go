@@ -30,9 +30,10 @@ func hasAdvisorHistory(value any) bool {
 	return false
 }
 
-// Keep existing advisor conversations intact because their server-tool history is stateful.
+// The provider adapter preserves prior advisor calls as text. A request that
+// explicitly forces the native advisor still requires a Claude route.
 func omitUnusedAdvisor(body []byte, payload map[string]any) ([]byte, map[string]any) {
-	if hasAdvisorHistory(payload["messages"]) || hasAdvisorHistory(payload["tool_choice"]) {
+	if hasAdvisorHistory(payload["tool_choice"]) {
 		return body, payload
 	}
 	tools, ok := payload["tools"].([]any)
@@ -124,10 +125,10 @@ func (s *proxyServer) nativeAdvisorCandidate(m modelConfig) bool {
 	return strings.HasPrefix(m.Upstream, "claude-") && (p.Variant == "claude-subscription" || directAnthropic)
 }
 
-// Advisor history requires a native Anthropic route.
+// An explicit advisor tool choice requires a native Anthropic route.
 func (s *proxyServer) advisorCompatibleCandidates(candidates []modelConfig, payload map[string]any) []modelConfig {
 	tools, _ := payload["tools"].([]any)
-	needsAdvisor := hasAdvisorHistory(payload["messages"]) || hasAdvisorHistory(payload["tool_choice"])
+	needsAdvisor := hasAdvisorHistory(payload["tool_choice"])
 	for _, raw := range tools {
 		tool, _ := raw.(map[string]any)
 		kind, _ := tool["type"].(string)

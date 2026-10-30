@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -59,10 +60,17 @@ func TestGatewayToolHistoryPreservesDefinitionsCacheAndNativeBody(t *testing.T) 
 		t.Fatal("native request modified")
 	}
 }
-func TestGatewayToolHistoryMalformedDefinitionFailsClosed(t *testing.T) {
-	p := map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_addition"}}}}}
-	if adaptGatewayToolHistory(p) == nil {
-		t.Fatal("unusable tool silently removed")
+func TestGatewayToolHistoryKeepsUnusableDefinitionAsText(t *testing.T) {
+	p := map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_addition", "tool": map[string]any{"type": "tool_reference", "tool_name": "example"}}}}}}
+	if err := adaptGatewayToolHistory(p); err != nil {
+		t.Fatal(err)
+	}
+	block := p["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if block["type"] != "text" || !strings.Contains(block["text"].(string), "tool_reference") {
+		t.Fatalf("history lost: %#v", block)
+	}
+	if tools, ok := p["tools"].([]any); ok && len(tools) != 0 {
+		t.Fatal("invented tool schema")
 	}
 }
 func TestPaidFallbackAfterTokenPassQuotaAndBudget(t *testing.T) {
