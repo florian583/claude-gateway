@@ -7435,6 +7435,8 @@ func (s *proxyServer) expandClaudeAccountAttempts(r *http.Request, candidates []
 
 func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body []byte, payload map[string]any, selected modelConfig) (upstreamResponse, error) {
 	r, requestID := ensureProxyRequestID(r)
+	fallbackBody, fallbackPayload := omitUnusedAdvisor(body, payload)
+	fallbackBody, fallbackPayload = omitEmptySystemMessage(fallbackBody, fallbackPayload)
 	networkProbe, err := s.beginNetworkRequest()
 	if err != nil {
 		return upstreamResponse{}, err
@@ -7447,13 +7449,13 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 	countTokens := strings.HasSuffix(r.URL.Path, "/count_tokens")
 	candidates := s.collectCandidates(selected)
 	if !countTokens {
-		candidates = s.advisorCompatibleCandidates(candidates, payload)
+		candidates = s.advisorCompatibleCandidates(candidates, fallbackPayload)
 		if len(candidates) == 0 {
 			return upstreamResponse{}, &requestCompatibilityError{message: "native advisor tool requires a compatible Anthropic route"}
 		}
 	}
 	if s.cfg.Definition != nil && !countTokens {
-		candidates = configuredCompatibleCandidates(candidates, payload)
+		candidates = configuredCompatibleCandidates(candidates, fallbackPayload)
 		if len(candidates) == 0 {
 			return upstreamResponse{}, &requestCompatibilityError{message: "no configured route supports this request's tools/images"}
 		}
@@ -7736,7 +7738,11 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			continue
 		}
 		transformStarted := time.Now()
-		attemptBody, err := s.buildAttemptBody(body, payload, candidate, providerName, r.URL.Path)
+		candidateBody, candidatePayload := body, payload
+		if !s.nativeAdvisorCandidate(candidate) {
+			candidateBody, candidatePayload = fallbackBody, fallbackPayload
+		}
+		attemptBody, err := s.buildAttemptBody(candidateBody, candidatePayload, candidate, providerName, r.URL.Path)
 		transformMS := time.Since(transformStarted).Milliseconds()
 		if err != nil {
 			releaseCircuitProbe(circuitProbe)
