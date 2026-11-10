@@ -24,7 +24,7 @@ func TestSonnetSubscriptionPriorityAndAdvisorCompatibility(t *testing.T) {
 		{"quota_fallback", true, false, "glm", false},
 		{"advisor_capacity", false, true, "first", false},
 		{"advisor_next_account", false, true, "second", true},
-		{"advisor_no_compatible_capacity", true, true, "", false},
+		{"advisor_fallback", true, true, "glm", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var mu sync.Mutex
@@ -33,6 +33,16 @@ func TestSonnetSubscriptionPriorityAndAdvisorCompatibility(t *testing.T) {
 				id := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer sk-ant-oat-test-")
 				if id == "" {
 					id = "glm"
+				}
+				if tc.advisor {
+					var payload map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					_, hasTools := payload["tools"]
+					if hasTools != (id != "glm") {
+						t.Errorf("provider=%s advisor present=%v", id, hasTools)
+					}
 				}
 				mu.Lock()
 				calls = append(calls, id)
