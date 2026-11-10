@@ -767,6 +767,8 @@ type adaptiveState struct {
 }
 
 type providerRuntimeState struct {
+	QuotaProbeAt       time.Time         `json:"quotaProbeAt,omitempty"`
+	QuotaProbeInFlight bool              `json:"-"`
 	LastFailure        time.Time         `json:"lastFailure,omitempty"`
 	BlockedUntil       time.Time         `json:"blockedUntil,omitempty"`
 	Reason             string            `json:"reason,omitempty"`
@@ -3164,7 +3166,11 @@ func (s *proxyServer) providerBlockForCandidate(runtimeProviderName string, cand
 		return true, state
 	}
 	if modelKey := s.claudeModelQuotaBlockKey(runtimeProviderName, candidate); modelKey != "" {
-		return s.providerBlocked(modelKey)
+		blocked, state := s.providerBlocked(modelKey)
+		if blocked && s.fableQuotaProbeDue(runtimeProviderName, modelKey) {
+			return false, state
+		}
+		return blocked, state
 	}
 	return false, providerRuntimeState{}
 }
@@ -6507,7 +6513,7 @@ func (s *proxyServer) proxy(w http.ResponseWriter, r *http.Request) {
 		s.resetCircuitAfter(runtimeProviderName, selectedModel, upstream.started)
 		s.clearProviderBlockAfter(runtimeProviderName, upstream.started)
 		if modelKey := s.claudeModelQuotaBlockKey(runtimeProviderName, selectedModel); modelKey != "" {
-			s.clearProviderBlockAfter(modelKey, upstream.started)
+			s.clearFableQuotaAfter(modelKey, upstream.started)
 		}
 		s.observeProviderHealthyAfter(runtimeProviderName, upstream.started)
 	}
@@ -7234,6 +7240,12 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 			}
 		}
 		attemptStarted := time.Now()
+		releaseQuota, quotaAllowed := s.acquireFableQuotaProbe(runtimeProviderName, candidate, countTokens)
+		if !quotaAllowed {
+			releaseAttemptAccount()
+			releaseCircuitProbe(circuitProbe)
+			continue
+		}
 		trace.Timing = &upstreamTiming{}
 		trace.HeadersMS, trace.FirstEventMS = 0, 0
 		releaseRoute := s.reserveRoute(runtimeProviderName, candidate)
@@ -7249,6 +7261,7 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		}
 		if err != nil {
 			releaseAttemptAccount()
+			releaseQuota()
 			releaseRoute()
 			releaseCircuitProbe(circuitProbe)
 			if ctx.Err() != nil {
@@ -7306,12 +7319,14 @@ func (s *proxyServer) doWithFallbacks(ctx context.Context, r *http.Request, body
 		}
 		if resp.Body != nil {
 			resp.Body = &releaseReadCloser{ReadCloser: resp.Body, release: func() {
+				releaseQuota()
 				releaseRoute()
 				releaseCircuitProbe(circuitProbe)
 				releaseAttemptAccount()
 			}}
 		} else {
 			releaseRoute()
+			releaseQuota()
 			releaseCircuitProbe(circuitProbe)
 			releaseAttemptAccount()
 		}

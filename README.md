@@ -186,6 +186,8 @@ Non-primary metered providers require explicit paid-fallback permission. Missing
 
 Usage collection defaults to `passive`. Routing still handles real quota errors without a usage API. Optional API polling and local browser snapshots are configured per provider; no browser or collector is launched automatically.
 
+Fable-specific limits do not disable other Claude models. An old Fable limit can be revalidated by one real inference per account per hour when fresh global quota headers allow requests. This handles allowance changes after an upgrade without background inference or duplicate requests. A complete successful Fable response clears the old limit; failures retain it. The menu labels partial restrictions `FABLE LIMIT`, with the model reset time in its tooltip.
+
 Claude Code manages login credentials. The proxy rereads rotated credentials and can use an explicitly configured `refreshCommand` for unattended refresh. A successful helper must actually rotate credentials; no hidden inference probe is used.
 
 Set per-profile or pool thresholds to preserve quota. Proactive reserves need fresh usage data; unknown usage is never presented as a full balance.

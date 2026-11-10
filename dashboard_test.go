@@ -92,6 +92,32 @@ func TestDashboardFreshnessAndWindowReset(t *testing.T) {
 	}
 }
 
+func TestDashboardFableLimitIsModelSpecificAndReadOnly(t *testing.T) {
+	f := testClaudeConfig(t)
+	m := f.Models["model"]
+	m.Upstream = "claude-fable-5-1"
+	f.Models["fable"] = m
+	s := testProxy(t, compileFixture(t, f))
+	now := time.Now()
+	s.providerStates["endpoint@first#fable"] = providerRuntimeState{Reason: "fable_quota_rejected", LastFailure: now.Add(-2 * time.Hour), BlockedUntil: now.Add(time.Hour)}
+	before, _ := json.Marshal(s.providerStates)
+	w := httptest.NewRecorder()
+	s.handler().ServeHTTP(w, httptest.NewRequest("GET", "/dashboard", nil))
+	var out dashboardSnapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range out.Accounts {
+		if row.ID == "first" && (row.State != "FABLE LIMIT" || row.FableResetAt == nil) {
+			t.Fatalf("missing model restriction: %+v", row)
+		}
+	}
+	after, _ := json.Marshal(s.providerStates)
+	if string(before) != string(after) {
+		t.Fatal("dashboard mutated quota state")
+	}
+}
+
 func TestDashboardTrafficCompletionAccounting(t *testing.T) {
 	s := testProxy(t, compileFixture(t, testClaudeConfig(t)))
 	now := time.Now().UTC()

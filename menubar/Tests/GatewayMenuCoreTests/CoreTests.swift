@@ -2,6 +2,14 @@ import XCTest
 @testable import GatewayMenuCore
 
 final class CoreTests: XCTestCase {
+    func testFableLimitDetailsAndLegacyCompatibility() throws {
+        let legacy = #"{"id":"test","name":"Test","models":[],"windows":[],"state":"OK"}"#
+        XCTAssertNil(try JSONDecoder().decode(UsageRow.self, from: Data(legacy.utf8)).fableResetAt)
+        let limited = #"{"id":"test","name":"Test","models":[],"windows":[],"state":"FABLE LIMIT","fableResetAt":"2026-09-11T10:00:00Z"}"#
+        let row = try JSONDecoder().decode(UsageRow.self, from: Data(limited.utf8))
+        XCTAssertTrue(row.details.contains("Fable limit resets:"))
+        XCTAssertFalse(row.details.contains("Fable limit resets: —"))
+    }
     func testCompactStatusTitleKeepsAccountOutOfMenuBar() {
         XCTAssertEqual(MenuFormat.statusTitle("Anthropic / Work account"), "AI Claude")
         XCTAssertEqual(MenuFormat.statusTitle("BigModel"), "AI BigModel")

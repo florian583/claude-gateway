@@ -14,6 +14,7 @@ public struct UsageRow: Decodable {
     public let state: String
     public let updatedAt: String?
     public let modelStates: [String: String]?
+    public let fableResetAt: String?
 
     public func window(_ name: String) -> UsageWindow? { windows.first { $0.name == name } }
     public var minimumRemaining: String {
@@ -22,6 +23,7 @@ public struct UsageRow: Decodable {
     public var details: String {
         var parts = [name, "Models: " + models.joined(separator: ", "), "State: " + state]
         if let updatedAt { parts.append("Usage updated: " + updatedAt) }
+        if let fableResetAt { parts.append("Fable limit resets: " + MenuFormat.reset(fableResetAt, weekly: true)) }
         for (model, state) in (modelStates ?? [:]).sorted(by: { $0.key < $1.key }) { parts.append(model + ": " + state) }
         return parts.joined(separator: "\n")
     }
